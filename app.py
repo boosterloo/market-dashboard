@@ -1,6 +1,6 @@
 import os
 from datetime import date, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
@@ -59,11 +59,12 @@ def list_views(dataset: str) -> List[str]:
         return []
 
 @st.cache_data(ttl=300, show_spinner=False)
-def run_query(sql: str, params: Optional[List]=None) -> pd.DataFrame:
+def run_query(sql: str, params: Optional[Tuple]=None) -> pd.DataFrame:
     client = get_bq_client()
     job_config = None
     if params:
-        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        qp = [bigquery.ScalarQueryParameter(n, t, v) for (n, t, v) in params]
+        job_config = bigquery.QueryJobConfig(query_parameters=qp)
     job = client.query(sql, job_config=job_config)
     return job.result().to_dataframe(create_bqstorage_client=False)
 
@@ -162,10 +163,10 @@ if isinstance(periode, tuple) and len(periode) == 2 and date_col:
     ORDER BY {date_col} ASC
     LIMIT {max_rows}
     """
-    params = [
-        bigquery.ScalarQueryParameter("start", "DATE", pd.to_datetime(start_d).date()),
-        bigquery.ScalarQueryParameter("end", "DATE", pd.to_datetime(end_d).date()),
-    ]
+    params = (
+        ("start", "DATE", pd.to_datetime(start_d).date()),
+        ("end", "DATE", pd.to_datetime(end_d).date()),
+    )
     df = run_query(sql, params=params)
 else:
     st.info("Kon geen datumkolom detecteren; haal data zonder server-side filter op.")
