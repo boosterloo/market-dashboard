@@ -3,3 +3,6 @@ pandas>=2.2
 google-cloud-bigquery>=3.25
 google-auth>=2.30
 plotly>=5.22
+db-dtypes>=1.2.0
+pyarrow>=14.0.1
+
