@@ -32,7 +32,7 @@ try:
     min_date = pd.to_datetime(df_min["d"].iloc[0]).date()
     today = date.today()
     dyn_max_days = max(30, (today - min_date).days)
-    dyn_max_days = min(dyn_max_days, 3650)  # optionele cap (±10 jaar)
+    dyn_max_days = min(dyn_max_days, 3650)  # cap ±10 jaar
 except Exception:
     today = date.today()
     dyn_max_days = 3650
@@ -50,9 +50,11 @@ with st.sidebar:
     show_ha_chart = st.checkbox("Toon Heikin Ashi + SuperTrend + Donchian", value=True)
 
     with st.expander("🔧 Indicator-instellingen (optioneel)"):
-        st_len = st.number_input("SuperTrend length", min_value=1, max_value=200, value=10, step=1)
+        st_len  = st.number_input("SuperTrend length", min_value=1, max_value=200, value=10, step=1)
         st_mult = st.number_input("SuperTrend multiplier", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
-        dc_len = st.number_input("Donchian Channel length", min_value=1, max_value=400, value=20, step=1, help="DC(20) zoals in je screenshot")
+        dc_len  = st.number_input("Donchian Channel length", min_value=1, max_value=400, value=20, step=1)
+        dc_fill = st.checkbox("Vul Donchian-band", value=False)
+        dc_opacity = st.slider("Donchian opacity", 0.0, 0.4, 0.08, 0.01, disabled=not dc_fill)
 
     st.caption(f"Databron: `{SPX_VIEW}`")
 
@@ -107,7 +109,7 @@ def heikin_ashi(ohlc: pd.DataFrame) -> pd.DataFrame:
     })
     return out
 
-# ---- ATR (Wilder/RMA) en SuperTrend op HA ----
+# ---- ATR (RMA) + SuperTrend op HA ----
 def atr_rma(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat([
@@ -129,7 +131,6 @@ def supertrend_on_ha(ha: pd.DataFrame, length: int = 10, multiplier: float = 1.0
     final_upper = np.zeros(len(ha))
     final_lower = np.zeros(len(ha))
     trend = np.ones(len(ha))  # +1 up, -1 down
-
     final_upper[:] = np.nan
     final_lower[:] = np.nan
 
@@ -160,27 +161,16 @@ def supertrend_on_ha(ha: pd.DataFrame, length: int = 10, multiplier: float = 1.0
         else:
             trend[i] = trend[i-1]
 
-        # Band selectie
-        if trend[i] == 1 and final_lower[i] < final_upper[i]:
-            pass
-        elif trend[i] == -1 and final_upper[i] > final_lower[i]:
-            pass
-
     st_line = pd.Series(np.where(trend == 1, final_lower, final_upper), index=ha.index, name="st_line")
     trend_s = pd.Series(trend, index=ha.index, name="trend")
-    return pd.DataFrame({
-        "date": ha["date"],
-        "st_line": st_line,
-        "trend": trend_s
-    })
+    return pd.DataFrame({"date": ha["date"], "st_line": st_line, "trend": trend_s})
 
-# ---- Donchian Channel op HA ----
+# ---- Donchian op HA ----
 def donchian_on_ha(ha: pd.DataFrame, length: int = 20) -> pd.DataFrame:
     upper = ha["ha_high"].rolling(length).max().rename("dc_upper")
     lower = ha["ha_low"].rolling(length).min().rename("dc_lower")
     mid = ((upper + lower) / 2.0).rename("dc_mid")
-    out = pd.concat([ha["date"], upper, lower, mid], axis=1)
-    return out
+    return pd.concat([ha["date"], upper, lower, mid], axis=1)
 
 # ---- Laden met fallback ----
 try:
@@ -246,7 +236,7 @@ fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=520, legend_orient
 fig.update_yaxes(title_text="SPX", secondary_y=False)
 if show_vix:
     fig.update_yaxes(title_text="VIX", secondary_y=True)
-fig.update_xaxes(showspikes=True, spikemode="across")
+fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)  # rangeslider uit
 st.plotly_chart(fig, use_container_width=True)
 
 # ---- Heikin Ashi + SuperTrend + Donchian (tweede grafiek) ----
@@ -254,12 +244,7 @@ if show_ha_chart:
     st.subheader("🕯️ Heikin Ashi + SuperTrend + Donchian")
 
     # Zorg dat we OHLC hebben
-    if fast_mode:
-        with st.spinner("OHLC ophalen voor Heikin Ashi…"):
-            df_ohlc = fetch_ohlc()
-    else:
-        df_ohlc = df
-
+    df_ohlc = fetch_ohlc() if fast_mode else df
     needed = {"open", "high", "low", "close"}
     if df_ohlc.empty or not needed.issubset(df_ohlc.columns):
         st.info("Geen OHLC-data beschikbaar om Heikin Ashi te berekenen.")
@@ -272,43 +257,36 @@ if show_ha_chart:
 
         # 1) Heikin Ashi candles
         ha_fig.add_trace(go.Candlestick(
-            x=ha["date"],
-            open=ha["ha_open"],
-            high=ha["ha_high"],
-            low=ha["ha_low"],
-            close=ha["ha_close"],
+            x=ha["date"], open=ha["ha_open"], high=ha["ha_high"], low=ha["ha_low"], close=ha["ha_close"],
             name="Heikin Ashi"
         ))
 
-        # 2) Donchian Channel (band)
-        if dc["dc_upper"].notna().any() and dc["dc_lower"].notna().any():
+        # 2) Donchian Channel (transparant; optionele vulling)
+        #   - altijd de lijnen tonen
+        ha_fig.add_trace(go.Scatter(x=dc["date"], y=dc["dc_upper"], mode="lines", name="DC Upper", line=dict(width=1)))
+        ha_fig.add_trace(go.Scatter(x=dc["date"], y=dc["dc_lower"], mode="lines", name="DC Lower", line=dict(width=1)))
+        #   - optioneel: zachte bandvulling tussen lower en upper
+        if dc_fill:
             ha_fig.add_trace(go.Scatter(
-                x=dc["date"], y=dc["dc_upper"], mode="lines", name="DC Upper", line=dict(width=1)
+                x=dc["date"], y=dc["dc_upper"], mode="lines", showlegend=False, line=dict(width=0)
             ))
             ha_fig.add_trace(go.Scatter(
-                x=dc["date"], y=dc["dc_lower"], mode="lines", name="DC Lower",
-                fill="tonexty",  # vul tussen lower en upper
-                opacity=0.15,
-                line=dict(width=1)
+                x=dc["date"], y=dc["dc_lower"], mode="lines", showlegend=False,
+                fill="tonexty", fillcolor=f"rgba(150,150,220,{dc_opacity})", line=dict(width=0)
             ))
 
         # 3) SuperTrend (groen/rood)
         st_up = st_df.where(st_df["trend"] == 1)["st_line"]
         st_dn = st_df.where(st_df["trend"] == -1)["st_line"]
-
         if st_up.notna().any():
-            ha_fig.add_trace(go.Scatter(
-                x=st_df["date"], y=st_up, mode="lines", name="SuperTrend Up",
-                line=dict(width=2, color="green")
-            ))
+            ha_fig.add_trace(go.Scatter(x=st_df["date"], y=st_up, mode="lines", name="SuperTrend Up",
+                                        line=dict(width=2, color="green")))
         if st_dn.notna().any():
-            ha_fig.add_trace(go.Scatter(
-                x=st_df["date"], y=st_dn, mode="lines", name="SuperTrend Down",
-                line=dict(width=2, color="red")
-            ))
+            ha_fig.add_trace(go.Scatter(x=st_df["date"], y=st_dn, mode="lines", name="SuperTrend Down",
+                                        line=dict(width=2, color="red")))
 
         ha_fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), height=460, legend_orientation="h")
-        ha_fig.update_xaxes(showspikes=True, spikemode="across")
+        ha_fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)  # rangeslider uit
         st.plotly_chart(ha_fig, use_container_width=True)
 
 # ---- Footer info ----
