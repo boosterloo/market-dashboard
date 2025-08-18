@@ -1,8 +1,0 @@
-
-streamlit>=1.33
-pandas>=2.2
-plotly>=5.22
-google-cloud-bigquery>=3.25
-pyarrow>=16.0
-numpy>=1.26
-python-dateutil>=2.9
