@@ -1,74 +1,77 @@
 # utils/bq.py
 from __future__ import annotations
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 from google.oauth2 import service_account
 from google.cloud import bigquery
 
-# ---- Client ----
+# ---------- Client ----------
 @st.cache_resource(show_spinner=False)
 def _bq_client_from_secrets() -> bigquery.Client:
-    """Build one global BigQuery client from Streamlit secrets."""
-    creds_dict = st.secrets["gcp_service_account"]
-    credentials = service_account.Credentials.from_service_account_info(creds_dict)
-    return bigquery.Client(credentials=credentials, project=creds_dict["project_id"])
+    creds = st.secrets["gcp_service_account"]
+    credentials = service_account.Credentials.from_service_account_info(creds)
+    return bigquery.Client(credentials=credentials, project=creds["project_id"])
 
-# Backwards-compatible alias expected by older pages
+# Backwards-compatible alias
 def get_bq_client() -> bigquery.Client:
     return _bq_client_from_secrets()
 
-# ---- Health check / ping ----
+# ---------- Healthcheck ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def bq_ping() -> bool:
-    """Returns True if a trivial query succeeds."""
     try:
-        client = _bq_client_from_secrets()
-        client.query("SELECT 1").result()
+        _bq_client_from_secrets().query("SELECT 1").result(timeout=10)
         return True
     except Exception:
         return False
 
-# ---- Query helper ----
+# ---------- Query helper ----------
 @st.cache_data(ttl=600, show_spinner=False)
-def run_query(sql: str, params: Dict[str, Any] | None = None) -> pd.DataFrame:
+def run_query(
+    sql: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: Optional[float] = None,  # <-- nieuw: seconds (float/int)
+) -> pd.DataFrame:
     """
-    Execute SQL and return pandas DataFrame.
-    - Supports simple scalar parameters (STRING/INT64/FLOAT64/DATE/TIMESTAMP).
-    - Normalizes 'date' and 'snapshot_date' columns.
+    Execute SQL and return a pandas DataFrame.
+    - Supports simple scalar params (INT64, FLOAT64, STRING, DATE, TIMESTAMP).
+    - Normalizes 'date' and 'snapshot_date' columns to pandas types.
+    - `timeout` (sec) aborts waiting for the job if it runs too long.
     """
     client = _bq_client_from_secrets()
 
     job_config = None
     if params:
-        job_params: List[bigquery.ScalarQueryParameter] = []
+        bq_params: List[bigquery.ScalarQueryParameter] = []
         for k, v in params.items():
-            # best-effort type detection
-            if isinstance(v, (int,)):
-                tp = "INT64"
-            elif isinstance(v, (float,)):
-                tp = "FLOAT64"
+            # basic type inference
+            if isinstance(v, int):
+                typ = "INT64"
+            elif isinstance(v, float):
+                typ = "FLOAT64"
             elif isinstance(v, pd.Timestamp):
-                tp = "TIMESTAMP"
-                v = v.to_pydatetime()
-            elif isinstance(v, (pd.DateOffset,)):
-                tp = "DATE"
+                typ = "TIMESTAMP"; v = v.to_pydatetime()
             else:
-                # try to parse common string date/timestamp
+                # Try parse date/timestamp from string-like
                 try:
                     ts = pd.to_datetime(v)
-                    if str(v).find("T") >= 0 or (hasattr(ts, "hour") and ts.hour is not pd.NaT):
-                        tp = "TIMESTAMP"
-                        v = ts.to_pydatetime()
+                    if " " in str(v) or "T" in str(v):
+                        typ = "TIMESTAMP"; v = ts.to_pydatetime()
                     else:
-                        tp = "DATE"
-                        v = ts.date()
+                        typ = "DATE"; v = ts.date()
                 except Exception:
-                    tp = "STRING"
-            job_params.append(bigquery.ScalarQueryParameter(k, tp, v))
-        job_config = bigquery.QueryJobConfig(query_parameters=job_params)
+                    typ = "STRING"
+            bq_params.append(bigquery.ScalarQueryParameter(k, typ, v))
+        job_config = bigquery.QueryJobConfig(query_parameters=bq_params)
 
-    df = client.query(sql, job_config=job_config).to_dataframe()
+    job = client.query(sql, job_config=job_config)
+
+    # Respect timeout while waiting for completion
+    job.result(timeout=timeout) if timeout else job.result()
+
+    # Use default fetch path (no BigQuery Storage requirement)
+    df = job.to_dataframe(create_bqstorage_client=False)
 
     # Normalize common columns
     if "date" in df.columns:
