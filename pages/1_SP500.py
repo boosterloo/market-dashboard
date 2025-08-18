@@ -1,105 +1,143 @@
-
-from datetime import date
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import date, timedelta
 
-from utils.bq import load_sp500, load_vix
-from utils.helpers import ensure_datetime, heikin_ashi
-from utils.charts import plot_candles, plot_line
+from utils.bq import run_query, get_bq_client
 
 st.set_page_config(page_title="S&P 500 + VIX", layout="wide")
 
-st.sidebar.subheader("📚 Pagina's")
-st.sidebar.page_link("app.py", label="🏠 Dashboard instellingen")
-st.sidebar.page_link("pages/1_SP500.py", label="📈 S&P 500 + VIX")
-st.sidebar.page_link("pages/2_VIX.py", label="📉 VIX (alleen)")
-st.sidebar.page_link("pages/3_SPX_Options.py", label="🧮 SPX Opties")
-
 st.title("📈 S&P 500 + 📉 VIX")
 
-view_start = st.session_state.get("view_start")
-view_end   = st.session_state.get("view_end")
-if not (view_start and view_end):
-    today = date.today()
-    view_start, view_end = today.replace(day=1), today
+# ---- Instellingen (links) ----
+with st.sidebar:
+    st.subheader("⚙️ Dashboard instellingen")
 
-df_spx = load_sp500(view_start, view_end)
-df_vix = load_vix(view_start, view_end)
+    # Tabellen (pas aan indien jouw namen anders zijn)
+    client = get_bq_client()
+    PROJECT = client.project
+    DATASET_DEFAULT = "marketdata"
 
+    tbl_spx = st.text_input(
+        "Tabel S&P 500",
+        value=f"{PROJECT}.{DATASET_DEFAULT}.sp500_prices",
+        help="Volledige tabelnaam in BigQuery"
+    )
+    tbl_vix = st.text_input(
+        "Tabel VIX",
+        value=f"{PROJECT}.{DATASET_DEFAULT}.vix_prices",
+        help="Volledige tabelnaam in BigQuery"
+    )
+
+    # Snel en veilig defaulten (snelle cold start)
+    default_days = st.slider("🔎 Periode (dagen terug)", min_value=30, max_value=1095, value=180, step=30)
+    end_date = date.today()
+    start_date = end_date - timedelta(days=default_days)
+
+    use_ha = st.checkbox("Toon Heikin Ashi (SPX)", value=False)
+    show_ma = st.checkbox("Toon 50/200 MA (SPX)", value=True)
+
+# ---- Helpers ----
+def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    """Maak HA-OHLC op basis van gewone OHLC."""
+    out = df.copy()
+    out["ha_close"] = (out["open"] + out["high"] + out["low"] + out["close"]) / 4.0
+    ha_open = []
+    for i, row in out.iterrows():
+        if i == 0:
+            ha_open.append((row["open"] + row["close"]) / 2.0)
+        else:
+            ha_open.append((ha_open[-1] + out.loc[i-1, "ha_close"]) / 2.0)
+    out["ha_open"] = ha_open
+    out["ha_high"] = out[["high", "ha_open", "ha_close"]].max(axis=1)
+    out["ha_low"]  = out[["low", "ha_open", "ha_close"]].min(axis=1)
+    return out
+
+# ---- Data laden met duidelijke status ----
+status = st.status("Data laden…", expanded=False)
+try:
+    sql_spx = f"""
+    SELECT
+      DATE(date) AS date, open, high, low, close, volume
+    FROM `{tbl_spx}`
+    WHERE DATE(date) BETWEEN @start AND @end
+    ORDER BY date
+    """
+    df_spx = run_query(sql_spx, params={"start": start_date, "end": end_date})
+
+    sql_vix = f"""
+    SELECT
+      DATE(date) AS date, close
+    FROM `{tbl_vix}`
+    WHERE DATE(date) BETWEEN @start AND @end
+    ORDER BY date
+    """
+    df_vix = run_query(sql_vix, params={"start": start_date, "end": end_date})
+
+    status.update(label="✅ Data geladen", state="complete", expanded=False)
+except Exception as e:
+    status.update(label="❌ Laden mislukt", state="error", expanded=True)
+    st.exception(e)
+    st.stop()
+
+# ---- Validatie ----
 if df_spx.empty:
-    st.warning("Geen S&P 500 data in de gekozen periode.")
+    st.warning("Geen S&P 500-gegevens voor de gekozen periode/tabel.")
+    st.stop()
 if df_vix.empty:
-    st.warning("Geen VIX data in de gekozen periode.")
+    st.warning("Geen VIX-gegevens voor de gekozen periode/tabel.")
+    st.stop()
 
-st.subheader("S&P 500")
-col1, col2, col3 = st.columns([1,1,1])
-with col1:
-    mode = st.selectbox(
-        "Weergave",
-        ["Heikin-Ashi (candlestick)", "Line + MA"],
-        index=0,
+# ---- Berekeningen ----
+df_spx = df_spx.sort_values("date").reset_index(drop=True)
+if show_ma:
+    df_spx["ma50"] = df_spx["close"].rolling(50).mean()
+    df_spx["ma200"] = df_spx["close"].rolling(200).mean()
+
+if use_ha:
+    df_ha = heikin_ashi(df_spx)
+
+# ---- Plotten (2 rijen, gedeelde x) ----
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                    vertical_spacing=0.08,
+                    row_heights=[0.65, 0.35],
+                    subplot_titles=("S&P 500", "VIX"))
+
+# SPX
+if use_ha:
+    fig.add_trace(
+        go.Candlestick(x=df_ha["date"],
+                       open=df_ha["ha_open"], high=df_ha["ha_high"],
+                       low=df_ha["ha_low"], close=df_ha["ha_close"],
+                       name="SPX (Heikin Ashi)"),
+        row=1, col=1
     )
-with col2:
-    ma_len = st.number_input("Moving Average lengte", min_value=1, value=20, step=1)
-with col3:
-    show_volume = st.toggle("Volume tonen (alleen bij line)", value=False)
-
-if not df_spx.empty:
-    df_spx = ensure_datetime(df_spx, date_col="date")
-    if mode.startswith("Heikin"):
-        df_ha = heikin_ashi(df_spx.rename(columns={
-            "open":"Open","high":"High","low":"Low","close":"Close"
-        }))
-        fig_spx = plot_candles(
-            df=df_ha,
-            date_col="date",
-            open_col="HA_Open",
-            high_col="HA_High",
-            low_col="HA_Low",
-            close_col="HA_Close",
-            title="S&P 500 — Heikin-Ashi"
-        )
-    else:
-        df_line = df_spx.sort_values("date").copy()
-        df_line["ma"] = df_line["close"].rolling(int(ma_len)).mean()
-        fig_spx = plot_line(
-            df=df_line,
-            x="date",
-            y_cols=["close","ma"],
-            names=["Close", f"MA({ma_len})"],
-            title="S&P 500 — Line + MA",
-            show_volume=show_volume,
-            volume_col="volume"
-        )
-    st.plotly_chart(fig_spx, use_container_width=True)
-
-    with st.expander("🔎 Tabel S&P 500 (download)"):
-        st.dataframe(df_spx)
-        st.download_button(
-            "Download CSV (S&P 500)",
-            data=df_spx.to_csv(index=False).encode("utf-8"),
-            file_name="sp500.csv",
-            mime="text/csv",
-        )
-
-st.subheader("VIX (zelfde periode)")
-if not df_vix.empty:
-    df_vix = ensure_datetime(df_vix, date_col="date")
-    fig_vix = plot_line(
-        df=df_vix,
-        x="date",
-        y_cols=["close"],
-        names=["VIX Close"],
-        title="VIX — Close",
-        show_volume=False
+else:
+    fig.add_trace(
+        go.Scatter(x=df_spx["date"], y=df_spx["close"], mode="lines", name="SPX Close"),
+        row=1, col=1
     )
-    st.plotly_chart(fig_vix, use_container_width=True)
 
-    with st.expander("🔎 Tabel VIX (download)"):
-        st.dataframe(df_vix)
-        st.download_button(
-            "Download CSV (VIX)",
-            data=df_vix.to_csv(index=False).encode("utf-8"),
-            file_name="vix.csv",
-            mime="text/csv",
-        )
+if show_ma and not use_ha:
+    if df_spx["ma50"].notna().any():
+        fig.add_trace(go.Scatter(x=df_spx["date"], y=df_spx["ma50"], mode="lines", name="MA50"), row=1, col=1)
+    if df_spx["ma200"].notna().any():
+        fig.add_trace(go.Scatter(x=df_spx["date"], y=df_spx["ma200"], mode="lines", name="MA200"), row=1, col=1)
+
+# VIX
+fig.add_trace(
+    go.Scatter(x=df_vix["date"], y=df_vix["close"], mode="lines", name="VIX Close"),
+    row=2, col=1
+)
+
+fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=700, legend_orientation="h")
+fig.update_xaxes(showspikes=True, spikesnap="cursor", spikemode="across")
+fig.update_yaxes(tickformat=",", separatethousands=True)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ---- Extra: laatste update info ----
+st.caption(
+    f"Periode: {start_date} → {end_date} • Rijen SPX: {len(df_spx):,} • Rijen VIX: {len(df_vix):,}"
+)
