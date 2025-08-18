@@ -20,18 +20,45 @@ def get_bq_client():
 
 _bq_client = get_bq_client()
 
+def _bq_param(name, value):
+    """Maak de juiste BigQuery query-parameter (scalar/array) met correcte type."""
+    # Array?
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            # lege array -> forceer lege STRING-array
+            return bigquery.ArrayQueryParameter(name, "STRING", [])
+        elem = value[0]
+        # type bepalen op basis van eerste element
+        if isinstance(elem, int):
+            return bigquery.ArrayQueryParameter(name, "INT64", list(value))
+        if isinstance(elem, float):
+            return bigquery.ArrayQueryParameter(name, "FLOAT64", list(value))
+        # dates als STRING doorgeven is tricky; we kiezen DATE indien date obj
+        if isinstance(elem, (date, pd.Timestamp, datetime)):
+            # cast naar ISO date string; query-vergelijking gebruikt DATE()
+            return bigquery.ArrayQueryParameter(name, "DATE", [str(pd.to_datetime(v).date()) for v in value])
+        return bigquery.ArrayQueryParameter(name, "STRING", [str(v) for v in value])
+
+    # Scalar
+    if isinstance(value, bool):
+        return bigquery.ScalarQueryParameter(name, "BOOL", value)
+    if isinstance(value, int) or isinstance(value, np.integer):
+        return bigquery.ScalarQueryParameter(name, "INT64", int(value))
+    if isinstance(value, float) or isinstance(value, np.floating):
+        return bigquery.ScalarQueryParameter(name, "FLOAT64", float(value))
+    if isinstance(value, datetime):
+        return bigquery.ScalarQueryParameter(name, "TIMESTAMP", value)
+    if isinstance(value, (date, pd.Timestamp)):
+        # BigQuery DATE
+        return bigquery.ScalarQueryParameter(name, "DATE", str(pd.to_datetime(value).date()))
+    # default: STRING
+    return bigquery.ScalarQueryParameter(name, "STRING", str(value))
+
 def run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
     job_config = None
     if params:
-        def _map_type(v):
-            if isinstance(v, int): return "INT64"
-            if isinstance(v, float): return "FLOAT64"
-            return "STRING"
         job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter(k, _map_type(v), v)
-                for k, v in params.items()
-            ]
+            query_parameters=[_bq_param(k, v) for k, v in params.items()]
         )
     return _bq_client.query(sql, job_config=job_config).to_dataframe()
 
@@ -69,6 +96,7 @@ with colA:
         max_value=max_date,
         format="YYYY-MM-DD"
     )
+    # Streamlit geeft tuple(date,date)
     start_date, end_date = daterange
 with colB:
     opt_types = st.multiselect("Type", ["call", "put"], default=["call", "put"])
@@ -78,20 +106,23 @@ with colD:
     moneyness_range = st.slider("Moneyness (strike/underlying − 1)", -0.20, 0.20, (-0.10, 0.10), step=0.01)
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_expirations(start_date: str, end_date: str):
+def load_expirations(start_date: date, end_date: date):
     sql = f"""
     SELECT DISTINCT expiration
     FROM `{VIEW}`
     WHERE DATE(snapshot_date) BETWEEN @start AND @end
     ORDER BY expiration
     """
-    df = run_query(sql, params={"start": str(start_date), "end": str(end_date)})
+    df = run_query(sql, params={"start": start_date, "end": end_date})
     return sorted(pd.to_datetime(df["expiration"]).dt.date.unique())
 
 exps = load_expirations(start_date, end_date)
 exp_default = [x for x in exps[:5]] if len(exps) > 0 else []
 selected_exps = st.multiselect("Expiraties (optioneel, voor strike- en OI-grafiek)", exps, default=exp_default)
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Data laden met filters
+# ────────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=True)
 def load_filtered(start_date, end_date, types, dte_min, dte_max, mny_min, mny_max):
     sql = f"""
@@ -122,13 +153,13 @@ def load_filtered(start_date, end_date, types, dte_min, dte_max, mny_min, mny_ma
     SELECT * FROM base
     """
     params = {
-        "start": str(start_date),
-        "end": str(end_date),
-        "dte_min": int(dte_min),
-        "dte_max": int(dte_max),
-        "mny_min": float(mny_min),
-        "mny_max": float(mny_max),
-        "types": [t.lower() for t in types] if types else ["call", "put"],
+        "start": start_date,          # DATE param
+        "end": end_date,              # DATE param
+        "dte_min": int(dte_min),      # INT64
+        "dte_max": int(dte_max),      # INT64
+        "mny_min": float(mny_min),    # FLOAT64
+        "mny_max": float(mny_max),    # FLOAT64
+        "types": [t.lower() for t in types] if types else ["call", "put"],  # ARRAY<STRING>
     }
     df = run_query(sql, params=params)
     if not df.empty:
@@ -142,7 +173,11 @@ def load_filtered(start_date, end_date, types, dte_min, dte_max, mny_min, mny_ma
         df["moneyness_pct"] = 100 * df["moneyness"]
     return df
 
-df = load_filtered(start_date, end_date, opt_types, dte_range[0], dte_range[1], moneyness_range[0], moneyness_range[1])
+df = load_filtered(
+    start_date, end_date, opt_types,
+    dte_range[0], dte_range[1],
+    moneyness_range[0], moneyness_range[1]
+)
 
 if df.empty:
     st.warning("Geen data voor de huidige filters.")
@@ -160,32 +195,35 @@ with col4: st.metric("Som Open Interest", f"{int(df['open_interest'].sum()):,}")
 st.markdown("---")
 
 # 1) Term structure IV
-term = df.groupby(["days_to_exp", "type"], as_index=False)["implied_volatility"].mean()
+term = df.groupby(["days_to_exp", "type"], as_index=False)["implied_volatility"].mean().sort_values("days_to_exp")
 fig_term = go.Figure()
 for t in sorted(term["type"].unique()):
     sub = term[term["type"] == t]
     fig_term.add_trace(go.Scatter(x=sub["days_to_exp"], y=sub["implied_volatility"],
                                   mode="lines+markers", name=f"IV {t.upper()}"))
-fig_term.update_layout(title="Term Structure — Gemiddelde IV", xaxis_title="DTE", yaxis_title="Implied Volatility")
+fig_term.update_layout(title="Term Structure — Gemiddelde IV", xaxis_title="DTE", yaxis_title="Implied Volatility", height=420)
 st.plotly_chart(fig_term, use_container_width=True)
 
 # 2) Calls vs Puts — volume en OI
-agg_cp = df.groupby("type", as_index=False)[["volume", "open_interest"]].sum()
+agg_cp = df.groupby("type", as_index=False)[["volume", "open_interest"]].sum().sort_values("type")
 fig_cp = make_subplots(rows=1, cols=2, subplot_titles=("Volume", "Open Interest"))
-fig_cp.add_trace(go.Bar(x=agg_cp["type"], y=agg_cp["volume"]), row=1, col=1)
-fig_cp.add_trace(go.Bar(x=agg_cp["type"], y=agg_cp["open_interest"]), row=1, col=2)
+fig_cp.add_trace(go.Bar(x=agg_cp["type"].str.upper(), y=agg_cp["volume"]), row=1, col=1)
+fig_cp.add_trace(go.Bar(x=agg_cp["type"].str.upper(), y=agg_cp["open_interest"]), row=1, col=2)
+fig_cp.update_layout(height=420, title_text="Calls vs Puts — Volume & Open Interest", showlegend=False)
 st.plotly_chart(fig_cp, use_container_width=True)
 
 # 3) OI per strike per expiratie
 if selected_exps:
     for e in selected_exps[:5]:
-        sub = df[df["expiration"] == e].groupby("strike", as_index=False)["open_interest"].sum()
+        sub = df[df["expiration"] == e].groupby("strike", as_index=False)["open_interest"].sum().sort_values("strike")
+        if sub.empty: 
+            continue
         fig = go.Figure(go.Bar(x=sub["strike"], y=sub["open_interest"]))
-        fig.update_layout(title=f"Open Interest per Strike — Expiry {e}")
+        fig.update_layout(title=f"Open Interest per Strike — Expiry {e}", xaxis_title="Strike", yaxis_title="Open Interest", height=380)
         st.plotly_chart(fig, use_container_width=True)
 
 # 4) Heatmap (Volume of OI)
-metric_choice = st.radio("Heatmap metric", ["volume", "open_interest"], horizontal=True)
+metric_choice = st.radio("Heatmap metric", ["volume", "open_interest"], horizontal=True, index=0)
 bins = st.slider("Aantal strike-bins", 20, 100, 40, step=5)
 q_low, q_hi = df["strike"].quantile([0.02, 0.98])
 strike_bins = np.linspace(q_low, q_hi, bins+1)
@@ -193,28 +231,32 @@ labels = 0.5 * (strike_bins[:-1] + strike_bins[1:])
 df_hm = df[(df["strike"] >= q_low) & (df["strike"] <= q_hi)].copy()
 df_hm["strike_bin"] = pd.cut(df_hm["strike"], bins=strike_bins, labels=np.round(labels, 1), include_lowest=True)
 pivot = df_hm.pivot_table(index="days_to_exp", columns="strike_bin", values=metric_choice, aggfunc="sum", fill_value=0)
-fig_hm = go.Figure(data=go.Heatmap(z=pivot.values, x=pivot.columns.astype(str), y=pivot.index))
+fig_hm = go.Figure(data=go.Heatmap(z=pivot.values, x=[float(x) for x in pivot.columns.astype(float)], y=pivot.index))
+fig_hm.update_layout(title=f"Heatmap — {metric_choice.capitalize()} over DTE × Strike", xaxis_title="Strike (bin)", yaxis_title="DTE", height=520)
 st.plotly_chart(fig_hm, use_container_width=True)
 
 # 5) PPD
 colL, colR = st.columns(2)
 with colL:
     fig_ppd_hist = go.Figure(go.Histogram(x=df["ppd"].dropna(), nbinsx=60))
+    fig_ppd_hist.update_layout(title="PPD Distributie", xaxis_title="PPD", yaxis_title="Aantal", height=420)
     st.plotly_chart(fig_ppd_hist, use_container_width=True)
 with colR:
-    ts_ppd = df.groupby(df["snapshot_date"].dt.date)["ppd"].mean().reset_index()
+    ts_ppd = df.groupby(df["snapshot_date"].dt.date, as_index=False)["ppd"].mean()
     fig_ppd_ts = go.Figure(go.Scatter(x=ts_ppd["snapshot_date"], y=ts_ppd["ppd"], mode="lines"))
+    fig_ppd_ts.update_layout(title="Gemiddelde PPD per dag", xaxis_title="Snapshot date", yaxis_title="PPD", height=420)
     st.plotly_chart(fig_ppd_ts, use_container_width=True)
 
 # 6) VIX vs IV
 vix_vs_iv = df.groupby(df["snapshot_date"].dt.date).agg(vix=("vix", "mean"), iv=("implied_volatility", "mean")).reset_index()
-fig_vix = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05)
-fig_vix.add_trace(go.Scatter(x=vix_vs_iv["snapshot_date"], y=vix_vs_iv["vix"], name="VIX"), row=1, col=1)
-fig_vix.add_trace(go.Scatter(x=vix_vs_iv["snapshot_date"], y=vix_vs_iv["iv"], name="IV"), row=2, col=1)
+fig_vix = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, subplot_titles=("VIX", "Gemiddelde IV"))
+fig_vix.add_trace(go.Scatter(x=vix_vs_iv["snapshot_date"], y=vix_vs_iv["vix"], mode="lines", name="VIX"), row=1, col=1)
+fig_vix.add_trace(go.Scatter(x=vix_vs_iv["snapshot_date"], y=vix_vs_iv["iv"], mode="lines", name="IV"), row=2, col=1)
+fig_vix.update_layout(height=520, title_text="VIX vs Gemiddelde Implied Volatility")
 st.plotly_chart(fig_vix, use_container_width=True)
 
 # 7) Tabel — top contracts
-metric_top = st.radio("Top contracts sorteer op", ["volume", "open_interest"], horizontal=True)
+metric_top = st.radio("Top contracts sorteer op", ["volume", "open_interest"], horizontal=True, index=0)
 cols_view = ["snapshot_date","contract_symbol","type","expiration","days_to_exp","strike","underlying_price",
              "implied_volatility","last_price","bid","ask","mid_price","volume","open_interest","ppd"]
 tbl = df[cols_view].sort_values(metric_top, ascending=False).head(200)
