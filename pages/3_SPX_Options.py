@@ -64,7 +64,6 @@ with colA:
         min_value=min_date, max_value=max_date, format="YYYY-MM-DD"
     )
 with colB:
-    # ✅ Altijd 1 type
     sel_type = st.radio("Type", ["call", "put"], index=1, horizontal=True)
 with colC:
     dte_range = st.slider("Days to Expiration (DTE)", 0, 365, (0, 60), step=1)
@@ -133,10 +132,46 @@ if df.empty:
 # ── KPI's ──────────────────────────────────────────────────────────────────────
 col1, col2, col3, col4 = st.columns(4)
 with col1: st.metric("Records", f"{len(df):,}")
-with col2: st.metric("Gem. IV", f"{df['implied_volatility'].mean():.2%}")
+with col2: st.metric("Gem. IV", f"{df['implied_volatility"].mean():.2%}")
 with col3: st.metric("Som Volume", f"{int(df['volume'].sum()):,}")
 with col4: st.metric("Som Open Interest", f"{int(df['open_interest'].sum()):,}")
 st.markdown("---")
+
+# ── Helper: outlier handling (één centrale functie/keuze) ──────────────────────
+st.caption("Outliers kunnen de schaal van grafieken verstoren. Kies hieronder een methode.")
+col_out1, col_out2 = st.columns([1.2, 1])
+with col_out1:
+    outlier_mode = st.radio(
+        "Outlier-methode",
+        ["Geen", "Percentiel clip", "IQR filter", "Z‑score filter"],
+        horizontal=True, index=1
+    )
+with col_out2:
+    pct_clip = st.slider("Percentiel clip (links/rechts)", 0, 10, 1, step=1,
+                         help="Alleen gebruikt bij 'Percentiel clip'")
+
+def apply_outlier(series: pd.Series, mode: str, pct: int) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    if mode == "Geen":
+        return s
+    if mode == "Percentiel clip":
+        if s.notna().any():
+            lo, hi = np.nanpercentile(s, [pct, 100 - pct])
+            return s.clip(lower=lo, upper=hi)
+        return s
+    if mode == "IQR filter":
+        if s.notna().any():
+            q1, q3 = np.nanpercentile(s, [25, 75])
+            iqr = q3 - q1
+            lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            return s.where((s >= lo) & (s <= hi), np.nan)
+        return s
+    if mode == "Z‑score filter":
+        mu, sd = np.nanmean(s), np.nanstd(s)
+        if sd == 0 or np.isnan(sd): return s
+        z = (s - mu) / sd
+        return s.where(np.abs(z) <= 3.0, np.nan)
+    return s
 
 # ── A) SERIE-SELECTIE — één optiereeks volgen ──────────────────────────────────
 st.subheader("Serie-selectie — volg één optiereeks door de tijd")
@@ -151,77 +186,117 @@ with colS2:
 with colS3:
     series_price_col = st.radio("Prijsbron", ["last_price","mid_price"], index=0, horizontal=True)
 with colS4:
-    pass
+    show_underlying_local = st.checkbox("Alleen Price & PPD (zonder S&P500)", value=False)
 
 serie = df[(df["strike"]==series_strike) & (df["expiration"]==series_exp)].copy().sort_values("snapshot_date")
-
 if serie.empty:
     st.info("Geen ticks voor deze combinatie binnen de huidige filters.")
 else:
     fig_ser = make_subplots(specs=[[{"secondary_y": True}]])
-    fig_ser.add_trace(go.Scatter(x=serie["snapshot_date"], y=serie[series_price_col], name="Price", mode="lines+markers"), secondary_y=False)
-    fig_ser.add_trace(go.Scatter(x=serie["snapshot_date"], y=serie["ppd"], name="PPD", mode="lines"), secondary_y=True)
-    if show_underlying:
-        fig_ser.add_trace(go.Scatter(x=serie["snapshot_date"], y=serie["underlying_price"], name="SP500", mode="lines", line=dict(dash="dot")), secondary_y=False)
+    fig_ser.add_trace(go.Scatter(x=serie["snapshot_date"], y=apply_outlier(serie[series_price_col], outlier_mode, pct_clip),
+                                 name="Price", mode="lines+markers"), secondary_y=False)
+    fig_ser.add_trace(go.Scatter(x=serie["snapshot_date"], y=apply_outlier(serie["ppd"], outlier_mode, pct_clip),
+                                 name="PPD", mode="lines"), secondary_y=True)
+    if show_underlying and not show_underlying_local:
+        fig_ser.add_trace(go.Scatter(x=serie["snapshot_date"], y=serie["underlying_price"], name="SP500",
+                                     mode="lines", line=dict(dash="dot")), secondary_y=False)
     fig_ser.update_layout(title=f"{sel_type.upper()} {series_strike} — exp {series_exp}", height=430, hovermode="x unified")
     fig_ser.update_xaxes(title_text="Meetmoment")
-    fig_ser.update_yaxes(title_text="Price / SP500", secondary_y=False)
-    fig_ser.update_yaxes(title_text="PPD", secondary_y=True)
+    fig_ser.update_yaxes(title_text="Price / SP500", secondary_y=False, rangemode="tozero")
+    fig_ser.update_yaxes(title_text="PPD", secondary_y=True,  rangemode="tozero")
+    if outlier_mode != "Geen":
+        fig_ser.add_annotation(xref="paper", yref="paper", x=1, y=1.08, xanchor="right", showarrow=False,
+                               text=f"Outlier: {outlier_mode}")
     st.plotly_chart(fig_ser, use_container_width=True)
 
 # ── B) PPD & Afstand tot Uitoefenprijs ─────────────────────────────────────────
 st.subheader("PPD & Afstand tot Uitoefenprijs (ATM→OTM/ITM)")
 
-# Neem laatste snapshot binnen range
-last_snap = df["snapshot_date"].max()
-df_last = df[df["snapshot_date"]==last_snap].copy()
-ppd_vs_dist = (
-    df_last.groupby("abs_dist_pct", as_index=False)["ppd"].mean().sort_values("abs_dist_pct")
+# Peildatum kiezen (default: meest recente)
+snapshots = sorted(df["snapshot_date"].dt.floor("min").unique())
+default_idx = len(snapshots) - 1 if snapshots else 0
+sel_snapshot = st.selectbox(
+    "Peildatum (snapshot)", options=snapshots, index=default_idx,
+    format_func=lambda x: pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")
 )
 
-fig_ppd_dist = go.Figure(go.Scatter(x=ppd_vs_dist["abs_dist_pct"], y=ppd_vs_dist["ppd"], mode="lines+markers"))
+df_last = df[df["snapshot_date"] == sel_snapshot].copy()
+
+ppd_vs_dist = (
+    df_last.assign(ppd_f=apply_outlier(df_last["ppd"], outlier_mode, pct_clip))
+          .groupby(((df_last["dist_points"].abs() / df_last["underlying_price"]) * 100.0)
+          .round(2), as_index=False)["ppd_f"].mean()
+          .rename(columns={"ppd_f": "ppd"})
+          .sort_values(0)
+)
+ppd_vs_dist.rename(columns={0: "abs_dist_pct"}, inplace=True)
+
+fig_ppd_dist = go.Figure(go.Scatter(x=ppd_vs_dist["abs_dist_pct"], y=ppd_vs_dist["ppd"], mode="lines+markers", name="PPD"))
 fig_ppd_dist.update_layout(
-    title=f"PPD vs Afstand tot Strike — laatst gemeten ({last_snap.strftime('%Y-%m-%d %H:%M')})",
-    xaxis_title="Afstand tot strike (|strike - underlying| / underlying, %)",
+    title=f"PPD vs Afstand tot Strike — {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}",
+    xaxis_title="Afstand tot strike (|strike − underlying| / underlying, %)",
     yaxis_title="PPD",
     height=400
 )
 st.plotly_chart(fig_ppd_dist, use_container_width=True)
 
-# ── C) Ontwikkeling Prijs per Expiratiedatum (laatste snapshot) ────────────────
+# ── C) Ontwikkeling Prijs per Expiratiedatum (peildatum) ───────────────────────
 st.subheader("Ontwikkeling Prijs per Expiratiedatum (laatste snapshot)")
 
-df_last_strike = df[df["snapshot_date"]==last_snap]
-exp_curve = (
-    df_last_strike[df_last_strike["strike"]==series_strike]
+exp_curve_raw = (
+    df_last[df_last["strike"] == series_strike]
       .groupby("expiration", as_index=False)
-      .agg(price=("last_price","mean"), ppd=("ppd","mean"))
+      .agg(price=("last_price", "mean"), ppd=("ppd", "mean"))
       .sort_values("expiration")
 )
+exp_curve = exp_curve_raw.copy()
+exp_curve["price_f"] = apply_outlier(exp_curve["price"], outlier_mode, pct_clip)
+exp_curve["ppd_f"]   = apply_outlier(exp_curve["ppd"], outlier_mode, pct_clip)
 
 fig_exp = make_subplots(specs=[[{"secondary_y": True}]])
-fig_exp.add_trace(
-    go.Scatter(x=exp_curve["expiration"], y=exp_curve["price"],
-               name="Price", mode="lines+markers"),
-    secondary_y=False
-)
-fig_exp.add_trace(
-    go.Scatter(x=exp_curve["expiration"], y=exp_curve["ppd"],
-               name="PPD", mode="lines+markers"),
-    secondary_y=True
-)
+fig_exp.add_trace(go.Scatter(x=exp_curve["expiration"], y=exp_curve["price_f"], name="Price", mode="lines+markers"), secondary_y=False)
+fig_exp.add_trace(go.Scatter(x=exp_curve["expiration"], y=exp_curve["ppd_f"],   name="PPD",   mode="lines+markers"), secondary_y=True)
 fig_exp.update_layout(
-    title=f"{sel_type.upper()} — Strike {series_strike} — laatste snapshot",
+    title=f"{sel_type.upper()} — Strike {series_strike} — peildatum {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}",
     height=420, hovermode="x unified"
 )
 fig_exp.update_xaxes(title_text="Expiratiedatum")
-fig_exp.update_yaxes(title_text="Price", secondary_y=False)
-fig_exp.update_yaxes(title_text="PPD", secondary_y=True)
+fig_exp.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
+fig_exp.update_yaxes(title_text="PPD",   secondary_y=True,  rangemode="tozero")
+if outlier_mode != "Geen":
+    fig_exp.add_annotation(xref="paper", yref="paper", x=1, y=1.08, xanchor="right", showarrow=False,
+                           text=f"Outlier: {outlier_mode}")
 st.plotly_chart(fig_exp, use_container_width=True)
+
+# ── D) PPD vs DTE — zelfde outlier‑logica ──────────────────────────────────────
+st.subheader("PPD vs DTE — opbouw van premium per dag")
+
+mode_col, atm_col, win_col = st.columns([1.2, 1, 1])
+with mode_col:
+    ppd_mode = st.radio("Bereik", ["ATM-band (moneyness)", "Rond gekozen strike"], horizontal=False, index=0)
+with atm_col:
+    atm_band = st.slider("ATM-band (± moneyness %)", 0.01, 0.10, 0.02, step=0.01)
+with win_col:
+    strike_window = st.slider("Strike-venster rond gekozen strike (punten)", 10, 200, 50, step=10)
+
+if ppd_mode.startswith("ATM"):
+    df_ppd = df[np.abs(df["moneyness"]) <= atm_band].copy()
+else:
+    df_ppd = df[(df["strike"] >= series_strike - strike_window) &
+                (df["strike"] <= series_strike + strike_window)].copy()
+
+ppd_curve = (df_ppd.assign(ppd_f=apply_outlier(df_ppd["ppd"], outlier_mode, pct_clip))
+                 .groupby("days_to_exp", as_index=False)["ppd_f"].mean()
+                 .rename(columns={"ppd_f": "ppd"})
+                 .sort_values("days_to_exp"))
+
+fig_ppd_dte = go.Figure(go.Scatter(x=ppd_curve["days_to_exp"], y=ppd_curve["ppd"], mode="lines+markers"))
+fig_ppd_dte.update_layout(title="PPD vs Days To Expiration", xaxis_title="Days to Expiration", yaxis_title="Gemiddelde PPD", height=400)
+st.plotly_chart(fig_ppd_dte, use_container_width=True)
 
 st.markdown("---")
 
-# ── D) MATRIX — meetmoment × strike (Heatmap & Gekleurde tabel) ────────────────
+# ── E) MATRIX — meetmoment × strike (Heatmap & Gekleurde tabel) ────────────────
 st.subheader("Matrix — meetmoment × strike")
 
 colM1, colM2, colM3, colM4 = st.columns([1, 1, 1, 1])
@@ -242,17 +317,20 @@ else:
     pivot = mx.pivot_table(index="snap_s", columns="strike", values=matrix_metric, aggfunc="mean")
     pivot = pivot.sort_index(ascending=False).round(2)
 
+    # Voor de HEATMAP: kleuren gebaseerd op geclipte waarden (outlier‑safe)
+    arr_raw = pivot.values.astype(float)
+    arr_clip = apply_outlier(pd.Series(arr_raw.flatten()), outlier_mode, pct_clip).values.reshape(arr_raw.shape)
+
     tab_hm, tab_tbl = st.tabs(["Heatmap", "Tabel (met kleur)"])
 
-    # Heatmap
     with tab_hm:
-        z = pivot.values
+        z = arr_clip  # geclipte waarden voor kleur
         x = pivot.columns.astype(float)
         y = pivot.index.tolist()
         fig_mx = go.Figure(data=go.Heatmap(
             z=z, x=x, y=y,
             colorbar_title=matrix_metric.capitalize(),
-            hovertemplate="Snapshot: %{y}<br>Strike: %{x}<br>Value: %{z}<extra></extra>"
+            hovertemplate="Snapshot: %{y}<br>Strike: %{x}<br>Value: %{z:.2f}<extra></extra>"
         ))
         fig_mx.update_layout(
             title=f"Heatmap — {sel_type.upper()} exp {matrix_exp} — {matrix_metric}",
@@ -260,35 +338,37 @@ else:
         )
         st.plotly_chart(fig_mx, use_container_width=True)
 
-    # Gekleurde tabel
     with tab_tbl:
+        # TABEL: getallen ongewijzigd; kleuren op basis van geclipte schaal
         scale = "Blues" if matrix_metric in ("last_price", "mid_price") else "Oranges"
-        arr = pivot.values.astype(float)
-        if np.isfinite(arr).any():
-            vmin, vmax = np.nanmin(arr), np.nanmax(arr)
-        else:
-            vmin, vmax = 0.0, 1.0
+        # normaliseer geclipte matrix voor kleurbereik
+        vmin = np.nanmin(arr_clip) if np.isfinite(arr_clip).any() else 0.0
+        vmax = np.nanmax(arr_clip) if np.isfinite(arr_clip).any() else 1.0
         denom = (vmax - vmin) if vmax != vmin else 1.0
-        norm = (np.nan_to_num(arr, nan=vmin) - vmin) / denom
+        norm = (np.nan_to_num(arr_clip, nan=vmin) - vmin) / denom
+
+        # kolomgewijs kleur-lijsten
         cell_colors = []
         for col_idx in range(norm.shape[1]):
             col_vals = norm[:, col_idx]
             col_colors = [pc.sample_colorscale(scale, float(v)) for v in col_vals]
             cell_colors.append(col_colors)
+
         header_vals = ["Snapshot"] + [str(c) for c in pivot.columns.tolist()]
         cell_vals = [pivot.index.tolist()] + [pivot[c].tolist() for c in pivot.columns.tolist()]
         header_color = pc.sample_colorscale(scale, 0.6)
 
         fig_tbl = go.Figure(data=[go.Table(
             header=dict(values=header_vals, fill_color=header_color, font=dict(color="white"), align="center"),
-            cells=dict(values=cell_vals, fill_color=[["white"]*len(pivot)] + cell_colors, align="right", format=[None]+[".2f"]*len(pivot.columns))
+            cells=dict(values=cell_vals, fill_color=[["white"]*len(pivot)] + cell_colors,
+                       align="right", format=[None]+[".2f"]*len(pivot.columns))
         )])
         fig_tbl.update_layout(title=f"Tabel — {sel_type.upper()} exp {matrix_exp} — {matrix_metric}", height=520)
         st.plotly_chart(fig_tbl, use_container_width=True)
 
 st.markdown("---")
 
-# ── E) Overige visualisaties (nu 1 type) ───────────────────────────────────────
+# ── F) Overige visualisaties (nu 1 type) ───────────────────────────────────────
 # Term structure (gem. IV)
 term = df.groupby("days_to_exp", as_index=False)["implied_volatility"].mean().sort_values("days_to_exp")
 fig_term = go.Figure(go.Scatter(x=term["days_to_exp"], y=term["implied_volatility"], mode="lines+markers", name=f"IV {sel_type.upper()}"))
