@@ -15,42 +15,34 @@ try:
     with st.spinner("BigQuery check…"):
         bq_ping()
 except Exception as e:
-    st.error("Geen BigQuery-verbinding. Controleer je Secrets ([gcp_service_account]) en datasetrechten.")
+    st.error("Geen BigQuery-verbinding. Controleer Secrets ([gcp_service_account]).")
     st.caption(f"Details: {e}")
     st.stop()
 
-# ---- Sidebar ----
+# ---- Config uit Secrets (view vastzetten) ----
+SPX_VIEW = st.secrets.get("tables", {}).get(
+    "spx_view",
+    "nth-pier-468314-p7.marketdata.spx_with_vix_v"  # fallback
+)
+
 with st.sidebar:
     st.subheader("⚙️ Instellingen")
-
-    client = get_bq_client()
-    PROJECT = client.project
-    DATASET = "marketdata"
-
-    # Gebruik de VIEW met VIX-join
-    tbl_spx = st.text_input(
-        "BigQuery view",
-        value="nth-pier-468314-p7.marketdata.spx_with_vix_v",
-        help="Volledige naam van de view met VIX"
-    )
-
     days = st.slider("Periode (dagen terug)", 30, 1095, 180, step=30)
     end_d = date.today()
     start_d = end_d - timedelta(days=days)
-
     fast_mode = st.checkbox("Snelle modus (alleen Close)", value=True)
     show_ma   = st.checkbox("Toon MA50/MA200 (op Close)", value=True)
     show_vix  = st.checkbox("Toon VIX overlay (2e as)", value=True)
+    st.caption(f"Databron: `{SPX_VIEW}`")
 
 status = st.status("Data laden…", expanded=False)
 
-# ---- Queries (lichtgewicht en via de VIEW) ----
 def fetch_close_only():
     sql = f"""
     SELECT DATE(date) AS date,
-           CAST(close AS FLOAT64) AS close,
+           CAST(close AS FLOAT64)     AS close,
            CAST(vix_close AS FLOAT64) AS vix_close
-    FROM `{tbl_spx}`
+    FROM `{SPX_VIEW}`
     WHERE DATE(date) BETWEEN @start AND @end
     ORDER BY date
     """
@@ -59,13 +51,13 @@ def fetch_close_only():
 def fetch_ohlc():
     sql = f"""
     SELECT DATE(date) AS date,
-           CAST(open  AS FLOAT64) AS open,
-           CAST(high  AS FLOAT64) AS high,
-           CAST(low   AS FLOAT64) AS low,
-           CAST(close AS FLOAT64) AS close,
-           CAST(volume AS INT64)  AS volume,
+           CAST(open  AS FLOAT64)     AS open,
+           CAST(high  AS FLOAT64)     AS high,
+           CAST(low   AS FLOAT64)     AS low,
+           CAST(close AS FLOAT64)     AS close,
+           CAST(volume AS INT64)      AS volume,
            CAST(vix_close AS FLOAT64) AS vix_close
-    FROM `{tbl_spx}`
+    FROM `{SPX_VIEW}`
     WHERE DATE(date) BETWEEN @start AND @end
     ORDER BY date
     """
@@ -85,9 +77,9 @@ except Exception as e:
         df = run_query(
             f"""
             SELECT DATE(date) AS date,
-                   CAST(close AS FLOAT64) AS close,
+                   CAST(close AS FLOAT64)     AS close,
                    CAST(vix_close AS FLOAT64) AS vix_close
-            FROM `{tbl_spx}`
+            FROM `{SPX_VIEW}`
             WHERE DATE(date) BETWEEN @start AND @end
             ORDER BY date
             """,
@@ -104,14 +96,13 @@ except Exception as e:
 
 df = df.sort_values("date").reset_index(drop=True)
 
-# ---- MA's op close (lichtgewicht) ----
+# ---- MA's op close ----
 if show_ma and "close" in df.columns:
     df["ma50"]  = df["close"].rolling(50).mean()
     df["ma200"] = df["close"].rolling(200).mean()
 
 # ---- Chart (VIX op 2e as) ----
-fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])  # 2e as voor VIX
-
+fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
 if fast_mode:
     fig.add_trace(go.Scatter(x=df["date"], y=df["close"], mode="lines", name="SPX Close"),
                   row=1, col=1, secondary_y=False)
@@ -137,12 +128,9 @@ fig.update_yaxes(title_text="SPX", secondary_y=False)
 if show_vix:
     fig.update_yaxes(title_text="VIX", secondary_y=True)
 fig.update_xaxes(showspikes=True, spikemode="across")
-
 st.plotly_chart(fig, use_container_width=True)
 
-# ---- Info ----
-rows = len(df)
 st.caption(
-    f"Periode: {start_d} → {end_d} • Rijen: {rows:,} • Modus: {'Close-only' if fast_mode else 'OHLC'} • "
+    f"Periode: {start_d} → {end_d} • Rijen: {len(df):,} • Modus: {'Close-only' if fast_mode else 'OHLC'} • "
     f"VIX overlay: {'aan' if show_vix else 'uit'}"
 )
