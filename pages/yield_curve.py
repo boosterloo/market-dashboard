@@ -1,4 +1,4 @@
-# pages/4_Yield_Curve.py
+# pages/yield_curve.py
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -8,36 +8,59 @@ st.set_page_config(page_title="Yield Curve Dashboard", layout="wide")
 st.title("🧯 Yield Curve Dashboard")
 
 PROJECT_ID = st.secrets["gcp_service_account"]["project_id"]
-TABLES = st.secrets.get("tables", {})
-# Lees de view uit secrets; val terug op de standaardnaam als niet gezet:
-YIELD_VIEW = TABLES.get(
-    "yield_view",
-    f"{PROJECT_ID}.marketdata.yield_curve_analysis_wide"
-)
+TABLES     = st.secrets.get("tables", {})
+YIELD_VIEW = TABLES.get("yield_view", f"{PROJECT_ID}.marketdata.yield_curve_analysis_wide")
 
-# ------------------------- Data ophalen -------------------------
-with st.spinner("Data ophalen uit BigQuery…"):
+# ---------- Helper: check welke kolommen bestaan ----------
+def list_columns(fully_qualified_table: str) -> set[str]:
+    # verwacht <project>.<dataset>.<table_or_view>
+    proj, dset, tbl = fully_qualified_table.split(".")
     sql = f"""
-    SELECT
-      date,
-      SAFE_CAST(y_3m AS FLOAT64)           AS y_3m,
-      SAFE_CAST(y_2y_synth AS FLOAT64)     AS y_2y,
-      SAFE_CAST(y_5y AS FLOAT64)           AS y_5y,
-      SAFE_CAST(y_10y AS FLOAT64)          AS y_10y,
-      SAFE_CAST(y_30y AS FLOAT64)          AS y_30y,
-      SAFE_CAST(spread_10_2 AS FLOAT64)    AS spread_10_2,
-      SAFE_CAST(spread_30_10 AS FLOAT64)   AS spread_30_10,
-      snapshot_date
-    FROM `{YIELD_VIEW}`
-    ORDER BY date
+    SELECT column_name
+    FROM `{proj}.{dset}.INFORMATION_SCHEMA.COLUMNS`
+    WHERE table_name = @tbl
     """
-    df = run_query(sql)
+    dfc = run_query(sql, params={"tbl": tbl}, timeout=30)
+    return set(dfc["column_name"].tolist())
 
-if df.empty:
-    st.warning("Geen data gevonden in de view. Controleer of de view gevuld is.")
+# ---------- Ophalen data met fallback y_2y_synth -> y_2y ----------
+cols = list_columns(YIELD_VIEW)
+use_y2y_synth = "y_2y_synth" in cols
+use_y2y       = "y_2y" in cols
+
+if not use_y2y_synth and not use_y2y:
+    st.error(f"De view `{YIELD_VIEW}` bevat geen kolom `y_2y_synth` of `y_2y`. Controleer je view.")
     st.stop()
 
-# ------------------------- Filters -------------------------
+y2y_expr = "y_2y_synth" if use_y2y_synth else "y_2y"
+
+base_sql = f"""
+SELECT
+  date,
+  SAFE_CAST(y_3m AS FLOAT64)         AS y_3m,
+  SAFE_CAST({y2y_expr} AS FLOAT64)   AS y_2y,
+  SAFE_CAST(y_5y AS FLOAT64)         AS y_5y,
+  SAFE_CAST(y_10y AS FLOAT64)        AS y_10y,
+  SAFE_CAST(y_30y AS FLOAT64)        AS y_30y,
+  SAFE_CAST(spread_10_2 AS FLOAT64)  AS spread_10_2,
+  SAFE_CAST(spread_30_10 AS FLOAT64) AS spread_30_10,
+  snapshot_date
+FROM `{YIELD_VIEW}`
+ORDER BY date
+"""
+
+try:
+    with st.spinner("Data ophalen uit BigQuery…"):
+        df = run_query(base_sql, timeout=60)
+except Exception as e:
+    st.error(f"Kon de view niet lezen: `{YIELD_VIEW}`.\nDetails: {type(e).__name__}")
+    st.stop()
+
+if df.empty:
+    st.warning("Geen data gevonden in de view (na query).")
+    st.stop()
+
+# ---------- Filters ----------
 cA, cB, cC, cD = st.columns([1.2,1.2,1,1.2])
 with cA:
     last_n = st.number_input("Laatste N dagen (0 = alles)", value=365, min_value=0, step=50)
@@ -53,7 +76,6 @@ with cD:
     show_table = st.toggle("Tabel tonen", value=False)
 
 df_f = df.copy()
-
 if filter_mode.startswith("Strikt"):
     df_f = df_f.dropna(subset=["y_3m","y_2y","y_5y","y_10y","y_30y"])
 else:
@@ -66,13 +88,13 @@ if df_f.empty:
     st.info("Na filteren is er geen data over.")
     st.stop()
 
-# ------------------------- Snapshot keuze -------------------------
+# ---------- Snapshot ----------
 st.sidebar.header("Snapshot")
 dates = list(df_f["date"].dropna().unique())
 sel_date = st.sidebar.selectbox("Kies datum", dates, index=len(dates)-1, format_func=str)
 snap = df_f[df_f["date"] == sel_date].tail(1)
 
-# ------------------------- KPI’s -------------------------
+# ---------- KPI’s ----------
 def fmt(x): 
     return "—" if pd.isna(x) else f"{round(float(x), round_dp)}%"
 
@@ -83,10 +105,9 @@ with k3: st.metric("5Y", fmt(snap["y_5y"].values[0] if not snap.empty else None)
 with k4: st.metric("10Y", fmt(snap["y_10y"].values[0] if not snap.empty else None))
 with k5: st.metric("30Y", fmt(snap["y_30y"].values[0] if not snap.empty else None))
 
-# ------------------------- Charts -------------------------
+# ---------- Charts ----------
 c1, c2 = st.columns([1.4,1])
 
-# Term structure (snapshot)
 with c1:
     st.subheader(f"Term Structure • {sel_date}")
     maturities = ["3M","2Y","5Y","10Y","30Y"]
@@ -102,7 +123,6 @@ with c1:
     fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Maturity")
     st.plotly_chart(fig, use_container_width=True)
 
-# Spreads (tijdreeks)
 with c2:
     st.subheader("Spreads (10Y-2Y, 30Y-10Y)")
     sp = go.Figure()
@@ -111,10 +131,8 @@ with c2:
     sp.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Spread (pp)", xaxis_title="Date")
     st.plotly_chart(sp, use_container_width=True)
 
-# Yields (tijdreeks)
 st.subheader("Rentes per looptijd (tijdreeks)")
-select_cols = st.multiselect(
-    "Selecteer looptijden",
+select_cols = st.multiselect("Selecteer looptijden",
     ["y_3m","y_2y","y_5y","y_10y","y_30y"],
     default=["y_2y","y_10y","y_30y"]
 )
@@ -125,24 +143,21 @@ if select_cols:
     yf.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Date")
     st.plotly_chart(yf, use_container_width=True)
 
-# Heatmap
 st.subheader("Heatmap van rentes")
 hm = df_f[["date","y_3m","y_2y","y_5y","y_10y","y_30y"]].set_index("date")
 hfig = go.Figure(data=go.Heatmap(
-    z=hm.T.values,
-    x=hm.index.astype(str),
-    y=["3M","2Y","5Y","10Y","30Y"],
-    coloraxis="coloraxis"
+    z=hm.T.values, x=hm.index.astype(str),
+    y=["3M","2Y","5Y","10Y","30Y"], coloraxis="coloraxis"
 ))
 hfig.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="Viridis")
 st.plotly_chart(hfig, use_container_width=True)
 
 # Tabel + download
+show_table = st.toggle("Tabel tonen", value=False)
 if show_table:
-    st.subheader("Tabel")
     st.dataframe(df_f.sort_values("date", ascending=False).round(round_dp))
 
 csv = df_f.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Download CSV (gefilterd)", data=csv, file_name="yield_curve_filtered.csv", mime="text/csv")
 
-st.caption(f"Bron: {YIELD_VIEW} • Lege datums gefilterd volgens gekozen modus.")
+st.caption(f"Bron: {YIELD_VIEW} • Lege datums gefilterd via instelling.")
