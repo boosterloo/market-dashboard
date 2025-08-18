@@ -25,22 +25,39 @@ SPX_VIEW = st.secrets.get("tables", {}).get(
     "nth-pier-468314-p7.marketdata.spx_with_vix_v"  # fallback
 )
 
+# ---- Bepaal dynamisch het maximum bereik (op basis van oudste datum in de view) ----
+try:
+    df_min = run_query(f"SELECT MIN(DATE(date)) AS d FROM `{SPX_VIEW}`", timeout=10)
+    min_date = pd.to_datetime(df_min["d"].iloc[0]).date()
+    today = date.today()
+    dyn_max_days = max(30, (today - min_date).days)
+    dyn_max_days = min(dyn_max_days, 3650)  # optionele bovengrens (±10 jaar)
+except Exception:
+    # veilige fallback
+    today = date.today()
+    dyn_max_days = 3650
+
+# ---- Sidebar ----
 with st.sidebar:
     st.subheader("⚙️ Instellingen")
-    days = st.slider("Periode (dagen terug)", 30, 1095, 180, step=30)
-    end_d = date.today()
+    days = st.slider("Periode (dagen terug)", 30, int(dyn_max_days), min(180, int(dyn_max_days)), step=30)
+    end_d = today
     start_d = end_d - timedelta(days=days)
-    fast_mode = st.checkbox("Snelle modus (alleen Close)", value=True)
-    show_ma   = st.checkbox("Toon MA50/MA200 (op Close)", value=True)
-    show_vix  = st.checkbox("Toon VIX overlay (2e as)", value=True)
+
+    fast_mode      = st.checkbox("Snelle modus (alleen Close)", value=True)
+    show_ma        = st.checkbox("Toon MA50/MA200 (op Close)", value=True)
+    show_vix       = st.checkbox("Toon VIX overlay (2e as)", value=True)
+    show_ha_table  = st.checkbox("Toon Heikin Ashi-tabel (OHLC nodig)", value=True)
+
     st.caption(f"Databron: `{SPX_VIEW}`")
 
 status = st.status("Data laden…", expanded=False)
 
+# ---- Queries via de VIEW ----
 def fetch_close_only():
     sql = f"""
     SELECT DATE(date) AS date,
-           CAST(close AS FLOAT64)     AS close,
+           CAST(close     AS FLOAT64) AS close,
            CAST(vix_close AS FLOAT64) AS vix_close
     FROM `{SPX_VIEW}`
     WHERE DATE(date) BETWEEN @start AND @end
@@ -51,17 +68,39 @@ def fetch_close_only():
 def fetch_ohlc():
     sql = f"""
     SELECT DATE(date) AS date,
-           CAST(open  AS FLOAT64)     AS open,
-           CAST(high  AS FLOAT64)     AS high,
-           CAST(low   AS FLOAT64)     AS low,
-           CAST(close AS FLOAT64)     AS close,
-           CAST(volume AS INT64)      AS volume,
+           CAST(open  AS FLOAT64) AS open,
+           CAST(high  AS FLOAT64) AS high,
+           CAST(low   AS FLOAT64) AS low,
+           CAST(close AS FLOAT64) AS close,
+           CAST(volume AS INT64)  AS volume,
            CAST(vix_close AS FLOAT64) AS vix_close
     FROM `{SPX_VIEW}`
     WHERE DATE(date) BETWEEN @start AND @end
     ORDER BY date
     """
     return run_query(sql, params={"start": start_d, "end": end_d}, timeout=25)
+
+# ---- Heikin Ashi helper ----
+def heikin_ashi(ohlc: pd.DataFrame) -> pd.DataFrame:
+    df = ohlc[["date", "open", "high", "low", "close"]].copy().reset_index(drop=True)
+    ha_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
+    ha_open = []
+    for i in range(len(df)):
+        if i == 0:
+            ha_open.append((df.loc[i, "open"] + df.loc[i, "close"]) / 2.0)
+        else:
+            ha_open.append((ha_open[-1] + ha_close.iloc[i - 1]) / 2.0)
+    ha_open = pd.Series(ha_open, index=df.index, name="ha_open")
+    ha_high = pd.concat([df["high"], ha_open, ha_close], axis=1).max(axis=1).rename("ha_high")
+    ha_low  = pd.concat([df["low"],  ha_open, ha_close], axis=1).min(axis=1).rename("ha_low")
+    out = pd.DataFrame({
+        "date": df["date"],
+        "ha_open": ha_open.round(2),
+        "ha_high": ha_high.round(2),
+        "ha_low":  ha_low.round(2),
+        "ha_close": ha_close.round(2),
+    })
+    return out
 
 # ---- Laden met fallback ----
 try:
@@ -77,7 +116,7 @@ except Exception as e:
         df = run_query(
             f"""
             SELECT DATE(date) AS date,
-                   CAST(close AS FLOAT64)     AS close,
+                   CAST(close     AS FLOAT64) AS close,
                    CAST(vix_close AS FLOAT64) AS vix_close
             FROM `{SPX_VIEW}`
             WHERE DATE(date) BETWEEN @start AND @end
@@ -101,7 +140,7 @@ if show_ma and "close" in df.columns:
     df["ma50"]  = df["close"].rolling(50).mean()
     df["ma200"] = df["close"].rolling(200).mean()
 
-# ---- Chart (VIX op 2e as) ----
+# ---- Plot (VIX op 2e as) ----
 fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
 if fast_mode:
     fig.add_trace(go.Scatter(x=df["date"], y=df["close"], mode="lines", name="SPX Close"),
@@ -130,6 +169,32 @@ if show_vix:
 fig.update_xaxes(showspikes=True, spikemode="across")
 st.plotly_chart(fig, use_container_width=True)
 
+# ---- Tabel 1: laatste rijen (Close + MA's + VIX) ----
+st.subheader("📋 Laatste rijen")
+last_cols = [c for c in ["date", "close", "ma50", "ma200", "vix_close"] if c in df.columns]
+df_last = df[last_cols].tail(30).copy()
+st.dataframe(df_last, use_container_width=True)
+
+# ---- Tabel 2: Heikin Ashi (alleen als aangevinkt) ----
+if show_ha_table:
+    st.subheader("📋 Heikin Ashi (op basis van OHLC)")
+    try:
+        if fast_mode:
+            # extra, gerichte OHLC-query voor dezelfde periode
+            with st.spinner("OHLC ophalen voor Heikin Ashi…"):
+                df_ohlc = fetch_ohlc()
+        else:
+            df_ohlc = df  # we hebben al OHLC
+
+        if df_ohlc.empty or not set(["open", "high", "low", "close"]).issubset(df_ohlc.columns):
+            st.info("Geen OHLC-data beschikbaar om Heikin Ashi te berekenen.")
+        else:
+            ha = heikin_ashi(df_ohlc)
+            st.dataframe(ha.tail(30), use_container_width=True)
+    except Exception as e:
+        st.warning(f"Heikin Ashi kon niet worden berekend: {e}")
+
+# ---- Footer info ----
 st.caption(
     f"Periode: {start_d} → {end_d} • Rijen: {len(df):,} • Modus: {'Close-only' if fast_mode else 'OHLC'} • "
     f"VIX overlay: {'aan' if show_vix else 'uit'}"
