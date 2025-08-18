@@ -21,37 +21,29 @@ def get_bq_client():
 _bq_client = get_bq_client()
 
 def _bq_param(name, value):
-    """Maak de juiste BigQuery query-parameter (scalar/array) met correcte type."""
-    # Array?
+    """Juiste BigQuery query-parameter (scalar/array) met correcte type."""
     if isinstance(value, (list, tuple)):
         if len(value) == 0:
-            # lege array -> forceer lege STRING-array
             return bigquery.ArrayQueryParameter(name, "STRING", [])
         elem = value[0]
-        # type bepalen op basis van eerste element
         if isinstance(elem, int):
             return bigquery.ArrayQueryParameter(name, "INT64", list(value))
         if isinstance(elem, float):
             return bigquery.ArrayQueryParameter(name, "FLOAT64", list(value))
-        # dates als STRING doorgeven is tricky; we kiezen DATE indien date obj
         if isinstance(elem, (date, pd.Timestamp, datetime)):
-            # cast naar ISO date string; query-vergelijking gebruikt DATE()
             return bigquery.ArrayQueryParameter(name, "DATE", [str(pd.to_datetime(v).date()) for v in value])
         return bigquery.ArrayQueryParameter(name, "STRING", [str(v) for v in value])
 
-    # Scalar
     if isinstance(value, bool):
         return bigquery.ScalarQueryParameter(name, "BOOL", value)
-    if isinstance(value, int) or isinstance(value, np.integer):
+    if isinstance(value, (int, np.integer)):
         return bigquery.ScalarQueryParameter(name, "INT64", int(value))
-    if isinstance(value, float) or isinstance(value, np.floating):
+    if isinstance(value, (float, np.floating)):
         return bigquery.ScalarQueryParameter(name, "FLOAT64", float(value))
     if isinstance(value, datetime):
         return bigquery.ScalarQueryParameter(name, "TIMESTAMP", value)
     if isinstance(value, (date, pd.Timestamp)):
-        # BigQuery DATE
         return bigquery.ScalarQueryParameter(name, "DATE", str(pd.to_datetime(value).date()))
-    # default: STRING
     return bigquery.ScalarQueryParameter(name, "STRING", str(value))
 
 def run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
@@ -96,8 +88,7 @@ with colA:
         max_value=max_date,
         format="YYYY-MM-DD"
     )
-    # Streamlit geeft tuple(date,date)
-    start_date, end_date = daterange
+    start_date, end_date = daterange  # tuple(date, date)
 with colB:
     opt_types = st.multiselect("Type", ["call", "put"], default=["call", "put"])
 with colC:
@@ -153,13 +144,13 @@ def load_filtered(start_date, end_date, types, dte_min, dte_max, mny_min, mny_ma
     SELECT * FROM base
     """
     params = {
-        "start": start_date,          # DATE param
-        "end": end_date,              # DATE param
-        "dte_min": int(dte_min),      # INT64
-        "dte_max": int(dte_max),      # INT64
-        "mny_min": float(mny_min),    # FLOAT64
-        "mny_max": float(mny_max),    # FLOAT64
-        "types": [t.lower() for t in types] if types else ["call", "put"],  # ARRAY<STRING>
+        "start": start_date,
+        "end": end_date,
+        "dte_min": int(dte_min),
+        "dte_max": int(dte_max),
+        "mny_min": float(mny_min),
+        "mny_max": float(mny_max),
+        "types": [t.lower() for t in types] if types else ["call", "put"],
     }
     df = run_query(sql, params=params)
     if not df.empty:
@@ -216,7 +207,7 @@ st.plotly_chart(fig_cp, use_container_width=True)
 if selected_exps:
     for e in selected_exps[:5]:
         sub = df[df["expiration"] == e].groupby("strike", as_index=False)["open_interest"].sum().sort_values("strike")
-        if sub.empty: 
+        if sub.empty:
             continue
         fig = go.Figure(go.Bar(x=sub["strike"], y=sub["open_interest"]))
         fig.update_layout(title=f"Open Interest per Strike — Expiry {e}", xaxis_title="Strike", yaxis_title="Open Interest", height=380)
@@ -241,19 +232,36 @@ with colL:
     fig_ppd_hist = go.Figure(go.Histogram(x=df["ppd"].dropna(), nbinsx=60))
     fig_ppd_hist.update_layout(title="PPD Distributie", xaxis_title="PPD", yaxis_title="Aantal", height=420)
     st.plotly_chart(fig_ppd_hist, use_container_width=True)
+
 with colR:
-    ts_ppd = df.groupby(df["snapshot_date"].dt.date, as_index=False)["ppd"].mean()
-    fig_ppd_ts = go.Figure(go.Scatter(x=ts_ppd["snapshot_date"], y=ts_ppd["ppd"], mode="lines"))
-    fig_ppd_ts.update_layout(title="Gemiddelde PPD per dag", xaxis_title="Snapshot date", yaxis_title="PPD", height=420)
-    st.plotly_chart(fig_ppd_ts, use_container_width=True)
+    # ✅ Robuuste grouping met gelabelde kolom
+    ts_ppd = (
+        df.assign(snap_date=df["snapshot_date"].dt.date)
+          .groupby("snap_date", as_index=False)["ppd"].mean()
+          .rename(columns={"snap_date": "date"})
+    )
+    if ts_ppd.empty:
+        st.info("Geen PPD-tijdreeks voor de huidige filters.")
+    else:
+        fig_ppd_ts = go.Figure(go.Scatter(x=ts_ppd["date"], y=ts_ppd["ppd"], mode="lines"))
+        fig_ppd_ts.update_layout(title="Gemiddelde PPD per dag", xaxis_title="Snapshot date", yaxis_title="PPD", height=420)
+        st.plotly_chart(fig_ppd_ts, use_container_width=True)
 
 # 6) VIX vs IV
-vix_vs_iv = df.groupby(df["snapshot_date"].dt.date).agg(vix=("vix", "mean"), iv=("implied_volatility", "mean")).reset_index()
-fig_vix = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, subplot_titles=("VIX", "Gemiddelde IV"))
-fig_vix.add_trace(go.Scatter(x=vix_vs_iv["snapshot_date"], y=vix_vs_iv["vix"], mode="lines", name="VIX"), row=1, col=1)
-fig_vix.add_trace(go.Scatter(x=vix_vs_iv["snapshot_date"], y=vix_vs_iv["iv"], mode="lines", name="IV"), row=2, col=1)
-fig_vix.update_layout(height=520, title_text="VIX vs Gemiddelde Implied Volatility")
-st.plotly_chart(fig_vix, use_container_width=True)
+vix_vs_iv = (
+    df.assign(snap_date=df["snapshot_date"].dt.date)
+      .groupby("snap_date", as_index=False)
+      .agg(vix=("vix", "mean"), iv=("implied_volatility", "mean"))
+      .rename(columns={"snap_date": "date"})
+)
+if vix_vs_iv.empty:
+    st.info("Geen VIX/IV-tijdreeks voor de huidige filters.")
+else:
+    fig_vix = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, subplot_titles=("VIX", "Gemiddelde IV"))
+    fig_vix.add_trace(go.Scatter(x=vix_vs_iv["date"], y=vix_vs_iv["vix"], mode="lines", name="VIX"), row=1, col=1)
+    fig_vix.add_trace(go.Scatter(x=vix_vs_iv["date"], y=vix_vs_iv["iv"], mode="lines", name="IV"), row=2, col=1)
+    fig_vix.update_layout(height=520, title_text="VIX vs Gemiddelde Implied Volatility")
+    st.plotly_chart(fig_vix, use_container_width=True)
 
 # 7) Tabel — top contracts
 metric_top = st.radio("Top contracts sorteer op", ["volume", "open_interest"], horizontal=True, index=0)
