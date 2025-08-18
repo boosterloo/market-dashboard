@@ -1,143 +1,115 @@
+# pages/1_SP500.py
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from datetime import date, timedelta
-
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 from utils.bq import run_query, get_bq_client
 
-st.set_page_config(page_title="S&P 500 + VIX", layout="wide")
+st.set_page_config(page_title="S&P 500", layout="wide")
+st.title("📈 S&P 500")
 
-st.title("📈 S&P 500 + 📉 VIX")
-
-# ---- Instellingen (links) ----
 with st.sidebar:
-    st.subheader("⚙️ Dashboard instellingen")
-
-    # Tabellen (pas aan indien jouw namen anders zijn)
+    st.subheader("⚙️ Instellingen")
     client = get_bq_client()
     PROJECT = client.project
-    DATASET_DEFAULT = "marketdata"
+    DATASET = "marketdata"
 
     tbl_spx = st.text_input(
-        "Tabel S&P 500",
-        value=f"{PROJECT}.{DATASET_DEFAULT}.sp500_prices",
-        help="Volledige tabelnaam in BigQuery"
-    )
-    tbl_vix = st.text_input(
-        "Tabel VIX",
-        value=f"{PROJECT}.{DATASET_DEFAULT}.vix_prices",
-        help="Volledige tabelnaam in BigQuery"
+        "BigQuery tabel",
+        value=f"{PROJECT}.{DATASET}.sp500_prices",
+        help="Volledige tabelnaam"
     )
 
-    # Snel en veilig defaulten (snelle cold start)
-    default_days = st.slider("🔎 Periode (dagen terug)", min_value=30, max_value=1095, value=180, step=30)
-    end_date = date.today()
-    start_date = end_date - timedelta(days=default_days)
+    days = st.slider("Periode (dagen terug)", 30, 1095, 180, step=30)
+    end_d = date.today()
+    start_d = end_d - timedelta(days=days)
 
-    use_ha = st.checkbox("Toon Heikin Ashi (SPX)", value=False)
-    show_ma = st.checkbox("Toon 50/200 MA (SPX)", value=True)
+    fast_mode = st.checkbox("Snelle modus (alleen Close)", value=True,
+                            help="Supersnel: alleen date+close. Uitschakelen = OHLC/candlestick laden.")
+    show_ma = st.checkbox("Toon MA50/MA200 (op Close)", value=True)
 
-# ---- Helpers ----
-def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
-    """Maak HA-OHLC op basis van gewone OHLC."""
-    out = df.copy()
-    out["ha_close"] = (out["open"] + out["high"] + out["low"] + out["close"]) / 4.0
-    ha_open = []
-    for i, row in out.iterrows():
-        if i == 0:
-            ha_open.append((row["open"] + row["close"]) / 2.0)
-        else:
-            ha_open.append((ha_open[-1] + out.loc[i-1, "ha_close"]) / 2.0)
-    out["ha_open"] = ha_open
-    out["ha_high"] = out[["high", "ha_open", "ha_close"]].max(axis=1)
-    out["ha_low"]  = out[["low", "ha_open", "ha_close"]].min(axis=1)
-    return out
-
-# ---- Data laden met duidelijke status ----
 status = st.status("Data laden…", expanded=False)
-try:
-    sql_spx = f"""
-    SELECT
-      DATE(date) AS date, open, high, low, close, volume
+
+def fetch_close_only():
+    sql = f"""
+    SELECT DATE(date) AS date, CAST(close AS FLOAT64) AS close
     FROM `{tbl_spx}`
     WHERE DATE(date) BETWEEN @start AND @end
     ORDER BY date
     """
-    df_spx = run_query(sql_spx, params={"start": start_date, "end": end_date})
+    return run_query(sql, params={"start": start_d, "end": end_d}, timeout=25)
 
-    sql_vix = f"""
-    SELECT
-      DATE(date) AS date, close
-    FROM `{tbl_vix}`
+def fetch_ohlc():
+    sql = f"""
+    SELECT DATE(date) AS date,
+           CAST(open AS FLOAT64)  AS open,
+           CAST(high AS FLOAT64)  AS high,
+           CAST(low  AS FLOAT64)  AS low,
+           CAST(close AS FLOAT64) AS close,
+           CAST(volume AS INT64)  AS volume
+    FROM `{tbl_spx}`
     WHERE DATE(date) BETWEEN @start AND @end
     ORDER BY date
     """
-    df_vix = run_query(sql_vix, params={"start": start_date, "end": end_date})
+    return run_query(sql, params={"start": start_d, "end": end_d}, timeout=25)
 
+# ---- Probeer snel pad; val terug op close-only 90d bij problemen ----
+try:
+    df = fetch_close_only() if fast_mode else fetch_ohlc()
+    if df.empty:
+        raise RuntimeError("Lege dataset voor de gekozen periode/tabel.")
     status.update(label="✅ Data geladen", state="complete", expanded=False)
 except Exception as e:
-    status.update(label="❌ Laden mislukt", state="error", expanded=True)
-    st.exception(e)
-    st.stop()
+    status.update(label="⚠️ Trage of mislukte query — val terug op 90 dagen close-only", state="error", expanded=True)
+    st.caption(f"Details: {e}")
+    try:
+        fallback_days = 90
+        df = run_query(
+            f"""
+            SELECT DATE(date) AS date, CAST(close AS FLOAT64) AS close
+            FROM `{tbl_spx}`
+            WHERE DATE(date) BETWEEN @start AND @end
+            ORDER BY date
+            """,
+            params={"start": end_d - timedelta(days=fallback_days), "end": end_d},
+            timeout=20
+        )
+        if df.empty:
+            st.error("Nog steeds geen data. Controleer de tabelnaam/gegevens in BigQuery.")
+            st.stop()
+        fast_mode = True  # we zitten in fallback
+    except Exception as e2:
+        st.error(f"Fallback faalde ook: {e2}")
+        st.stop()
 
-# ---- Validatie ----
-if df_spx.empty:
-    st.warning("Geen S&P 500-gegevens voor de gekozen periode/tabel.")
-    st.stop()
-if df_vix.empty:
-    st.warning("Geen VIX-gegevens voor de gekozen periode/tabel.")
-    st.stop()
+df = df.sort_values("date").reset_index(drop=True)
 
-# ---- Berekeningen ----
-df_spx = df_spx.sort_values("date").reset_index(drop=True)
-if show_ma:
-    df_spx["ma50"] = df_spx["close"].rolling(50).mean()
-    df_spx["ma200"] = df_spx["close"].rolling(200).mean()
+# ---- MA's op close (lichtgewicht) ----
+if show_ma and "close" in df.columns:
+    df["ma50"] = df["close"].rolling(50).mean()
+    df["ma200"] = df["close"].rolling(200).mean()
 
-if use_ha:
-    df_ha = heikin_ashi(df_spx)
+# ---- Chart ----
+fig = make_subplots(rows=1, cols=1)
 
-# ---- Plotten (2 rijen, gedeelde x) ----
-fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                    vertical_spacing=0.08,
-                    row_heights=[0.65, 0.35],
-                    subplot_titles=("S&P 500", "VIX"))
-
-# SPX
-if use_ha:
-    fig.add_trace(
-        go.Candlestick(x=df_ha["date"],
-                       open=df_ha["ha_open"], high=df_ha["ha_high"],
-                       low=df_ha["ha_low"], close=df_ha["ha_close"],
-                       name="SPX (Heikin Ashi)"),
-        row=1, col=1
-    )
+if fast_mode:
+    fig.add_trace(go.Scatter(x=df["date"], y=df["close"], mode="lines", name="SPX Close"))
 else:
-    fig.add_trace(
-        go.Scatter(x=df_spx["date"], y=df_spx["close"], mode="lines", name="SPX Close"),
-        row=1, col=1
-    )
+    fig.add_trace(go.Candlestick(
+        x=df["date"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="SPX OHLC"
+    ))
 
-if show_ma and not use_ha:
-    if df_spx["ma50"].notna().any():
-        fig.add_trace(go.Scatter(x=df_spx["date"], y=df_spx["ma50"], mode="lines", name="MA50"), row=1, col=1)
-    if df_spx["ma200"].notna().any():
-        fig.add_trace(go.Scatter(x=df_spx["date"], y=df_spx["ma200"], mode="lines", name="MA200"), row=1, col=1)
+if show_ma and fast_mode:
+    if df["ma50"].notna().any():
+        fig.add_trace(go.Scatter(x=df["date"], y=df["ma50"], mode="lines", name="MA50"))
+    if df["ma200"].notna().any():
+        fig.add_trace(go.Scatter(x=df["date"], y=df["ma200"], mode="lines", name="MA200"))
 
-# VIX
-fig.add_trace(
-    go.Scatter(x=df_vix["date"], y=df_vix["close"], mode="lines", name="VIX Close"),
-    row=2, col=1
-)
-
-fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=700, legend_orientation="h")
-fig.update_xaxes(showspikes=True, spikesnap="cursor", spikemode="across")
-fig.update_yaxes(tickformat=",", separatethousands=True)
-
+fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=520, legend_orientation="h")
+fig.update_xaxes(showspikes=True, spikemode="across")
 st.plotly_chart(fig, use_container_width=True)
 
-# ---- Extra: laatste update info ----
-st.caption(
-    f"Periode: {start_date} → {end_date} • Rijen SPX: {len(df_spx):,} • Rijen VIX: {len(df_vix):,}"
-)
+# ---- Info ----
+rows = len(df)
+st.caption(f"Periode: {start_d} → {end_d} • Rijen: {rows:,} • Modus: {'Close-only' if fast_mode else 'OHLC'}")
