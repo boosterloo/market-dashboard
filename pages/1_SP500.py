@@ -54,7 +54,17 @@ with st.sidebar:
     show_hist     = st.checkbox("Toon delta-histogrammen (abs & %)", value=True)
     bins          = st.slider("Aantal bins", 10, 120, 50, 5)
 
-    with st.expander("🔧 Indicator-instellingen (optioneel)"):
+    st.divider()
+    st.markdown("### 📐 Kerncijfers")
+    show_stats    = st.checkbox("Toon kerncijfers onder histogrammen", value=True)
+
+    st.divider()
+    st.markdown("### 📉 Realized Vol vs VIX")
+    show_rv       = st.checkbox("Toon rolling realized vol", value=True)
+    rv_w1         = st.number_input("RV window 1 (dagen)", min_value=5,  value=20, step=1)
+    rv_w2         = st.number_input("RV window 2 (dagen)", min_value=5,  value=60, step=1)
+
+    with st.expander("🔧 Indicator-instellingen (HA/ST/DC)"):
         st_len  = st.number_input("SuperTrend length", min_value=1, max_value=200, value=10, step=1)
         st_mult = st.number_input("SuperTrend multiplier", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
         dc_len  = st.number_input("Donchian Channel length", min_value=1, max_value=400, value=20, step=1)
@@ -212,21 +222,15 @@ if show_ma and "close" in df.columns:
     df["ma50"]  = df["close"].rolling(50).mean()
     df["ma200"] = df["close"].rolling(200).mean()
 
-# ---- Bereken daily delta (abs & %) robuust ----
-# Gebruik kolommen uit view als ze bestaan; anders berekenen op basis van close
+# ---- Daily delta (abs & %) ----
 if "delta_abs" in df.columns:
     df["delta_abs"] = pd.to_numeric(df["delta_abs"], errors="coerce")
 else:
     df["delta_abs"] = df["close"].diff()
 
 if "delta_pct" in df.columns:
-    # verwacht in %; indien in ratio, schaal naar %
     cand = pd.to_numeric(df["delta_pct"], errors="coerce")
-    # heuristiek: als absolute gemiddelde < 1, ga uit van ratio
-    if cand.dropna().abs().mean() < 1:
-        df["delta_pct"] = cand * 100.0
-    else:
-        df["delta_pct"] = cand
+    df["delta_pct"] = cand * 100.0 if cand.dropna().abs().mean() < 1 else cand
 else:
     df["delta_pct"] = df["close"].pct_change() * 100.0
 
@@ -259,11 +263,10 @@ if show_vix:
 fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)
 st.plotly_chart(fig, use_container_width=True)
 
-# ---- Heikin Ashi + SuperTrend + Donchian (tweede grafiek) ----
+# ---- Heikin Ashi + SuperTrend + Donchian ----
 if show_ha_chart:
     st.subheader("🕯️ Heikin Ashi + SuperTrend + Donchian")
 
-    # Zorg dat we OHLC hebben
     df_ohlc = fetch_ohlc() if fast_mode else df
     needed = {"open", "high", "low", "close"}
     if df_ohlc.empty or not needed.issubset(df_ohlc.columns):
@@ -275,13 +278,11 @@ if show_ha_chart:
 
         ha_fig = make_subplots(rows=1, cols=1)
 
-        # 1) Heikin Ashi candles
         ha_fig.add_trace(go.Candlestick(
             x=ha["date"], open=ha["ha_open"], high=ha["ha_high"], low=ha["ha_low"], close=ha["ha_close"],
             name="Heikin Ashi"
         ))
 
-        # 2) Donchian Channel (transparant; optionele vulling)
         ha_fig.add_trace(go.Scatter(x=dc["date"], y=dc["dc_upper"], mode="lines", name="DC Upper", line=dict(width=1)))
         ha_fig.add_trace(go.Scatter(x=dc["date"], y=dc["dc_lower"], mode="lines", name="DC Lower", line=dict(width=1)))
         if dc_fill:
@@ -293,7 +294,6 @@ if show_ha_chart:
                 fill="tonexty", fillcolor=f"rgba(150,150,220,{dc_opacity})", line=dict(width=0)
             ))
 
-        # 3) SuperTrend (groen/rood)
         st_up = st_df.where(st_df["trend"] == 1)["st_line"]
         st_dn = st_df.where(st_df["trend"] == -1)["st_line"]
         if st_up.notna().any():
@@ -318,7 +318,6 @@ if show_hist:
         hist_abs = go.Figure()
         x_abs = df["delta_abs"].dropna()
         hist_abs.add_trace(go.Histogram(x=x_abs, nbinsx=int(bins), name="Δ abs (punten)"))
-        # verticale lijn op 0
         hist_abs.add_shape(type="line", x0=0, x1=0, y0=0, y1=1, xref="x", yref="paper")
         hist_abs.update_layout(
             margin=dict(l=10, r=10, t=30, b=10),
@@ -345,8 +344,80 @@ if show_hist:
         hist_pct.update_xaxes(tickformat=".2f")
         st.plotly_chart(hist_pct, use_container_width=True)
 
+    # ---- Kerncijfers onder histogrammen ----
+    if show_stats:
+        st.markdown("#### 📐 Kerncijfers (daily changes)")
+        # Veilig casten
+        da = pd.to_numeric(df["delta_abs"], errors="coerce").dropna()
+        dp = pd.to_numeric(df["delta_pct"], errors="coerce").dropna()
+
+        def extrema_series(s: pd.Series):
+            if s.empty:
+                return np.nan, pd.NaT, np.nan, pd.NaT
+            i_max = int(s.idxmax())
+            i_min = int(s.idxmin())
+            return s.max(), df.loc[i_max, "date"], s.min(), df.loc[i_min, "date"]
+
+        max_up_abs, max_up_abs_d, max_dn_abs, max_dn_abs_d = extrema_series(da)
+        max_up_pct, max_up_pct_d, max_dn_pct, max_dn_pct_d = extrema_series(dp)
+
+        stats_df = pd.DataFrame({
+            "Metric": [
+                "Mean", "Median", "Stdev", "Skewness", "Excess Kurtosis",
+                "Max Up (abs)", "Max Down (abs)",
+                "Max Up (%)", "Max Down (%)"
+            ],
+            "Value": [
+                da.mean(), da.median(), da.std(), da.skew(), da.kurt(),
+                max_up_abs, max_dn_abs,
+                max_up_pct, max_dn_pct
+            ],
+            "Date": [
+                "", "", "", "", "",
+                max_up_abs_d, max_dn_abs_d,
+                max_up_pct_d, max_dn_pct_d
+            ]
+        })
+        # Nettere weergave
+        def fmt_val(v):
+            if pd.isna(v):
+                return ""
+            if isinstance(v, (np.float32, np.float64, float)):
+                return f"{v:,.4f}"
+            return str(v)
+
+        stats_df["Value"] = stats_df["Value"].apply(fmt_val)
+        stats_df["Date"]  = stats_df["Date"].apply(lambda d: "" if pd.isna(d) else str(d))
+        st.dataframe(stats_df, hide_index=True, use_container_width=True)
+
+# ---- Rolling realized volatility vs VIX ----
+if show_rv:
+    st.subheader("📉 Rolling Realized Volatility vs VIX (annualized, %)")
+
+    # returns in decimal
+    r = pd.to_numeric(df["delta_pct"], errors="coerce") / 100.0
+    rv1 = r.rolling(int(rv_w1)).std() * np.sqrt(252) * 100.0
+    rv2 = r.rolling(int(rv_w2)).std() * np.sqrt(252) * 100.0
+
+    rv_fig = go.Figure()
+    rv_fig.add_trace(go.Scatter(x=df["date"], y=rv1, mode="lines", name=f"RV {int(rv_w1)}d"))
+    rv_fig.add_trace(go.Scatter(x=df["date"], y=rv2, mode="lines", name=f"RV {int(rv_w2)}d"))
+
+    if "vix_close" in df.columns and df["vix_close"].notna().any():
+        rv_fig.add_trace(go.Scatter(x=df["date"], y=df["vix_close"], mode="lines", name="VIX (close)"))
+
+    rv_fig.update_layout(
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=420,
+        legend_orientation="h",
+        yaxis_title="%",
+    )
+    rv_fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)
+    st.plotly_chart(rv_fig, use_container_width=True)
+
 # ---- Footer info ----
 st.caption(
     f"Periode: {start_d} → {end_d} • Rijen: {len(df):,} • Modus: {'Close-only' if fast_mode else 'OHLC'} • "
-    f"VIX overlay: {'aan' if show_vix else 'uit'} • ST({int(st_len)},{float(st_mult)}) DC({int(dc_len)})"
+    f"VIX overlay: {'aan' if show_vix else 'uit'} • ST({int(st_len)},{float(st_mult)}) DC({int(dc_len)}) • "
+    f"RV windows: {int(rv_w1)}/{int(rv_w2)}"
 )
