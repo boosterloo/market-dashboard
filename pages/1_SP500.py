@@ -49,6 +49,11 @@ with st.sidebar:
     show_vix      = st.checkbox("Toon VIX overlay (2e as)", value=True)
     show_ha_chart = st.checkbox("Toon Heikin Ashi + SuperTrend + Donchian", value=True)
 
+    st.divider()
+    st.markdown("### 📊 Delta histogrammen")
+    show_hist     = st.checkbox("Toon delta-histogrammen (abs & %)", value=True)
+    bins          = st.slider("Aantal bins", 10, 120, 50, 5)
+
     with st.expander("🔧 Indicator-instellingen (optioneel)"):
         st_len  = st.number_input("SuperTrend length", min_value=1, max_value=200, value=10, step=1)
         st_mult = st.number_input("SuperTrend multiplier", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
@@ -141,19 +146,16 @@ def supertrend_on_ha(ha: pd.DataFrame, length: int = 10, multiplier: float = 1.0
             trend[i] = 1
             continue
 
-        # Final upper band
         if (upper_basic.iloc[i] < final_upper[i-1]) or (close.iloc[i-1] > final_upper[i-1]):
             final_upper[i] = upper_basic.iloc[i]
         else:
             final_upper[i] = final_upper[i-1]
 
-        # Final lower band
         if (lower_basic.iloc[i] > final_lower[i-1]) or (close.iloc[i-1] < final_lower[i-1]):
             final_lower[i] = lower_basic.iloc[i]
         else:
             final_lower[i] = final_lower[i-1]
 
-        # Trend switch
         if close.iloc[i] > final_upper[i-1]:
             trend[i] = 1
         elif close.iloc[i] < final_lower[i-1]:
@@ -210,6 +212,24 @@ if show_ma and "close" in df.columns:
     df["ma50"]  = df["close"].rolling(50).mean()
     df["ma200"] = df["close"].rolling(200).mean()
 
+# ---- Bereken daily delta (abs & %) robuust ----
+# Gebruik kolommen uit view als ze bestaan; anders berekenen op basis van close
+if "delta_abs" in df.columns:
+    df["delta_abs"] = pd.to_numeric(df["delta_abs"], errors="coerce")
+else:
+    df["delta_abs"] = df["close"].diff()
+
+if "delta_pct" in df.columns:
+    # verwacht in %; indien in ratio, schaal naar %
+    cand = pd.to_numeric(df["delta_pct"], errors="coerce")
+    # heuristiek: als absolute gemiddelde < 1, ga uit van ratio
+    if cand.dropna().abs().mean() < 1:
+        df["delta_pct"] = cand * 100.0
+    else:
+        df["delta_pct"] = cand
+else:
+    df["delta_pct"] = df["close"].pct_change() * 100.0
+
 # ---- Hoofdgrafiek (VIX op 2e as) ----
 fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
 if fast_mode:
@@ -236,7 +256,7 @@ fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=520, legend_orient
 fig.update_yaxes(title_text="SPX", secondary_y=False)
 if show_vix:
     fig.update_yaxes(title_text="VIX", secondary_y=True)
-fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)  # rangeslider uit
+fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)
 st.plotly_chart(fig, use_container_width=True)
 
 # ---- Heikin Ashi + SuperTrend + Donchian (tweede grafiek) ----
@@ -262,10 +282,8 @@ if show_ha_chart:
         ))
 
         # 2) Donchian Channel (transparant; optionele vulling)
-        #   - altijd de lijnen tonen
         ha_fig.add_trace(go.Scatter(x=dc["date"], y=dc["dc_upper"], mode="lines", name="DC Upper", line=dict(width=1)))
         ha_fig.add_trace(go.Scatter(x=dc["date"], y=dc["dc_lower"], mode="lines", name="DC Lower", line=dict(width=1)))
-        #   - optioneel: zachte bandvulling tussen lower en upper
         if dc_fill:
             ha_fig.add_trace(go.Scatter(
                 x=dc["date"], y=dc["dc_upper"], mode="lines", showlegend=False, line=dict(width=0)
@@ -286,8 +304,46 @@ if show_ha_chart:
                                         line=dict(width=2, color="red")))
 
         ha_fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), height=460, legend_orientation="h")
-        ha_fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)  # rangeslider uit
+        ha_fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)
         st.plotly_chart(ha_fig, use_container_width=True)
+
+# ---- Delta histogrammen (abs & %) ----
+if show_hist:
+    st.subheader("📊 Daily Delta Histogrammen")
+
+    c1, c2 = st.columns(2)
+
+    # Histogram Δ abs (punten)
+    with c1:
+        hist_abs = go.Figure()
+        x_abs = df["delta_abs"].dropna()
+        hist_abs.add_trace(go.Histogram(x=x_abs, nbinsx=int(bins), name="Δ abs (punten)"))
+        # verticale lijn op 0
+        hist_abs.add_shape(type="line", x0=0, x1=0, y0=0, y1=1, xref="x", yref="paper")
+        hist_abs.update_layout(
+            margin=dict(l=10, r=10, t=30, b=10),
+            height=340,
+            showlegend=False,
+            xaxis_title="Δ (punten)",
+            yaxis_title="Frequentie"
+        )
+        st.plotly_chart(hist_abs, use_container_width=True)
+
+    # Histogram Δ % (in procenten)
+    with c2:
+        hist_pct = go.Figure()
+        x_pct = df["delta_pct"].dropna()
+        hist_pct.add_trace(go.Histogram(x=x_pct, nbinsx=int(bins), name="Δ % (pct-points)"))
+        hist_pct.add_shape(type="line", x0=0, x1=0, y0=0, y1=1, xref="x", yref="paper")
+        hist_pct.update_layout(
+            margin=dict(l=10, r=10, t=30, b=10),
+            height=340,
+            showlegend=False,
+            xaxis_title="Δ (%)",
+            yaxis_title="Frequentie"
+        )
+        hist_pct.update_xaxes(tickformat=".2f")
+        st.plotly_chart(hist_pct, use_container_width=True)
 
 # ---- Footer info ----
 st.caption(
