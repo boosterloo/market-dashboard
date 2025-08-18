@@ -1,12 +1,22 @@
+# utils/bq.py
 import streamlit as st
 from google.cloud import bigquery
+from google.oauth2 import service_account
 import datetime as dt
 import pandas as pd
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Verbinding met BigQuery…")
 def get_bq_client() -> bigquery.Client:
-    # Authenticatie via Streamlit Cloud secrets of gcloud default creds
-    return bigquery.Client()
+    # Gebruik expliciete credentials uit Secrets
+    sa = st.secrets.get("gcp_service_account", None)
+    if not sa:
+        raise RuntimeError(
+            "Geen [gcp_service_account] in Secrets. "
+            "Ga naar Settings → Secrets en voeg je service-account JSON toe."
+        )
+    creds = service_account.Credentials.from_service_account_info(sa)
+    project = sa.get("project_id")
+    return bigquery.Client(credentials=creds, project=project)
 
 def _infer_bq_type(v):
     if isinstance(v, bool): return "BOOL"
@@ -18,14 +28,17 @@ def _infer_bq_type(v):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def run_query(sql: str, params: dict | None = None, timeout: int = 30) -> pd.DataFrame:
-    """Kleine, veilige wrapper om query’s te cachen en parameters te typen."""
     client = get_bq_client()
     job_config = None
     if params:
-        qparams = []
-        for k, v in params.items():
-            qparams.append(bigquery.ScalarQueryParameter(k, _infer_bq_type(v), v))
-        job_config = bigquery.QueryJobConfig(query_parameters=qparams)
+        from google.cloud import bigquery as bq
+        qparams = [bq.ScalarQueryParameter(k, _infer_bq_type(v), v) for k, v in params.items()]
+        job_config = bq.QueryJobConfig(query_parameters=qparams)
     job = client.query(sql, job_config=job_config)
-    df = job.result(timeout=timeout).to_dataframe(create_bqstorage_client=False)
-    return df
+    return job.result(timeout=timeout).to_dataframe(create_bqstorage_client=False)
+
+@st.cache_data(ttl=120)
+def bq_ping() -> bool:
+    client = get_bq_client()
+    client.query("SELECT 1").result()
+    return True
