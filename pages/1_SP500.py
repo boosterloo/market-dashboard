@@ -25,15 +25,14 @@ SPX_VIEW = st.secrets.get("tables", {}).get(
     "nth-pier-468314-p7.marketdata.spx_with_vix_v"  # fallback
 )
 
-# ---- Bepaal dynamisch het maximum bereik (op basis van oudste datum in de view) ----
+# ---- Bepaal dynamisch het maximum bereik ----
 try:
     df_min = run_query(f"SELECT MIN(DATE(date)) AS d FROM `{SPX_VIEW}`", timeout=10)
     min_date = pd.to_datetime(df_min["d"].iloc[0]).date()
     today = date.today()
     dyn_max_days = max(30, (today - min_date).days)
-    dyn_max_days = min(dyn_max_days, 3650)  # optionele bovengrens (±10 jaar)
+    dyn_max_days = min(dyn_max_days, 3650)  # optionele cap (±10 jaar)
 except Exception:
-    # veilige fallback
     today = date.today()
     dyn_max_days = 3650
 
@@ -47,7 +46,7 @@ with st.sidebar:
     fast_mode      = st.checkbox("Snelle modus (alleen Close)", value=True)
     show_ma        = st.checkbox("Toon MA50/MA200 (op Close)", value=True)
     show_vix       = st.checkbox("Toon VIX overlay (2e as)", value=True)
-    show_ha_table  = st.checkbox("Toon Heikin Ashi-tabel (OHLC nodig)", value=True)
+    show_ha_chart  = st.checkbox("Toon Heikin Ashi grafiek (OHLC nodig)", value=True)
 
     st.caption(f"Databron: `{SPX_VIEW}`")
 
@@ -95,10 +94,10 @@ def heikin_ashi(ohlc: pd.DataFrame) -> pd.DataFrame:
     ha_low  = pd.concat([df["low"],  ha_open, ha_close], axis=1).min(axis=1).rename("ha_low")
     out = pd.DataFrame({
         "date": df["date"],
-        "ha_open": ha_open.round(2),
-        "ha_high": ha_high.round(2),
-        "ha_low":  ha_low.round(2),
-        "ha_close": ha_close.round(2),
+        "ha_open": ha_open,
+        "ha_high": ha_high,
+        "ha_low":  ha_low,
+        "ha_close": ha_close,
     })
     return out
 
@@ -140,7 +139,7 @@ if show_ma and "close" in df.columns:
     df["ma50"]  = df["close"].rolling(50).mean()
     df["ma200"] = df["close"].rolling(200).mean()
 
-# ---- Plot (VIX op 2e as) ----
+# ---- Hoofdgrafiek (VIX op 2e as) ----
 fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
 if fast_mode:
     fig.add_trace(go.Scatter(x=df["date"], y=df["close"], mode="lines", name="SPX Close"),
@@ -169,30 +168,37 @@ if show_vix:
 fig.update_xaxes(showspikes=True, spikemode="across")
 st.plotly_chart(fig, use_container_width=True)
 
-# ---- Tabel 1: laatste rijen (Close + MA's + VIX) ----
-st.subheader("📋 Laatste rijen")
-last_cols = [c for c in ["date", "close", "ma50", "ma200", "vix_close"] if c in df.columns]
-df_last = df[last_cols].tail(30).copy()
-st.dataframe(df_last, use_container_width=True)
-
-# ---- Tabel 2: Heikin Ashi (alleen als aangevinkt) ----
-if show_ha_table:
-    st.subheader("📋 Heikin Ashi (op basis van OHLC)")
+# ---- Heikin Ashi grafiek ----
+if show_ha_chart:
+    st.subheader("🕯️ Heikin Ashi")
     try:
+        # Zorg dat we OHLC hebben (fast_mode = extra query)
         if fast_mode:
-            # extra, gerichte OHLC-query voor dezelfde periode
             with st.spinner("OHLC ophalen voor Heikin Ashi…"):
                 df_ohlc = fetch_ohlc()
         else:
-            df_ohlc = df  # we hebben al OHLC
+            df_ohlc = df
 
-        if df_ohlc.empty or not set(["open", "high", "low", "close"]).issubset(df_ohlc.columns):
+        needed = {"open", "high", "low", "close"}
+        if df_ohlc.empty or not needed.issubset(df_ohlc.columns):
             st.info("Geen OHLC-data beschikbaar om Heikin Ashi te berekenen.")
         else:
-            ha = heikin_ashi(df_ohlc)
-            st.dataframe(ha.tail(30), use_container_width=True)
+            ha = heikin_ashi(df_ohlc).dropna().reset_index(drop=True)
+
+            ha_fig = make_subplots(rows=1, cols=1)
+            ha_fig.add_trace(go.Candlestick(
+                x=ha["date"],
+                open=ha["ha_open"],
+                high=ha["ha_high"],
+                low=ha["ha_low"],
+                close=ha["ha_close"],
+                name="Heikin Ashi"
+            ), row=1, col=1)
+            ha_fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), height=420, showlegend=False)
+            ha_fig.update_xaxes(showspikes=True, spikemode="across")
+            st.plotly_chart(ha_fig, use_container_width=True)
     except Exception as e:
-        st.warning(f"Heikin Ashi kon niet worden berekend: {e}")
+        st.warning(f"Heikin Ashi kon niet worden getekend: {e}")
 
 # ---- Footer info ----
 st.caption(
