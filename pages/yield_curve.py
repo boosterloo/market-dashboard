@@ -38,7 +38,7 @@ if have("spread_10_2"): select_parts.append("SAFE_CAST(spread_10_2 AS FLOAT64) A
 if have("spread_30_10"): select_parts.append("SAFE_CAST(spread_30_10 AS FLOAT64) AS spread_30_10")
 if have("snapshot_date"): select_parts.append("snapshot_date")
 
-sql = f"SELECT\n  {', '.join(select_parts)}\nFROM `{YIELD_VIEW}`\nORDER BY date"
+sql = f"SELECT {', '.join(select_parts)} FROM `{YIELD_VIEW}` ORDER BY date"
 
 with st.spinner("Data ophalen uit BigQuery…"):
     df = run_query(sql, timeout=60)
@@ -88,7 +88,7 @@ if df_range.empty:
     st.info("Geen data in de gekozen periode.")
     st.stop()
 
-# ---------- Snapshot-keuze (onafhankelijk van periode) ----------
+# ---------- Snapshot-keuze ----------
 st.sidebar.header("Snapshot")
 all_dates = list(df_f["date"].dropna().unique())
 sel_date = st.sidebar.selectbox("Kies datum", all_dates, index=len(all_dates)-1, format_func=str)
@@ -102,7 +102,7 @@ for col, box in zip(["y_3m","y_2y","y_5y","y_10y","y_30y"], [k1,k2,k3,k4,k5]):
     val = fmt(snap[col].values[0]) if (col in snap.columns and not snap.empty) else "—"
     box.metric(col.upper().replace("_",""), val)
 
-# ---------- Grafieken (onder elkaar) ----------
+# ---------- Grafieken + Uitleg (onder elkaar) ----------
 
 # 1) Term Structure (snapshot)
 st.subheader(f"Term Structure • {sel_date}")
@@ -116,8 +116,17 @@ ts_fig = go.Figure()
 ts_fig.add_trace(go.Scatter(x=maturities, y=values, mode="lines+markers", name="Snapshot"))
 ts_fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Maturity")
 st.plotly_chart(ts_fig, use_container_width=True)
+st.markdown(
+    """
+**Wat je ziet:** de rentecurve (3M–30Y) op de gekozen datum.  
+**Interpretatie:**
+- *Normaal (oplopend)* → gezonde groei/verwachte inflatie.
+- *Vlak* → einde van de rente-cyclus / onzekerheid.
+- *Invers* (kort > lang) → verhoogd recessierisico.
+"""
+)
 
-# 2) Spreads (tijdreeks, gefilterd op periode)
+# 2) Spreads (tijdreeks)
 st.subheader("Spreads")
 if "spread_10_2" in df_range.columns or "spread_30_10" in df_range.columns:
     sp = go.Figure()
@@ -129,8 +138,17 @@ if "spread_10_2" in df_range.columns or "spread_30_10" in df_range.columns:
     st.plotly_chart(sp, use_container_width=True)
 else:
     st.info("Spreads niet beschikbaar in de view.")
+st.markdown(
+    """
+**Wat je ziet:** verschil tussen lange en kortere looptijden.  
+**Interpretatie:**
+- **10Y–2Y < 0** = inversie → historisch vaak 6–18 maanden vóór recessies.
+- Terug naar **positief** net vóór/tijdens de daadwerkelijke krimp.
+- **30Y–10Y** reflecteert vooral lange-termijn inflatiepremie/verwachtingen.
+"""
+)
 
-# 3) Rentes per looptijd (tijdreeks, gefilterd op periode)
+# 3) Rentes per looptijd (tijdreeks)
 st.subheader("Rentes per looptijd (tijdreeks)")
 avail_yields = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
 default_sel = [c for c in ["y_2y","y_10y","y_30y"] if c in avail_yields] or avail_yields[:2]
@@ -141,6 +159,15 @@ if sel:
         yf.add_trace(go.Scatter(x=df_range["date"], y=df_range[col], name=col.upper()))
     yf.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Date")
     st.plotly_chart(yf, use_container_width=True)
+st.markdown(
+    """
+**Wat je ziet:** afzonderlijke rentecurves door de tijd (gefilterd op je periode).  
+**Interpretatie:**
+- **Stijgende 2Y** → markt prijst meer/strakker beleid.
+- **Dalende 10Y/30Y** terwijl 2Y hoog blijft → groeistress/afkoeling.
+- **Parallelle verschuiving** (alles op/af) → macro-shock (CPI, FOMC, geopolitiek).
+"""
+)
 
 # 4) Heatmap (periode)
 st.subheader("Heatmap van rentes")
@@ -153,6 +180,12 @@ hfig = go.Figure(data=go.Heatmap(
 ))
 hfig.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="Viridis")
 st.plotly_chart(hfig, use_container_width=True)
+st.markdown(
+    """
+**Wat je ziet:** kleurintensiteit van rentes per looptijd door de tijd.  
+**Interpretatie:** donkere/clusters maken **periodes van hoge/lage rentes** en **snelle verschuivingen** zichtbaar (bijv. na CPI/FOMC).
+"""
+)
 
 # Tabel + download (periode)
 if show_table:
