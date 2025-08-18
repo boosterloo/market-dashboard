@@ -172,7 +172,7 @@ else:
 # ── B) PPD & Afstand tot Uitoefenprijs ─────────────────────────────────────────
 st.subheader("PPD & Afstand tot Uitoefenprijs (ATM→OTM/ITM)")
 
-# Neem laatste snapshot binnen range (zoals je eerdere dashboard deed)
+# Neem laatste snapshot binnen range
 last_snap = df["snapshot_date"].max()
 df_last = df[df["snapshot_date"]==last_snap].copy()
 ppd_vs_dist = (
@@ -200,9 +200,20 @@ exp_curve = (
 )
 
 fig_exp = make_subplots(specs=[[{"secondary_y": True}]])
-fig_exp.add_trace(go.Scatter(x=exp_curve["expiration"], y=exp_curve["price"], name="Price", mode="lines+markers"), secondary_y=False)
-fig_exp.add_trace(go.Scatter(x=exp_curve["expiration"], y=exp_curve["ppd"], name="PPD", mode="lines+markers"), secondary_y=True)
-fig_exp.update_layout(title=f"{sel_type.upper()} — Strike {series_strike} — laatste snapshot", height=420)
+fig_exp.add_trace(
+    go.Scatter(x=exp_curve["expiration"], y=exp_curve["price"],
+               name="Price", mode="lines+markers"),
+    secondary_y=False
+)
+fig_exp.add_trace(
+    go.Scatter(x=exp_curve["expiration"], y=exp_curve["ppd"],
+               name="PPD", mode="lines+markers"),
+    secondary_y=True
+)
+fig_exp.update_layout(
+    title=f"{sel_type.upper()} — Strike {series_strike} — laatste snapshot",
+    height=420, hovermode="x unified"
+)
 fig_exp.update_xaxes(title_text="Expiratiedatum")
 fig_exp.update_yaxes(title_text="Price", secondary_y=False)
 fig_exp.update_yaxes(title_text="PPD", secondary_y=True)
@@ -278,6 +289,7 @@ else:
 st.markdown("---")
 
 # ── E) Overige visualisaties (nu 1 type) ───────────────────────────────────────
+# Term structure (gem. IV)
 term = df.groupby("days_to_exp", as_index=False)["implied_volatility"].mean().sort_values("days_to_exp")
 fig_term = go.Figure(go.Scatter(x=term["days_to_exp"], y=term["implied_volatility"], mode="lines+markers", name=f"IV {sel_type.upper()}"))
 fig_term.update_layout(title="Term Structure — Gemiddelde IV", xaxis_title="DTE", yaxis_title="Implied Volatility", height=420)
@@ -292,7 +304,7 @@ if selected_exps:
             fig.update_layout(title=f"Open Interest per Strike — {sel_type.upper()} exp {e}", xaxis_title="Strike", yaxis_title="Open Interest", height=380)
             st.plotly_chart(fig, use_container_width=True)
 
-# VIX vs IV (zelfde type)
+# VIX vs IV
 vix_vs_iv = (df.assign(snap_date=df["snapshot_date"].dt.date)
                .groupby("snap_date", as_index=False)
                .agg(vix=("vix","mean"), iv=("implied_volatility","mean"))
