@@ -10,11 +10,11 @@ from plotly import colors as pc
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-# ───────────────────────────────── Helpers ─────────────────────────────────────
+# ───────────────────────────── Helpers ─────────────────────────────
 def pick_closest_date(options: list[date], target: date) -> date | None:
     if not options:
         return None
-    return min(options, key=lambda d: abs(pd.Timestamp(d) - pd.Timestamp(target))).astype(object)
+    return min(options, key=lambda d: abs(pd.Timestamp(d) - pd.Timestamp(target)))
 
 def pick_first_on_or_after(options: list[date], target: date) -> date | None:
     after = [d for d in options if d >= target]
@@ -25,7 +25,7 @@ def pick_closest_value(options: list[float], target: float, fallback: float | No
         return fallback
     return float(min(options, key=lambda x: abs(float(x) - float(target))))
 
-# ── BigQuery client via st.secrets ─────────────────────────────────────────────
+# ── BigQuery client via st.secrets ────────────────────────────────
 def get_bq_client():
     sa_info = st.secrets["gcp_service_account"]
     creds = service_account.Credentials.from_service_account_info(sa_info)
@@ -57,12 +57,12 @@ def run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
         job_config = bigquery.QueryJobConfig(query_parameters=[_bq_param(k, v) for k, v in params.items()])
     return _bq_client.query(sql, job_config=job_config).to_dataframe()
 
-# ── Page ───────────────────────────────────────────────────────────────────────
+# ── Page ──────────────────────────────────────────────────────────
 st.set_page_config(page_title="SPX Options Dashboard", layout="wide")
 st.title("🧩 SPX Options Dashboard")
 VIEW = "marketdata.spx_options_enriched_v"
 
-# ── Basisfilters ────────────────────────────────────────────────────────────────
+# ── Basisfilters ──────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
 def load_date_bounds():
     df = run_query(f"""
@@ -83,7 +83,7 @@ with colA:
         min_value=min_date, max_value=max_date, format="YYYY-MM-DD"
     )
 with colB:
-    sel_type = st.radio("Type", ["call", "put"], index=1, horizontal=True)  # keuze blijft vrij
+    sel_type = st.radio("Type", ["call", "put"], index=1, horizontal=True)
 with colC:
     dte_range = st.slider("Days to Expiration (DTE)", 0, 365, (0, 60), step=1)
 with colD:
@@ -104,7 +104,7 @@ def load_expirations(start_date: date, end_date: date, sel_type: str):
 
 exps = load_expirations(start_date, end_date, sel_type)
 
-# ── Data laden ─────────────────────────────────────────────────────────────────
+# ── Data laden ────────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=True)
 def load_filtered(start_date, end_date, sel_type, dte_min, dte_max, mny_min, mny_max):
     sql = f"""
@@ -139,6 +139,8 @@ def load_filtered(start_date, end_date, sel_type, dte_min, dte_max, mny_min, mny
             if c in df: df[c] = pd.to_numeric(df[c], errors="coerce")
         df["moneyness_pct"] = 100 * df["moneyness"]
         df["abs_dist_pct"]  = (np.abs(df["dist_points"]) / df["underlying_price"]) * 100.0
+        # ⬇️ minuut-niveau snapshot (cruciaal voor filtering)
+        df["snap_min"] = df["snapshot_date"].dt.floor("min")
     return df
 
 df = load_filtered(start_date, end_date, sel_type, dte_range[0], dte_range[1], mny_range[0], mny_range[1])
@@ -146,7 +148,7 @@ if df.empty:
     st.warning("Geen data voor de huidige filters.")
     st.stop()
 
-# ── KPI's ──────────────────────────────────────────────────────────────────────
+# ── KPI's ────────────────────────────────────────────────────────
 col1, col2, col3, col4 = st.columns(4)
 with col1: st.metric("Records", f"{len(df):,}")
 with col2: st.metric("Gem. IV", f"{df['implied_volatility'].mean():.2%}")
@@ -154,11 +156,11 @@ with col3: st.metric("Som Volume", f"{int(df['volume'].sum()):,}")
 with col4: st.metric("Som Open Interest", f"{int(df['open_interest'].sum()):,}")
 st.markdown("---")
 
-# ── Outlier-instellingen ───────────────────────────────────────────────────────
+# ── Outlier-instellingen ─────────────────────────────────────────
 st.caption("Outliers kunnen de schaal verstoren. Kies een methode.")
 col_out1, col_out2 = st.columns([1.2, 1])
 with col_out1:
-    outlier_mode = st.radio("Outlier-methode", ["Geen", "Percentiel clip", "IQR filter", "Z‑score filter"],
+    outlier_mode = st.radio("Outlier-methode", ["Geen", "Percentiel clip", "IQR filter", "Z-score filter"],
                             horizontal=True, index=1)
 with col_out2:
     pct_clip = st.slider("Percentiel clip (links/rechts)", 0, 10, 1, step=1,
@@ -180,34 +182,33 @@ def apply_outlier(series: pd.Series, mode: str, pct: int) -> pd.Series:
             lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
             return s.where((s >= lo) & (s <= hi), np.nan)
         return s
-    if mode == "Z‑score filter":
+    if mode == "Z-score filter":
         mu, sd = np.nanmean(s), np.nanstd(s)
         if sd == 0 or np.isnan(sd): return s
         z = (s - mu) / sd
         return s.where(np.abs(z) <= 3.0, np.nan)
     return s
 
-# ── Defaults: strike, expiratie, snapshot ──────────────────────────────────────
-# Onderliggende NU (laatste snapshot)
-latest_snap = df["snapshot_date"].max()
+# ── Defaults: snapshot(vandaag), strike(±), expiratie(+14d) ────────────────────
+# Alle snapshots op minuutniveau
+snapshots_all = sorted(df["snap_min"].unique())
 today_d = pd.Timestamp(date.today())
-# gebruik laatste snapshot van vandaag indien aanwezig, anders laatste beschikbare
-snapshots_all = sorted(df["snapshot_date"].dt.floor("min").unique())
+
 if any(pd.to_datetime(s).date() == today_d.date() for s in snapshots_all):
     default_snapshot = max([s for s in snapshots_all if pd.to_datetime(s).date() == today_d.date()])
 else:
-    default_snapshot = latest_snap
+    default_snapshot = snapshots_all[-1] if snapshots_all else None
 
-# onderliggende op default snapshot
-if pd.isna(default_snapshot):
-    underlying_now = float(df["underlying_price"].dropna().iloc[-1]) if not df["underlying_price"].dropna().empty else np.nan
-else:
-    sub_u = df[df["snapshot_date"] == default_snapshot]["underlying_price"].dropna()
+# Onderliggende op default snapshot
+if default_snapshot is not None:
+    sub_u = df[df["snap_min"] == default_snapshot]["underlying_price"].dropna()
     underlying_now = float(sub_u.mean()) if not sub_u.empty else (
         float(df["underlying_price"].dropna().iloc[-1]) if not df["underlying_price"].dropna().empty else np.nan
     )
+else:
+    underlying_now = float(df["underlying_price"].dropna().iloc[-1]) if not df["underlying_price"].dropna().empty else np.nan
 
-# strike opties
+# Strikes & default strike (−500 put, +300 call; fallback 6000)
 strikes_all = sorted([float(x) for x in df["strike"].dropna().unique().tolist()])
 if np.isnan(underlying_now):
     suggested_strike = 6000.0
@@ -215,31 +216,36 @@ else:
     suggested_strike = (underlying_now - 500.0) if sel_type == "put" else (underlying_now + 300.0)
 default_series_strike = pick_closest_value(strikes_all, suggested_strike, fallback=6000.0)
 
-# expiratie: 2 weken vanaf vandaag → eerst dichtsbijzijnde >= target, anders dichtstbijzijnde
+# Expiratie: 2 weken vanaf vandaag (eerste >= target, anders dichtstbijzijnde)
 exps_all = exps
 target_exp = date.today() + timedelta(days=14)
 default_series_exp = pick_first_on_or_after(exps_all, target_exp) or (pick_closest_date(exps_all, target_exp) if exps_all else None)
 
-# ── A) Serie-selectie — twee grafieken ─────────────────────────────────────────
+# ── A) Serie-selectie — twee grafieken ───────────────────────────
 st.subheader("Serie-selectie — volg één optiereeks door de tijd")
 
 colS1, colS2, colS3, colS4 = st.columns([1, 1, 1, 1.6])
 with colS1:
+    strike_options = strikes_all or [6000.0]
     series_strike = st.selectbox(
         "Serie Strike",
-        options=strikes_all,
-        index=(strikes_all.index(default_series_strike) if default_series_strike in strikes_all and len(strikes_all)>0 else 0)
+        options=strike_options,
+        index=(strike_options.index(default_series_strike) if default_series_strike in strike_options else 0)
     )
 with colS2:
+    exp_options = exps_all or [date.today()]
     series_exp = st.selectbox(
         "Serie Expiratie",
-        options=exps_all if exps_all else [],
-        index=(exps_all.index(default_series_exp) if (exps_all and default_series_exp in exps_all) else 0)
+        options=exp_options,
+        index=(exp_options.index(default_series_exp) if (default_series_exp in exp_options) else 0)
     )
 with colS3:
     series_price_col = st.radio("Prijsbron", ["last_price","mid_price"], index=0, horizontal=True)
 with colS4:
-    st.caption(f"🔧 Defaults: {'PUT −500' if sel_type=='put' else 'CALL +300'} vs onderliggende {underlying_now:.0f} • Exp {default_series_exp or 'n.v.t.'}")
+    if not np.isnan(underlying_now):
+        st.caption(f"🔧 Defaults: {'PUT −500' if sel_type=='put' else 'CALL +300'} rond onderliggende ~{underlying_now:.0f} • Exp ~{target_exp}")
+    else:
+        st.caption("🔧 Defaults: fallback strike 6000 (onderliggende onbekend)")
 
 serie = df[(df["strike"]==series_strike) & (df["expiration"]==series_exp)].copy().sort_values("snapshot_date")
 
@@ -289,24 +295,31 @@ else:
         fig_ppd.update_yaxes(title_text="SP500", secondary_y=True)
         st.plotly_chart(fig_ppd, use_container_width=True)
 
-# ── B) PPD & Afstand tot Uitoefenprijs ─────────────────────────────────────────
+# ── B) PPD & Afstand tot Uitoefenprijs ───────────────────────────
 st.subheader("PPD & Afstand tot Uitoefenprijs (ATM→OTM/ITM)")
-snapshots = snapshots_all
-# default: vandaag → anders laatste snapshot
-if snapshots:
-    if default_snapshot in snapshots:
-        default_idx = snapshots.index(default_snapshot)
+# default: vandaag (minuut), anders laatste snapshot
+if snapshots_all:
+    if default_snapshot in snapshots_all:
+        default_idx = snapshots_all.index(default_snapshot)
     else:
-        default_idx = len(snapshots) - 1
+        default_idx = len(snapshots_all) - 1
 else:
     default_idx = 0
 
 sel_snapshot = st.selectbox(
     "Peildatum (snapshot)",
-    options=snapshots, index=default_idx,
+    options=snapshots_all, index=default_idx,
     format_func=lambda x: pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")
 )
-df_last = df[df["snapshot_date"] == sel_snapshot].copy()
+
+# ⬇️ Filteren op snap_min i.p.v. ruwe timestamp
+df_last = df[df["snap_min"] == sel_snapshot].copy()
+if df_last.empty:
+    # Safeguard: kies dichtstbijzijnde snapshot als er niets exact matcht
+    near = pick_closest_date(list(snapshots_all), pd.to_datetime(sel_snapshot).date())
+    if near is not None:
+        df_last = df[df["snap_min"] == near].copy()
+
 df_last["abs_dist_pct"] = ((df_last["dist_points"].abs() / df_last["underlying_price"]) * 100.0).round(2)
 
 ppd_vs_dist = (
@@ -327,7 +340,7 @@ fig_ppd_dist.update_layout(
 )
 st.plotly_chart(fig_ppd_dist, use_container_width=True)
 
-# ── C) Ontwikkeling Prijs per Expiratiedatum (laatste snapshot) ────────────────
+# ── C) Ontwikkeling Prijs per Expiratiedatum (laatste snapshot) ───────────────
 st.subheader("Ontwikkeling Prijs per Expiratiedatum (laatste snapshot)")
 exp_curve_raw = (
     df_last[df_last["strike"] == series_strike]
@@ -357,7 +370,7 @@ fig_exp.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
 fig_exp.update_yaxes(title_text="PPD",   secondary_y=True,  rangemode="tozero")
 st.plotly_chart(fig_exp, use_container_width=True)
 
-# ── D) PPD vs DTE ──────────────────────────────────────────────────────────────
+# ── D) PPD vs DTE ─────────────────────────────────────────────────
 st.subheader("PPD vs DTE — opbouw van premium per dag")
 mode_col, atm_col, win_col = st.columns([1.2, 1, 1])
 with mode_col:
@@ -391,7 +404,7 @@ st.plotly_chart(fig_ppd_dte, use_container_width=True)
 
 st.markdown("---")
 
-# ── E) Matrix — meetmoment × strike ────────────────────────────────────────────
+# ── E) Matrix — meetmoment × strike ──────────────────────────────
 st.subheader("Matrix — meetmoment × strike")
 colM1, colM2, colM3, colM4 = st.columns([1, 1, 1, 1])
 with colM1:
@@ -458,7 +471,7 @@ else:
 
 st.markdown("---")
 
-# ── F) Overige visualisaties ───────────────────────────────────────────────────
+# ── F) Overige visualisaties ─────────────────────────────────────
 term = df.groupby("days_to_exp", as_index=False)["implied_volatility"].mean().sort_values("days_to_exp")
 fig_term = go.Figure(go.Scatter(x=term["days_to_exp"], y=term["implied_volatility"],
                                 mode="lines+markers", name=f"IV {sel_type.upper()}"))
