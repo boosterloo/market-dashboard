@@ -174,8 +174,9 @@ def apply_outlier(series: pd.Series, mode: str, pct: int) -> pd.Series:
         return s.where(np.abs(z) <= 3.0, np.nan)
     return s
 
-# ── A) Serie-selectie — één optiereeks volgen ──────────────────────────────────
+# ── A) Serie-selectie — TWEE grafieken (Price↔SP500 én PPD↔SP500) ───────────────
 st.subheader("Serie-selectie — volg één optiereeks door de tijd")
+
 colS1, colS2, colS3, colS4 = st.columns([1, 1, 1, 1.6])
 with colS1:
     strikes = sorted(df["strike"].dropna().unique().tolist())
@@ -190,38 +191,64 @@ with colS2:
 with colS3:
     series_price_col = st.radio("Prijsbron", ["last_price","mid_price"], index=0, horizontal=True)
 with colS4:
-    show_underlying_local = st.checkbox("Alleen Price & PPD (zonder S&P500)", value=False)
+    pass
 
 serie = df[(df["strike"]==series_strike) & (df["expiration"]==series_exp)].copy().sort_values("snapshot_date")
+
 if serie.empty:
     st.info("Geen ticks voor deze combinatie binnen de huidige filters.")
 else:
-    fig_ser = make_subplots(specs=[[{"secondary_y": True}]])
-    fig_ser.add_trace(go.Scatter(
-        x=serie["snapshot_date"],
-        y=apply_outlier(serie[series_price_col], outlier_mode, pct_clip),
-        name="Price", mode="lines+markers"
-    ), secondary_y=False)
-    fig_ser.add_trace(go.Scatter(
-        x=serie["snapshot_date"],
-        y=apply_outlier(serie["ppd"], outlier_mode, pct_clip),
-        name="PPD", mode="lines", connectgaps=True
-    ), secondary_y=True)
-    if show_underlying and not show_underlying_local:
-        fig_ser.add_trace(go.Scatter(
+    c1, c2 = st.columns(2)
+
+    # 1) Price ↔ SP500 (dubbele as)
+    with c1:
+        fig_price = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_price.add_trace(go.Scatter(
             x=serie["snapshot_date"],
-            y=serie["underlying_price"],
-            name="SP500", mode="lines", line=dict(dash="dot")
+            y=apply_outlier(serie[series_price_col], outlier_mode, pct_clip),
+            name="Price", mode="lines+markers"
         ), secondary_y=False)
-    fig_ser.update_layout(title=f"{sel_type.upper()} {series_strike} — exp {series_exp}",
-                          height=430, hovermode="x unified")
-    fig_ser.update_xaxes(title_text="Meetmoment")
-    fig_ser.update_yaxes(title_text="Price / SP500", secondary_y=False, rangemode="tozero")
-    fig_ser.update_yaxes(title_text="PPD", secondary_y=True,  rangemode="tozero")
-    if outlier_mode != "Geen":
-        fig_ser.add_annotation(xref="paper", yref="paper", x=1, y=1.08, xanchor="right",
-                               showarrow=False, text=f"Outlier: {outlier_mode}")
-    st.plotly_chart(fig_ser, use_container_width=True)
+        if show_underlying:
+            fig_price.add_trace(go.Scatter(
+                x=serie["snapshot_date"], y=serie["underlying_price"],
+                name="SP500", mode="lines", line=dict(dash="dot")
+            ), secondary_y=True)
+        fig_price.update_layout(
+            title=f"{sel_type.upper()} {series_strike} — exp {series_exp} | Price vs SP500",
+            height=420, hovermode="x unified"
+        )
+        fig_price.update_xaxes(title_text="Meetmoment")
+        fig_price.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
+        fig_price.update_yaxes(title_text="SP500", secondary_y=True)
+        if outlier_mode != "Geen":
+            fig_price.add_annotation(xref="paper", yref="paper", x=1, y=1.08, xanchor="right",
+                                     showarrow=False, text=f"Outlier: {outlier_mode}")
+        st.plotly_chart(fig_price, use_container_width=True)
+
+    # 2) PPD ↔ SP500 (dubbele as)
+    with c2:
+        fig_ppd = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_ppd.add_trace(go.Scatter(
+            x=serie["snapshot_date"],
+            y=apply_outlier(serie["ppd"], outlier_mode, pct_clip),
+            name="PPD", mode="lines", connectgaps=True
+        ), secondary_y=False)
+        if show_underlying:
+            fig_ppd.add_trace(go.Scatter(
+                x=serie["snapshot_date"], y=serie["underlying_price"],
+                name="SP500", mode="lines", line=dict(dash="dot")
+            ), secondary_y=True)
+        fig_ppd.update_layout(
+            title=f"{sel_type.upper()} {series_strike} — exp {series_exp} | PPD vs SP500",
+            height=420, hovermode="x unified"
+        )
+        fig_ppd.update_xaxes(title_text="Meetmoment")
+        fig_ppd.update_yaxes(title_text="PPD", secondary_y=False, rangemode="tozero")
+        fig_ppd.update_yaxes(title_text="SP500", secondary_y=True)
+        if outlier_mode != "Geen":
+            fig_ppd.add_annotation(xref="paper", yref="paper", x=1, y=1.08, xanchor="right",
+                                   showarrow=False, text=f"Outlier: {outlier_mode}")
+        st.plotly_chart(fig_ppd, use_container_width=True)
 
 # ── B) PPD & Afstand tot Uitoefenprijs ─────────────────────────────────────────
 st.subheader("PPD & Afstand tot Uitoefenprijs (ATM→OTM/ITM)")
@@ -233,8 +260,6 @@ sel_snapshot = st.selectbox(
     format_func=lambda x: pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")
 )
 df_last = df[df["snapshot_date"] == sel_snapshot].copy()
-
-# label de afstandskolom expliciet → geen KeyError meer
 df_last["abs_dist_pct"] = ((df_last["dist_points"].abs() / df_last["underlying_price"]) * 100.0).round(2)
 
 ppd_vs_dist = (
@@ -344,7 +369,6 @@ else:
     pivot = mx.pivot_table(index="snap_s", columns="strike", values=matrix_metric, aggfunc="mean")
     pivot = pivot.sort_index(ascending=False).round(2)
 
-    # Heatmap/tabel: kleur gebaseerd op geclipte waarden; getallen blijven raw
     arr_raw = pivot.values.astype(float)
     arr_clip = apply_outlier(pd.Series(arr_raw.flatten()), outlier_mode, pct_clip).values.reshape(arr_raw.shape)
 
