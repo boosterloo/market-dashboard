@@ -174,7 +174,7 @@ def apply_outlier(series: pd.Series, mode: str, pct: int) -> pd.Series:
         return s.where(np.abs(z) <= 3.0, np.nan)
     return s
 
-# ── A) Serie-selectie — TWEE grafieken (Price↔SP500 én PPD↔SP500) ───────────────
+# ── A) Serie-selectie — EXACT TWEE grafieken (Price↔SP500 & PPD↔SP500) ─────────
 st.subheader("Serie-selectie — volg één optiereeks door de tijd")
 
 colS1, colS2, colS3, colS4 = st.columns([1, 1, 1, 1.6])
@@ -202,16 +202,16 @@ else:
 
     # 1) Price ↔ SP500 (dubbele as)
     with c1:
+        y_price = apply_outlier(serie[series_price_col], outlier_mode, pct_clip)
         fig_price = make_subplots(specs=[[{"secondary_y": True}]])
         fig_price.add_trace(go.Scatter(
-            x=serie["snapshot_date"],
-            y=apply_outlier(serie[series_price_col], outlier_mode, pct_clip),
-            name="Price", mode="lines+markers"
+            x=serie["snapshot_date"], y=y_price,
+            name="Price", mode="lines+markers", connectgaps=True
         ), secondary_y=False)
         if show_underlying:
             fig_price.add_trace(go.Scatter(
                 x=serie["snapshot_date"], y=serie["underlying_price"],
-                name="SP500", mode="lines", line=dict(dash="dot")
+                name="SP500", mode="lines", line=dict(dash="dot"), connectgaps=True
             ), secondary_y=True)
         fig_price.update_layout(
             title=f"{sel_type.upper()} {series_strike} — exp {series_exp} | Price vs SP500",
@@ -220,23 +220,20 @@ else:
         fig_price.update_xaxes(title_text="Meetmoment")
         fig_price.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
         fig_price.update_yaxes(title_text="SP500", secondary_y=True)
-        if outlier_mode != "Geen":
-            fig_price.add_annotation(xref="paper", yref="paper", x=1, y=1.08, xanchor="right",
-                                     showarrow=False, text=f"Outlier: {outlier_mode}")
         st.plotly_chart(fig_price, use_container_width=True)
 
     # 2) PPD ↔ SP500 (dubbele as)
     with c2:
+        y_ppd = apply_outlier(serie["ppd"], outlier_mode, pct_clip)
         fig_ppd = make_subplots(specs=[[{"secondary_y": True}]])
         fig_ppd.add_trace(go.Scatter(
-            x=serie["snapshot_date"],
-            y=apply_outlier(serie["ppd"], outlier_mode, pct_clip),
-            name="PPD", mode="lines", connectgaps=True
+            x=serie["snapshot_date"], y=y_ppd,
+            name="PPD", mode="lines+markers", connectgaps=True
         ), secondary_y=False)
         if show_underlying:
             fig_ppd.add_trace(go.Scatter(
                 x=serie["snapshot_date"], y=serie["underlying_price"],
-                name="SP500", mode="lines", line=dict(dash="dot")
+                name="SP500", mode="lines", line=dict(dash="dot"), connectgaps=True
             ), secondary_y=True)
         fig_ppd.update_layout(
             title=f"{sel_type.upper()} {series_strike} — exp {series_exp} | PPD vs SP500",
@@ -245,9 +242,6 @@ else:
         fig_ppd.update_xaxes(title_text="Meetmoment")
         fig_ppd.update_yaxes(title_text="PPD", secondary_y=False, rangemode="tozero")
         fig_ppd.update_yaxes(title_text="SP500", secondary_y=True)
-        if outlier_mode != "Geen":
-            fig_ppd.add_annotation(xref="paper", yref="paper", x=1, y=1.08, xanchor="right",
-                                   showarrow=False, text=f"Outlier: {outlier_mode}")
         st.plotly_chart(fig_ppd, use_container_width=True)
 
 # ── B) PPD & Afstand tot Uitoefenprijs ─────────────────────────────────────────
@@ -296,7 +290,7 @@ exp_curve["ppd_f"]   = apply_outlier(exp_curve["ppd"], outlier_mode, pct_clip)
 fig_exp = make_subplots(specs=[[{"secondary_y": True}]])
 fig_exp.add_trace(go.Scatter(
     x=exp_curve["expiration"], y=exp_curve["price_f"],
-    name="Price", mode="lines+markers"
+    name="Price", mode="lines+markers", connectgaps=True
 ), secondary_y=False)
 fig_exp.add_trace(go.Scatter(
     x=exp_curve["expiration"], y=exp_curve["ppd_f"],
@@ -309,12 +303,9 @@ fig_exp.update_layout(
 fig_exp.update_xaxes(title_text="Expiratiedatum")
 fig_exp.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
 fig_exp.update_yaxes(title_text="PPD",   secondary_y=True,  rangemode="tozero")
-if outlier_mode != "Geen":
-    fig_exp.add_annotation(xref="paper", yref="paper", x=1, y=1.08, xanchor="right",
-                           showarrow=False, text=f"Outlier: {outlier_mode}")
 st.plotly_chart(fig_exp, use_container_width=True)
 
-# ── D) PPD vs DTE — outlier‑logica ─────────────────────────────────────────────
+# ── D) PPD vs DTE ──────────────────────────────────────────────────────────────
 st.subheader("PPD vs DTE — opbouw van premium per dag")
 mode_col, atm_col, win_col = st.columns([1.2, 1, 1])
 with mode_col:
