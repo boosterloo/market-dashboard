@@ -174,7 +174,7 @@ def apply_outlier(series: pd.Series, mode: str, pct: int) -> pd.Series:
         return s.where(np.abs(z) <= 3.0, np.nan)
     return s
 
-# ── A) Serie-selectie — EXACT TWEE grafieken (Price↔SP500 & PPD↔SP500) ─────────
+# ── A) Serie-selectie — EXACT TWEE grafieken ───────────────────────────────────
 st.subheader("Serie-selectie — volg één optiereeks door de tijd")
 
 colS1, colS2, colS3, colS4 = st.columns([1, 1, 1, 1.6])
@@ -200,7 +200,7 @@ if serie.empty:
 else:
     c1, c2 = st.columns(2)
 
-    # 1) Price ↔ SP500 (dubbele as)
+    # 1) Price ↔ SP500
     with c1:
         y_price = apply_outlier(serie[series_price_col], outlier_mode, pct_clip)
         fig_price = make_subplots(specs=[[{"secondary_y": True}]])
@@ -222,7 +222,7 @@ else:
         fig_price.update_yaxes(title_text="SP500", secondary_y=True)
         st.plotly_chart(fig_price, use_container_width=True)
 
-    # 2) PPD ↔ SP500 (dubbele as)
+    # 2) PPD ↔ SP500
     with c2:
         y_ppd = apply_outlier(serie["ppd"], outlier_mode, pct_clip)
         fig_ppd = make_subplots(specs=[[{"secondary_y": True}]])
@@ -275,43 +275,73 @@ fig_ppd_dist.update_layout(
 )
 st.plotly_chart(fig_ppd_dist, use_container_width=True)
 
-# ── C) Ontwikkeling Prijs per Expiratiedatum (peildatum) ───────────────────────
+# ── C) Ontwikkeling Prijs per Expiratiedatum (peildatum) — met fallbacks ───────
 st.subheader("Ontwikkeling Prijs per Expiratiedatum (laatste snapshot)")
-exp_curve_raw = (
-    df_last[df_last["strike"] == series_strike]
-      .groupby("expiration", as_index=False)
-      .agg(price=("last_price", "mean"), ppd=("ppd", "mean"))
-      .sort_values("expiration")
-)
-exp_curve = exp_curve_raw.copy()
-exp_curve["price_f"] = apply_outlier(exp_curve["price"], outlier_mode, pct_clip)
-exp_curve["ppd_f"]   = apply_outlier(exp_curve["ppd"], outlier_mode, pct_clip)
 
-fig_exp = make_subplots(specs=[[{"secondary_y": True}]])
-fig_exp.add_trace(go.Scatter(
-    x=exp_curve["expiration"], y=exp_curve["price_f"],
-    name="Price", mode="lines+markers", connectgaps=True
-), secondary_y=False)
-fig_exp.add_trace(go.Scatter(
-    x=exp_curve["expiration"], y=exp_curve["ppd_f"],
-    name="PPD", mode="lines+markers", connectgaps=True
-), secondary_y=True)
-fig_exp.update_layout(
-    title=f"{sel_type.upper()} — Strike {series_strike} — peildatum {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}",
-    height=420, hovermode="x unified"
-)
-fig_exp.update_xaxes(title_text="Expiratiedatum")
-fig_exp.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
-fig_exp.update_yaxes(title_text="PPD",   secondary_y=True,  rangemode="tozero")
-st.plotly_chart(fig_exp, use_container_width=True)
+def latest_snapshot_with_strike(data: pd.DataFrame, strike_val: float) -> datetime | None:
+    snaps = sorted(data["snapshot_date"].unique(), reverse=True)
+    for s in snaps:
+        if not data[(data["snapshot_date"] == s) & (data["strike"] == strike_val)].empty:
+            return s
+    return None
 
-# ── D) PPD vs DTE ──────────────────────────────────────────────────────────────
+# 1) Exact gekozen strike op peildatum
+sub_exact = df[(df["snapshot_date"] == sel_snapshot) & (df["strike"] == series_strike)]
+
+title_ctx = f"{sel_type.upper()} — Strike {series_strike} — peildatum {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}"
+sub_used = sub_exact.copy()
+
+# 2) Fallback: ATM‑band op peildatum
+if sub_used.empty:
+    sub_atm = df[(df["snapshot_date"] == sel_snapshot) & (np.abs(df["moneyness"]) <= st.session_state.get("atm_band", 0.02))]
+    if not sub_atm.empty:
+        sub_used = sub_atm.copy()
+        title_ctx = f"{sel_type.upper()} — ATM-band (±{st.session_state.get('atm_band', 0.02):.0%}) — peildatum {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}"
+
+# 3) Fallback: laatste snapshot met data voor strike
+if sub_used.empty:
+    alt_snap = latest_snapshot_with_strike(df, series_strike)
+    if alt_snap is not None:
+        sub_alt = df[(df["snapshot_date"] == alt_snap) & (df["strike"] == series_strike)]
+        if not sub_alt.empty:
+            sub_used = sub_alt.copy()
+            title_ctx = f"{sel_type.upper()} — Strike {series_strike} — peildatum (fallback) {pd.to_datetime(alt_snap).strftime('%Y-%m-%d %H:%M')}"
+
+if sub_used.empty:
+    st.info("Geen data gevonden voor deze grafiek (ook niet na fallbacks).")
+else:
+    exp_curve_raw = (
+        sub_used.groupby("expiration", as_index=False)
+                .agg(price=(series_price_col, "mean"), ppd=("ppd", "mean"))
+                .sort_values("expiration")
+    )
+    exp_curve = exp_curve_raw.copy()
+    exp_curve["price_f"] = apply_outlier(exp_curve["price"], outlier_mode, pct_clip)
+    exp_curve["ppd_f"]   = apply_outlier(exp_curve["ppd"], outlier_mode, pct_clip)
+
+    fig_exp = make_subplots(specs=[[{"secondary_y": True}]])
+    fig_exp.add_trace(go.Scatter(
+        x=exp_curve["expiration"], y=exp_curve["price_f"],
+        name="Price", mode="lines+markers", connectgaps=True
+    ), secondary_y=False)
+    fig_exp.add_trace(go.Scatter(
+        x=exp_curve["expiration"], y=exp_curve["ppd_f"],
+        name="PPD", mode="lines+markers", connectgaps=True
+    ), secondary_y=True)
+    fig_exp.update_layout(title=title_ctx, height=420, hovermode="x unified")
+    fig_exp.update_xaxes(title_text="Expiratiedatum")
+    fig_exp.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
+    fig_exp.update_yaxes(title_text="PPD",   secondary_y=True,  rangemode="tozero")
+    st.plotly_chart(fig_exp, use_container_width=True)
+
+# ── D) PPD vs DTE — opbouw van premium per dag ─────────────────────────────────
 st.subheader("PPD vs DTE — opbouw van premium per dag")
 mode_col, atm_col, win_col = st.columns([1.2, 1, 1])
 with mode_col:
     ppd_mode = st.radio("Bereik", ["ATM-band (moneyness)", "Rond gekozen strike"], horizontal=False, index=0)
 with atm_col:
     atm_band = st.slider("ATM-band (± moneyness %)", 0.01, 0.10, 0.02, step=0.01)
+    st.session_state["atm_band"] = atm_band  # ook gebruikt bij fallback in sectie C
 with win_col:
     strike_window = st.slider("Strike-venster rond gekozen strike (punten)", 10, 200, 50, step=10)
 
