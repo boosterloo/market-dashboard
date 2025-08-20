@@ -3,15 +3,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import date, timedelta
-
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # ---- BigQuery helpers ----
 try:
     from utils.bq import run_query, bq_ping
 except Exception:
-    # Fallback als utils.bq niet beschikbaar is
     import google.cloud.bigquery as bq
     from google.oauth2 import service_account
 
@@ -31,24 +28,19 @@ except Exception:
     @st.cache_data(ttl=300, show_spinner=False)
     def run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
         client = _bq_client_from_secrets()
-        job = client.query(sql, job_config=None)
-        return job.to_dataframe()
+        return client.query(sql).to_dataframe()
 
 # ---- Page config ----
 st.set_page_config(page_title="Commodities", layout="wide")
 st.title("🛢️ Commodities Dashboard")
 
-# ---- View naam uit secrets (met fallback) ----
-COM_WIDE_VIEW = st.secrets.get("tables", {}).get(
-    "commodities_wide_view",
-    "nth-pier-468314-p7.marketdata.commodity_prices_wide_v",
-)
+COM_WIDE_VIEW = st.secrets.get(
+    "tables", {}
+).get("commodities_wide_view", "nth-pier-468314-p7.marketdata.commodity_prices_wide_v")
 
 # ---- Health check ----
 try:
-    with st.spinner("BigQuery check…"):
-        ok = bq_ping()
-    if not ok:
+    if not bq_ping():
         st.error("Geen BigQuery-verbinding.")
         st.stop()
 except Exception as e:
@@ -59,11 +51,13 @@ except Exception as e:
 # ---- Data laden ----
 @st.cache_data(ttl=300, show_spinner=False)
 def load_data() -> pd.DataFrame:
-    sql = f"SELECT * FROM `{COM_WIDE_VIEW}`"
-    df = run_query(sql)
-    # Zorg dat date als datetime komt
+    df = run_query(f"SELECT * FROM `{COM_WIDE_VIEW}`")
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"]).dt.date
+    # 🔧 Zet alle niet-date kolommen naar float om Decimal→float issues te voorkomen
+    for c in df.columns:
+        if c != "date":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 df_wide = load_data()
@@ -72,10 +66,8 @@ if df_wide.empty:
     st.stop()
 
 # ---- Instrument mapping (prefix -> label) ----
-# We leiden instrumenten af uit kolommen die eindigen op '_close'
 close_cols = [c for c in df_wide.columns if c.endswith("_close")]
 prefixes = [c.removesuffix("_close") for c in close_cols]
-
 LABELS = {
     "wti": "WTI",
     "brent": "Brent",
@@ -86,11 +78,9 @@ LABELS = {
     "natgas": "Natural Gas",
     "copper": "Copper",
 }
-# Filter op bekende labels
 prefixes = [p for p in prefixes if p in LABELS]
 
 # ---- UI: filters ----
-# Datumbereik (default: laatste 365 dagen)
 min_d, max_d = df_wide["date"].min(), df_wide["date"].max()
 default_start = max(min_d, max_d - timedelta(days=365)) if pd.notnull(max_d) else min_d
 date_range = st.slider(
@@ -101,7 +91,6 @@ date_range = st.slider(
     format="YYYY-MM-DD",
 )
 
-# Keuze instrumenten (voor comparison chart / KPI)
 default_selection = [p for p in ["wti", "brent", "gold", "silver"] if p in prefixes]
 sel_prefixes = st.multiselect(
     "Instrumenten",
@@ -109,9 +98,8 @@ sel_prefixes = st.multiselect(
     default=[(p, LABELS[p]) for p in default_selection] or [(prefixes[0], LABELS[prefixes[0]])],
     format_func=lambda t: t[1],
 )
-sel_prefixes = [p for p, _ in sel_prefixes]  # haal alleen keys terug
+sel_prefixes = [p for p, _ in sel_prefixes]  # haal key terug
 
-# Detail-instrument voor MA/Histogram
 detail_prefix = st.selectbox(
     "Detail instrument (price + MA & histogrammen)",
     options=[(p, LABELS[p]) for p in prefixes],
@@ -123,7 +111,6 @@ detail_prefix = st.selectbox(
 mask = (df_wide["date"] >= date_range[0]) & (df_wide["date"] <= date_range[1])
 df = df_wide.loc[mask].sort_values("date").copy()
 
-# ---- Helper: haal kolommen voor een prefix op ----
 def cols_for(pfx: str) -> dict:
     return {
         "close": f"{pfx}_close",
@@ -146,16 +133,16 @@ for i, pfx in enumerate(sel_prefixes or prefixes[:1]):
             st.metric(label, value="—", delta="—")
         continue
     last_row = sub.iloc[-1]
-    val = last_row[cols["close"]]
-    delt = last_row[cols["d_abs"]]
-    d_pct = last_row[cols["d_pct"]]
-    delta_str = f"{delt:+.2f} ({(d_pct or 0)*100:+.2f}%)" if pd.notnull(d_pct) else f"{delt:+.2f}"
+    val = float(last_row[cols["close"]])
+    d_abs = float(last_row[cols["d_abs"]]) if pd.notnull(last_row[cols["d_abs"]]) else 0.0
+    d_pct = float(last_row[cols["d_pct"]]) if pd.notnull(last_row[cols["d_pct"]]) else 0.0
+    delta_str = f"{d_abs:+.2f} ({d_pct*100:+.2f}%)"
     with kpi_cols[i]:
         st.metric(label, value=f"{val:,.2f}", delta=delta_str)
 
 st.markdown("---")
 
-# ---- Chart 1: Normalized comparison (100 = start) ----
+# ---- Chart 1: Normalized comparison (100 = start)
 st.subheader("Vergelijking (genormaliseerd naar 100)")
 fig_cmp = go.Figure()
 for pfx in (sel_prefixes or prefixes[:1]):
@@ -163,10 +150,14 @@ for pfx in (sel_prefixes or prefixes[:1]):
     series = df[["date", cols["close"]]].dropna()
     if series.empty:
         continue
-    base = series[cols["close"]].iloc[0]
-    norm = (series[cols["close"]] / base) * 100.0 if base else np.nan
+    # 🔧 robust: zet naar float en voorkom NaN/0 base
+    s_close = pd.to_numeric(series[cols["close"]], errors="coerce").astype(float)
+    base = s_close.dropna().iloc[0] if not s_close.dropna().empty else np.nan
+    if pd.isna(base) or base == 0:
+        continue
+    norm = (s_close / base) * 100.0
     fig_cmp.add_trace(go.Scatter(
-        x=series["date"], y=norm, mode="lines",
+        x=series["date"], y=norm.values, mode="lines",
         name=LABELS.get(pfx, pfx.upper())
     ))
 fig_cmp.update_layout(
@@ -176,24 +167,23 @@ fig_cmp.update_layout(
 )
 st.plotly_chart(fig_cmp, use_container_width=True)
 
-# ---- Chart 2: Detail (close + MA20/50/200) ----
+# ---- Chart 2: Detail (close + MA20/50/200)
 st.subheader(f"Detail: {LABELS.get(detail_prefix, detail_prefix.upper())} (close + MA20/50/200)")
 c = cols_for(detail_prefix)
 sub = df[["date", c["close"], c["ma20"], c["ma50"], c["ma200"]]].dropna(subset=[c["close"]]).copy()
+for col in [c["close"], c["ma20"], c["ma50"], c["ma200"]]:
+    if col in sub.columns:
+        sub[col] = pd.to_numeric(sub[col], errors="coerce").astype(float)
 
 fig_det = go.Figure()
 fig_det.add_trace(go.Scatter(x=sub["date"], y=sub[c["close"]], name="Close", mode="lines"))
-if sub[c["ma20"]].notna().any():
-    fig_det.add_trace(go.Scatter(x=sub["date"], y=sub[c["ma20"]], name="MA20", mode="lines"))
-if sub[c["ma50"]].notna().any():
-    fig_det.add_trace(go.Scatter(x=sub["date"], y=sub[c["ma50"]], name="MA50", mode="lines"))
-if sub[c["ma200"]].notna().any():
-    fig_det.add_trace(go.Scatter(x=sub["date"], y=sub[c["ma200"]], name="MA200", mode="lines"))
-
+if sub[c["ma20"]].notna().any(): fig_det.add_trace(go.Scatter(x=sub["date"], y=sub[c["ma20"]], name="MA20", mode="lines"))
+if sub[c["ma50"]].notna().any(): fig_det.add_trace(go.Scatter(x=sub["date"], y=sub[c["ma50"]], name="MA50", mode="lines"))
+if sub[c["ma200"]].notna().any(): fig_det.add_trace(go.Scatter(x=sub["date"], y=sub[c["ma200"]], name="MA200", mode="lines"))
 fig_det.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
 st.plotly_chart(fig_det, use_container_width=True)
 
-# ---- Chart 3 & 4: Histogrammen delta_abs en delta_pct ----
+# ---- Chart 3 & 4: Histogrammen delta_abs en delta_pct
 left, right = st.columns(2)
 with left:
     st.caption("Dagelijkse verandering (absolute delta)")
@@ -201,8 +191,9 @@ with left:
     if h.empty:
         st.info("Geen data voor histogram.")
     else:
+        s = pd.to_numeric(h[c["d_abs"]], errors="coerce").astype(float)
         fig_h1 = go.Figure()
-        fig_h1.add_trace(go.Histogram(x=h[c["d_abs"]]))
+        fig_h1.add_trace(go.Histogram(x=s))
         fig_h1.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig_h1, use_container_width=True)
 
@@ -212,12 +203,13 @@ with right:
     if h.empty:
         st.info("Geen data voor histogram.")
     else:
+        s = pd.to_numeric(h[c["d_pct"]], errors="coerce").astype(float) * 100.0
         fig_h2 = go.Figure()
-        fig_h2.add_trace(go.Histogram(x=100 * h[c["d_pct"]]))  # in %
+        fig_h2.add_trace(go.Histogram(x=s))
         fig_h2.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig_h2, use_container_width=True)
 
-# ---- Tabel ----
+# ---- Tabel
 st.subheader("Laatste rijen (gefilterd bereik)")
 show_cols = ["date"]
 for pfx in (sel_prefixes or prefixes[:1]):
