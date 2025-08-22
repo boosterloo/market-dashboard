@@ -222,182 +222,19 @@ with st.sidebar:
     with st.expander("Geavanceerd: dual-axis per categorie aanpassen"):
         dual_custom = {}
         for gname, gcols in GROUPS.items():
-            if any(c in selected for c in gcols):
-                options = [c for c in gcols if c in selected]
-                defaults = DUAL_AXIS_DEFAULT.get(gname, {})
-                def_left = [c for c in defaults.get("left", []) if c in options]
-                def_right = [c for c in defaults.get("right", []) if c in options]
-                left = st.multiselect(f"{gname} — linkeras", options, default=def_left)
-                right = st.multiselect(f"{gname} — rechteras", options, default=def_right)
-                dual_custom[gname] = {"left": left, "right": right}
-
-    # Deeplink: schrijf huidige filters naar query params (kopieer uit adresbalk)
-    if st.button("🔗 Zet filters in URL (deeplink)"):
-        try:
-            st.experimental_set_query_params(
-                start=str(start_d), end=str(end_d), transform=transform, view=view_mode,
-                indicators=",".join(selected), preset=preset, normalize=str(normalize), recessions=str(shade_recessions)
-            )
-            st.success("URL bijgewerkt — kopieer 'm uit de adresbalk.")
-        except Exception:
-            st.info("Kon query params niet zetten in deze omgeving.")
-
-    # Keep-awake (alleen als tab open is)
-    keep_awake = st.checkbox("Auto-refresh elke 14 min (houd tab wakker)", value=False,
-                             help="Dit voorkomt slapen zolang deze pagina open blijft in je browser.")
-
-    st.caption(f"Bron: `{MACRO_VIEW}`")
-    if st.button("🔄 Vernieuw data (cache legen)"):
-        load_data.clear()
-        st.experimental_rerun()
-
-# Injecteer auto-refresh JS indien gewenst
-if keep_awake:
-    st.markdown("""
-    <script>
-      setTimeout(function(){ window.location.reload(); }, 14*60*1000);
-    </script>
-    """, unsafe_allow_html=True)
-
-# ---------- Filter & transform ----------
-mask = (df["date"] >= start_d) & (df["date"] <= end_d)
-df = df.loc[mask].copy()
-
-if not selected:
-    st.info("Selecteer minimaal één indicator.")
-    st.stop()
-
-work = df[["date"] + selected].copy().sort_values("date")
-work_indexed = work.set_index("date")
-
-# helpers
-
-def pct_change_n(x: pd.Series, n: int) -> pd.Series:
-    return x.pct_change(n) * 100.0
-
-if transform == "YoY % (12m)":
-    work_indexed = work_indexed.apply(lambda s: pct_change_n(s, 12))
-elif transform == "MoM % (1m)":
-    work_indexed = work_indexed.apply(lambda s: pct_change_n(s, 1))
-elif transform == "Index (start=100)":
-    def _to_index(s: pd.Series) -> pd.Series:
-        s = s.copy()
-        base = s.dropna()
-        if base.empty:
-            return s
-        return (s / base.iloc[0]) * 100.0
-    work_indexed = work_indexed.apply(_to_index)
-elif transform == "3m MA":
-    work_indexed = work_indexed.rolling(3, min_periods=1).mean()
-elif transform == "6m MA":
-    work_indexed = work_indexed.rolling(6, min_periods=1).mean()
-elif transform == "Eerste verschillen":
-    work_indexed = work_indexed.diff(1)
-
-# Normaliseer (z-score) optioneel
-if normalize:
-    def _z(s: pd.Series) -> pd.Series:
-        mu = s.mean()
-        sd = s.std(ddof=0)
-        return (s - mu) / sd if pd.notna(sd) and sd != 0 else s
-    work_indexed = work_indexed.apply(_z)
-
-work_tidy = work_indexed.reset_index().dropna(how="all", subset=selected)
-
-# ---------- KPI's ----------
-st.subheader("Laatste waarden")
-
-percent_like = is_percent_like(transform)
-
-kpi_rows = []
-for col in selected:
-    s = work_indexed[col].dropna()
-    if s.empty:
-        kpi_rows.append({"indicator": col, "value": np.nan, "prev": np.nan, "delta": np.nan})
-        continue
-    value = s.iloc[-1]
-    prev = s.iloc[-2] if len(s) >= 2 else np.nan
-    delta = value - prev if pd.notna(prev) else np.nan
-    kpi_rows.append({"indicator": col, "value": value, "prev": prev, "delta": delta})
-
-kpis = pd.DataFrame(kpi_rows).replace([np.inf, -np.inf], np.nan)
-
-cols = st.columns(min(4, max(1, len(kpis))))
-for i, row in kpis.iterrows():
-    name = LABELS.get(row["indicator"], row["indicator"])
-    val = row["value"]
-    delta = row["delta"]
-    kpi_percent = percent_like or (percent_allowed_for_levels(transform) and is_percent_col(row["indicator"]) and not normalize)
-    if kpi_percent:
-        txt_val = "—" if pd.isna(val) else f"{val:,.2f}%"
-        # Bij verschillen (Δ) en % reeksen: pp tonen
-        if pd.isna(delta):
-            txt_delta = None
-        else:
-            txt_delta = f"{delta:,.2f}pp" if transform == "Eerste verschillen" else f"{delta:,.2f}pp" if percent_like else f"{delta:,.2f}pp"
-    else:
-        txt_val = "—" if pd.isna(val) else f"{val:,.2f}"
-        txt_delta = None if pd.isna(delta) else f"{delta:,.2f}"
-    with cols[i % len(cols)]:
-        st.metric(name, txt_val, delta=txt_delta)
-
-st.divider()
-
-# ---------- Charts ----------
-
-def add_png_download(fig: go.Figure, filename: str):
-    try:
-        img_bytes = fig.to_image(format="png")  # vereist 'kaleido'
-        st.download_button("⬇️ Download PNG", data=img_bytes, file_name=filename, mime="image/png")
-    except Exception:
-        st.caption("ℹ️ Voor PNG-export: `pip install kaleido` in je omgeving.")
-
-
-def plot_single_indicator(col: str):
-    series = work_tidy[["date", col]].dropna()
-    if series.empty:
-        return
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=series["date"], y=series[col], mode="lines", name=LABELS.get(col, col)))
-    fig.update_layout(
-        title=LABELS.get(col, col),
-        xaxis_title="Datum",
-        yaxis_title=y_title_for(transform),
-        hovermode="x unified",
-        height=520,
-        legend_title="Indicator",
-    )
-    if shade_recessions:
-        add_recession_shading(fig, start_d, end_d)
-
-    # Per-as %-suffix bepalen (alle reeksen op de as moeten % zijn, tenzij YoY/MoM transform)
-    try:
-        # Binnen deze scope bestaan left_list/right_list
-        left_avail = [c for c in (left_list if 'left_list' in locals() else []) if c in cols_avail]
-        right_avail = [c for c in (right_list if 'right_list' in locals() else []) if c in cols_avail]
-        left_pct = percent_like or (percent_allowed_for_levels(transform) and not normalize and len(left_avail) > 0 and all(is_percent_col(c) for c in left_avail))
-        right_pct = percent_like or (percent_allowed_for_levels(transform) and not normalize and len(right_avail) > 0 and all(is_percent_col(c) for c in right_avail))
-        apply_percent_axis_dual(fig, left_pct, right_pct)
-    except Exception:
-        # fallback als er geen dual context is
-        axis_pct = percent_like or (percent_allowed_for_levels(transform) and not normalize and all(is_percent_col(c) for c in cols_avail))
-        apply_percent_axis_single(fig, axis_pct)
-
-    st.plotly_chart(fig, use_container_width=True)
-    add_png_download(fig, f"{slug(group_name)}.png")
-
-# Render
-if view_mode == "Aparte grafieken (per indicator)":
-    st.subheader("Grafieken per indicator")
-    for col in selected:
-        plot_single_indicator(col)
-else:
-    st.subheader("Grafieken per categorie")
-    # Kies dual-config uit custom, anders default
-    for gname, gcols in GROUPS.items():
         if any(c in selected for c in gcols):
-            dual_cfg = locals().get('dual_custom', {}).get(gname, DUAL_AXIS_DEFAULT.get(gname, {"left": [], "right": []}))
-            plot_group(gname, gcols, dual_cfg)
+            # Dual-config: haal uit sidebar-config als die bestaat, anders defaults
+            try:
+                dual_cfg = dual_custom.get(gname, DUAL_AXIS_DEFAULT.get(gname, {"left": [], "right": []}))
+            except NameError:
+                dual_cfg = DUAL_AXIS_DEFAULT.get(gname, {"left": [], "right": []})
+            # Robuust plotten met foutmelding per categorie
+            try:
+                plot_group(gname, gcols, dual_cfg)
+            except NameError as e:
+                st.error(f"Kon {gname} niet plotten (NameError): {e}")
+            except Exception as e:
+                st.error(f"Kon {gname} niet plotten: {e}")
 
 # ---------- Table + download ----------
 st.subheader("Data (huidige selectie)")
