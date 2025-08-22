@@ -203,10 +203,12 @@ with st.sidebar:
         dual_custom = {}
         for gname, gcols in GROUPS.items():
             if any(c in selected for c in gcols):
-                left = st.multiselect(f"{gname} — linkeras", [c for c in gcols if c in selected],
-                                      default=DUAL_AXIS_DEFAULT.get(gname, {}).get("left", []))
-                right = st.multiselect(f"{gname} — rechteras", [c for c in gcols if c in selected],
-                                       default=DUAL_AXIS_DEFAULT.get(gname, {}).get("right", []))
+                options = [c for c in gcols if c in selected]
+                defaults = DUAL_AXIS_DEFAULT.get(gname, {})
+                def_left = [c for c in defaults.get("left", []) if c in options]
+                def_right = [c for c in defaults.get("right", []) if c in options]
+                left = st.multiselect(f"{gname} — linkeras", options, default=def_left)
+                right = st.multiselect(f"{gname} — rechteras", options, default=def_right)
                 dual_custom[gname] = {"left": left, "right": right}
 
     # Deeplink: schrijf huidige filters naar query params (kopieer uit adresbalk)
