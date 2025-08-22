@@ -360,7 +360,7 @@ def plot_single_indicator(col: str):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=series["date"], y=series[col], mode="lines", name=LABELS.get(col, col)))
     fig.update_layout(
-        title=group_name,
+        title=LABELS.get(col, col),
         xaxis_title="Datum",
         yaxis_title=y_title_for(transform),
         hovermode="x unified",
