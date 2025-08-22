@@ -5,6 +5,7 @@ import numpy as np
 from datetime import timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from urllib.parse import quote
 
 st.set_page_config(page_title="📊 Macro (Monthly)", layout="wide")
 st.title("📊 Macro (Monthly, filled)")
@@ -44,12 +45,61 @@ GROUPS = {
         "m2_yoy", "m2_real_yoy", "m2_vel", "m2_vel_ma3", "m2_vel_yoy",
     ],
 }
-DUAL_AXIS = {
+DUAL_AXIS_DEFAULT = {
     "Inflatie": {"left": ["cpi_all"], "right": ["cpi_core", "pce_all"]},
     "Arbeid": {"left": ["unemployment"], "right": ["payrolls", "init_claims"]},
     "Activiteit": {"left": ["ind_production"], "right": ["retail_sales", "housing_starts"]},
     "Geld & Velocity": {"left": ["m2", "m2_real"], "right": ["m2_yoy", "m2_vel", "m2_vel_yoy"]},
 }
+
+# NBER recessies (alleen vanaf 1990 voor compactheid)
+RECESSIONS = [
+    ("1990-07-01", "1991-03-31"),
+    ("2001-03-01", "2001-11-30"),
+    ("2007-12-01", "2009-06-30"),
+    ("2020-02-01", "2020-04-30"),
+]
+
+# ---------- Helpers ----------
+
+def add_recession_shading(fig: go.Figure, start_d, end_d):
+    for s, e in RECESSIONS:
+        s = pd.to_datetime(s).date()
+        e = pd.to_datetime(e).date()
+        if e < start_d or s > end_d:
+            continue
+        fig.add_vrect(
+            x0=s, x1=e,
+            fillcolor="LightGrey", opacity=0.25, line_width=0, layer="below"
+        )
+
+
+def y_title_for(transform: str) -> str:
+    return {
+        "— Geen —": "Niveau",
+        "YoY % (12m)": "YoY %",
+        "MoM % (1m)": "MoM %",
+        "Index (start=100)": "Index (start=100)",
+        "3m MA": "Niveau (3m MA)",
+        "6m MA": "Niveau (6m MA)",
+        "Eerste verschillen": "Δ (m/m)",
+    }[transform]
+
+
+def is_percent_like(transform: str) -> bool:
+    return transform in {"YoY % (12m)", "MoM % (1m)"}
+
+
+def apply_percent_axis(fig: go.Figure, percent_like: bool):
+    if percent_like:
+        try:
+            fig.update_yaxes(ticksuffix="%")
+        except Exception:
+            pass
+
+
+def slug(s: str) -> str:
+    return "".join(c.lower() if c.isalnum() else "-" for c in s).strip("-")
 
 # ---------- Data access ----------
 
@@ -99,12 +149,17 @@ with st.sidebar:
             default_pick = all_cols_sorted[:4]
         selected = st.multiselect("Indicatoren", options=all_cols_sorted, default=default_pick)
 
-    # Periode slider (default laatste 12 maanden)
+    # Periode presets + slider (default: laatste 12 maanden)
     min_d, max_d = df["date"].min(), df["date"].max()
-    try:
-        default_start = (pd.to_datetime(max_d) - pd.DateOffset(months=12)).date()
-    except Exception:
+    preset = st.radio("Preset", ["12m", "3y", "5y", "Max"], horizontal=True, index=0)
+    months_map = {"12m": 12, "3y": 36, "5y": 60}
+    if preset == "Max":
         default_start = min_d
+    else:
+        try:
+            default_start = (pd.to_datetime(max_d) - pd.DateOffset(months=months_map[preset])).date()
+        except Exception:
+            default_start = min_d
 
     date_range = st.slider(
         "Periode",
@@ -134,6 +189,9 @@ with st.sidebar:
         help="Wordt per geselecteerde serie toegepast.",
     )
 
+    normalize = st.checkbox("Normaliseer (z-score) per serie", value=False, help="Vergelijk reeksen op dezelfde schaal.")
+    shade_recessions = st.checkbox("Toon recessies (NBER)", value=True)
+
     view_mode = st.radio(
         "Weergave",
         ["Aparte grafieken (per indicator)", "Categorie-grafieken (dual-axis waar zinvol)"],
@@ -141,10 +199,43 @@ with st.sidebar:
         help="Kies of je per indicator een grafiek wilt of per categorie met 2 y-assen.",
     )
 
+    with st.expander("Geavanceerd: dual-axis per categorie aanpassen"):
+        dual_custom = {}
+        for gname, gcols in GROUPS.items():
+            if any(c in selected for c in gcols):
+                left = st.multiselect(f"{gname} — linkeras", [c for c in gcols if c in selected],
+                                      default=DUAL_AXIS_DEFAULT.get(gname, {}).get("left", []))
+                right = st.multiselect(f"{gname} — rechteras", [c for c in gcols if c in selected],
+                                       default=DUAL_AXIS_DEFAULT.get(gname, {}).get("right", []))
+                dual_custom[gname] = {"left": left, "right": right}
+
+    # Deeplink: schrijf huidige filters naar query params (kopieer uit adresbalk)
+    if st.button("🔗 Zet filters in URL (deeplink)"):
+        try:
+            st.experimental_set_query_params(
+                start=str(start_d), end=str(end_d), transform=transform, view=view_mode,
+                indicators=",".join(selected), preset=preset, normalize=str(normalize), recessions=str(shade_recessions)
+            )
+            st.success("URL bijgewerkt — kopieer 'm uit de adresbalk.")
+        except Exception:
+            st.info("Kon query params niet zetten in deze omgeving.")
+
+    # Keep-awake (alleen als tab open is)
+    keep_awake = st.checkbox("Auto-refresh elke 14 min (houd tab wakker)", value=False,
+                             help="Dit voorkomt slapen zolang deze pagina open blijft in je browser.")
+
     st.caption(f"Bron: `{MACRO_VIEW}`")
     if st.button("🔄 Vernieuw data (cache legen)"):
         load_data.clear()
         st.experimental_rerun()
+
+# Injecteer auto-refresh JS indien gewenst
+if keep_awake:
+    st.markdown("""
+    <script>
+      setTimeout(function(){ window.location.reload(); }, 14*60*1000);
+    </script>
+    """, unsafe_allow_html=True)
 
 # ---------- Filter & transform ----------
 mask = (df["date"] >= start_d) & (df["date"] <= end_d)
@@ -181,10 +272,20 @@ elif transform == "6m MA":
 elif transform == "Eerste verschillen":
     work_indexed = work_indexed.diff(1)
 
+# Normaliseer (z-score) optioneel
+if normalize:
+    def _z(s: pd.Series) -> pd.Series:
+        mu = s.mean()
+        sd = s.std(ddof=0)
+        return (s - mu) / sd if pd.notna(sd) and sd != 0 else s
+    work_indexed = work_indexed.apply(_z)
+
 work_tidy = work_indexed.reset_index().dropna(how="all", subset=selected)
 
 # ---------- KPI's ----------
 st.subheader("Laatste waarden")
+
+percent_like = is_percent_like(transform)
 
 kpi_rows = []
 for col in selected:
@@ -204,8 +305,12 @@ for i, row in kpis.iterrows():
     name = LABELS.get(row["indicator"], row["indicator"])
     val = row["value"]
     delta = row["delta"]
-    txt_val = "—" if pd.isna(val) else f"{val:,.2f}"
-    txt_delta = None if pd.isna(delta) else f"{delta:,.2f}"
+    if percent_like:
+        txt_val = "—" if pd.isna(val) else f"{val:,.2f}%"
+        txt_delta = None if pd.isna(delta) else f"{delta:,.2f}pp"
+    else:
+        txt_val = "—" if pd.isna(val) else f"{val:,.2f}"
+        txt_delta = None if pd.isna(delta) else f"{delta:,.2f}"
     with cols[i % len(cols)]:
         st.metric(name, txt_val, delta=txt_delta)
 
@@ -213,42 +318,43 @@ st.divider()
 
 # ---------- Charts ----------
 
+def add_png_download(fig: go.Figure, filename: str):
+    try:
+        img_bytes = fig.to_image(format="png")  # vereist 'kaleido'
+        st.download_button("⬇️ Download PNG", data=img_bytes, file_name=filename, mime="image/png")
+    except Exception:
+        st.caption("ℹ️ Voor PNG-export: `pip install kaleido` in je omgeving.")
+
+
 def plot_single_indicator(col: str):
     series = work_tidy[["date", col]].dropna()
     if series.empty:
         return
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=series["date"], y=series[col], mode="lines", name=LABELS.get(col, col)))
-    y_title = {
-        "— Geen —": "Niveau",
-        "YoY % (12m)": "YoY %",
-        "MoM % (1m)": "MoM %",
-        "Index (start=100)": "Index (start=100)",
-        "3m MA": "Niveau (3m MA)",
-        "6m MA": "Niveau (6m MA)",
-        "Eerste verschillen": "Δ (m/m)",
-    }[transform]
     fig.update_layout(
         title=LABELS.get(col, col),
         xaxis_title="Datum",
-        yaxis_title=y_title,
+        yaxis_title=y_title_for(transform),
         hovermode="x unified",
         height=420,
         legend_title="Indicator",
     )
+    if shade_recessions:
+        add_recession_shading(fig, start_d, end_d)
+    apply_percent_axis(fig, percent_like)
     st.plotly_chart(fig, use_container_width=True)
+    add_png_download(fig, f"{slug(col)}.png")
 
 
-def plot_group(group_name: str, cols_in_group: list[str]):
-    # Bereid dual-axis set
-    dual = DUAL_AXIS.get(group_name, None)
-    left_list = dual.get("left", []) if dual else []
-    right_list = dual.get("right", []) if dual else []
-
+def plot_group(group_name: str, cols_in_group: list[str], dual_cfg):
     # Filter op geselecteerde kolommen
     cols_avail = [c for c in cols_in_group if c in selected]
     if not cols_avail:
         return
+
+    left_list = dual_cfg.get("left", [])
+    right_list = dual_cfg.get("right", [])
 
     # Als geen dual-config: 1-as multi-line
     if not left_list and not right_list:
@@ -261,12 +367,16 @@ def plot_group(group_name: str, cols_in_group: list[str]):
         fig.update_layout(
             title=group_name,
             xaxis_title="Datum",
-            yaxis_title="Waarde",
+            yaxis_title=y_title_for(transform),
             hovermode="x unified",
             height=460,
             legend_title="Indicator",
         )
+        if shade_recessions:
+            add_recession_shading(fig, start_d, end_d)
+        apply_percent_axis(fig, percent_like)
         st.plotly_chart(fig, use_container_width=True)
+        add_png_download(fig, f"{slug(group_name)}.png")
         return
 
     # Dual-axis figuur
@@ -299,10 +409,14 @@ def plot_group(group_name: str, cols_in_group: list[str]):
         legend_title="Indicator",
     )
     fig.update_xaxes(title_text="Datum")
-    fig.update_yaxes(title_text="Linker as", secondary_y=False)
-    fig.update_yaxes(title_text="Rechter as", secondary_y=True)
+    fig.update_yaxes(title_text=y_title_for(transform), secondary_y=False)
+    fig.update_yaxes(title_text=y_title_for(transform), secondary_y=True)
+    if shade_recessions:
+        add_recession_shading(fig, start_d, end_d)
+    apply_percent_axis(fig, percent_like)
 
     st.plotly_chart(fig, use_container_width=True)
+    add_png_download(fig, f"{slug(group_name)}.png")
 
 # Render
 if view_mode == "Aparte grafieken (per indicator)":
@@ -311,10 +425,11 @@ if view_mode == "Aparte grafieken (per indicator)":
         plot_single_indicator(col)
 else:
     st.subheader("Grafieken per categorie")
+    # Kies dual-config uit custom, anders default
     for gname, gcols in GROUPS.items():
-        # render alleen als er overlapping is met selectie
         if any(c in selected for c in gcols):
-            plot_group(gname, gcols)
+            dual_cfg = locals().get('dual_custom', {}).get(gname, DUAL_AXIS_DEFAULT.get(gname, {"left": [], "right": []}))
+            plot_group(gname, gcols, dual_cfg)
 
 # ---------- Table + download ----------
 st.subheader("Data (huidige selectie)")
@@ -323,4 +438,4 @@ st.dataframe(work_tidy, use_container_width=True, hide_index=True)
 csv = work_tidy.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Download CSV", data=csv, file_name="macro_selected.csv", mime="text/csv")
 
-st.caption("Tip: kies 'Categorie-grafieken' om gerelateerde indicatoren naast elkaar te zien met 2 y-assen. De periode-schuiver staat standaard op de laatste 12 maanden.")
+st.caption("Tip: gebruik presets (12m/3y/5y/Max), recessie-shading en dual-axis per categorie voor meer context. Zet desgewenst filters in de URL voor een deelbare link.")
