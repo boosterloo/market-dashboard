@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from datetime import timedelta
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="📊 Macro (Monthly)", layout="wide")
 st.title("📊 Macro (Monthly, filled)")
@@ -33,6 +34,23 @@ LABELS = {
     "unemployment": "Unemployment rate",
 }
 
+# Categorieën + (optionele) dual-axis paren
+GROUPS = {
+    "Inflatie": ["cpi_all", "cpi_core", "pce_all"],
+    "Arbeid": ["unemployment", "payrolls", "init_claims"],
+    "Activiteit": ["ind_production", "retail_sales", "housing_starts"],
+    "Geld & Velocity": [
+        "m2", "m2_ma3", "m2_real", "m2_real_ma3",
+        "m2_yoy", "m2_real_yoy", "m2_vel", "m2_vel_ma3", "m2_vel_yoy",
+    ],
+}
+DUAL_AXIS = {
+    "Inflatie": {"left": ["cpi_all"], "right": ["cpi_core", "pce_all"]},
+    "Arbeid": {"left": ["unemployment"], "right": ["payrolls", "init_claims"]},
+    "Activiteit": {"left": ["ind_production"], "right": ["retail_sales", "housing_starts"]},
+    "Geld & Velocity": {"left": ["m2", "m2_real"], "right": ["m2_yoy", "m2_vel", "m2_vel_yoy"]},
+}
+
 # ---------- Data access ----------
 
 def _default_run_query(sql: str) -> pd.DataFrame:
@@ -56,7 +74,6 @@ def load_data() -> pd.DataFrame:
     df = _default_run_query(sql)
     if df.empty:
         return df
-    # types
     df["date"] = pd.to_datetime(df["date"]).dt.date
     return df
 
@@ -73,23 +90,32 @@ with st.sidebar:
     all_cols = [c for c in df.columns if c != "date"]
     all_cols_sorted = sorted(all_cols)
 
-    default_pick = [c for c in ["cpi_all", "unemployment", "ind_production"] if c in all_cols_sorted]
-    if not default_pick:
-        default_pick = all_cols_sorted[:4]
+    # Snelkeuze
+    if st.checkbox("Selecteer alle indicatoren", value=False):
+        selected = all_cols_sorted
+    else:
+        default_pick = [c for c in ["cpi_all", "unemployment", "ind_production"] if c in all_cols_sorted]
+        if not default_pick:
+            default_pick = all_cols_sorted[:4]
+        selected = st.multiselect("Indicatoren", options=all_cols_sorted, default=default_pick)
 
-    selected = st.multiselect("Indicatoren", options=all_cols_sorted, default=default_pick)
-
+    # Periode slider (default laatste 12 maanden)
     min_d, max_d = df["date"].min(), df["date"].max()
     try:
-        default_start = (pd.to_datetime(max_d) - pd.DateOffset(years=10)).date()
+        default_start = (pd.to_datetime(max_d) - pd.DateOffset(months=12)).date()
     except Exception:
         default_start = min_d
 
-    date_input_val = st.date_input(
-        "Periode", value=(default_start, max_d), min_value=min_d, max_value=max_d
+    date_range = st.slider(
+        "Periode",
+        min_value=min_d,
+        max_value=max_d,
+        value=(max(default_start, min_d), max_d),
+        step=timedelta(days=1),
+        help="Schuif om de periode te kiezen. Standaard: laatste 12 maanden.",
     )
-    if isinstance(date_input_val, tuple) and len(date_input_val) == 2:
-        start_d, end_d = date_input_val
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_d, end_d = date_range
     else:
         start_d, end_d = min_d, max_d
 
@@ -106,6 +132,13 @@ with st.sidebar:
         ],
         index=0,
         help="Wordt per geselecteerde serie toegepast.",
+    )
+
+    view_mode = st.radio(
+        "Weergave",
+        ["Aparte grafieken (per indicator)", "Categorie-grafieken (dual-axis waar zinvol)"],
+        index=1,
+        help="Kies of je per indicator een grafiek wilt of per categorie met 2 y-assen.",
     )
 
     st.caption(f"Bron: `{MACRO_VIEW}`")
@@ -150,7 +183,7 @@ elif transform == "Eerste verschillen":
 
 work_tidy = work_indexed.reset_index().dropna(how="all", subset=selected)
 
-# ---------- KPI's (FIX) ----------
+# ---------- KPI's ----------
 st.subheader("Laatste waarden")
 
 kpi_rows = []
@@ -178,36 +211,110 @@ for i, row in kpis.iterrows():
 
 st.divider()
 
-# ---------- Chart ----------
-fig = go.Figure()
-for col in selected:
+# ---------- Charts ----------
+
+def plot_single_indicator(col: str):
     series = work_tidy[["date", col]].dropna()
     if series.empty:
-        continue
-    fig.add_trace(
-        go.Scatter(x=series["date"], y=series[col], mode="lines", name=LABELS.get(col, col))
+        return
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=series["date"], y=series[col], mode="lines", name=LABELS.get(col, col)))
+    y_title = {
+        "— Geen —": "Niveau",
+        "YoY % (12m)": "YoY %",
+        "MoM % (1m)": "MoM %",
+        "Index (start=100)": "Index (start=100)",
+        "3m MA": "Niveau (3m MA)",
+        "6m MA": "Niveau (6m MA)",
+        "Eerste verschillen": "Δ (m/m)",
+    }[transform]
+    fig.update_layout(
+        title=LABELS.get(col, col),
+        xaxis_title="Datum",
+        yaxis_title=y_title,
+        hovermode="x unified",
+        height=420,
+        legend_title="Indicator",
     )
+    st.plotly_chart(fig, use_container_width=True)
 
-y_title = {
-    "— Geen —": "Niveau",
-    "YoY % (12m)": "YoY %",
-    "MoM % (1m)": "MoM %",
-    "Index (start=100)": "Index (start=100)",
-    "3m MA": "Niveau (3m MA)",
-    "6m MA": "Niveau (6m MA)",
-    "Eerste verschillen": "Δ (m/m)",
-}[transform]
 
-fig.update_layout(
-    title="Macro-reeksen (maandelijks, filled)",
-    xaxis_title="Datum",
-    yaxis_title=y_title,
-    hovermode="x unified",
-    height=480,
-    legend_title="Indicator",
-)
+def plot_group(group_name: str, cols_in_group: list[str]):
+    # Bereid dual-axis set
+    dual = DUAL_AXIS.get(group_name, None)
+    left_list = dual.get("left", []) if dual else []
+    right_list = dual.get("right", []) if dual else []
 
-st.plotly_chart(fig, use_container_width=True)
+    # Filter op geselecteerde kolommen
+    cols_avail = [c for c in cols_in_group if c in selected]
+    if not cols_avail:
+        return
+
+    # Als geen dual-config: 1-as multi-line
+    if not left_list and not right_list:
+        fig = go.Figure()
+        for col in cols_avail:
+            s = work_tidy[["date", col]].dropna()
+            if s.empty:
+                continue
+            fig.add_trace(go.Scatter(x=s["date"], y=s[col], mode="lines", name=LABELS.get(col, col)))
+        fig.update_layout(
+            title=group_name,
+            xaxis_title="Datum",
+            yaxis_title="Waarde",
+            hovermode="x unified",
+            height=460,
+            legend_title="Indicator",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+    # Dual-axis figuur
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # Linkeras
+    for col in [c for c in left_list if c in cols_avail]:
+        s = work_tidy[["date", col]].dropna()
+        if s.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(x=s["date"], y=s[col], mode="lines", name=LABELS.get(col, col)),
+            secondary_y=False,
+        )
+
+    # Rechteras
+    for col in [c for c in right_list if c in cols_avail]:
+        s = work_tidy[["date", col]].dropna()
+        if s.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(x=s["date"], y=s[col], mode="lines", name=LABELS.get(col, col), line=dict(dash="dash")),
+            secondary_y=True,
+        )
+
+    fig.update_layout(
+        title=f"{group_name} (dual-axis)",
+        hovermode="x unified",
+        height=520,
+        legend_title="Indicator",
+    )
+    fig.update_xaxes(title_text="Datum")
+    fig.update_yaxes(title_text="Linker as", secondary_y=False)
+    fig.update_yaxes(title_text="Rechter as", secondary_y=True)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+# Render
+if view_mode == "Aparte grafieken (per indicator)":
+    st.subheader("Grafieken per indicator")
+    for col in selected:
+        plot_single_indicator(col)
+else:
+    st.subheader("Grafieken per categorie")
+    for gname, gcols in GROUPS.items():
+        # render alleen als er overlapping is met selectie
+        if any(c in selected for c in gcols):
+            plot_group(gname, gcols)
 
 # ---------- Table + download ----------
 st.subheader("Data (huidige selectie)")
@@ -216,4 +323,4 @@ st.dataframe(work_tidy, use_container_width=True, hide_index=True)
 csv = work_tidy.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Download CSV", data=csv, file_name="macro_selected.csv", mime="text/csv")
 
-st.caption("Tip: voeg meer indicatoren toe aan de onderliggende tabel; de pagina pakt ze automatisch op via de view.")
+st.caption("Tip: kies 'Categorie-grafieken' om gerelateerde indicatoren naast elkaar te zien met 2 y-assen. De periode-schuiver staat standaard op de laatste 12 maanden.")
