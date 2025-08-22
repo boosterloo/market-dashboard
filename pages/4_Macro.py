@@ -85,12 +85,26 @@ def y_title_for(transform: str) -> str:
         "Eerste verschillen": "Δ (m/m)",
     }[transform]
 
+# Series die in 'raw' als percentage gezien mogen worden
+PCT_LEVEL_COLS = {"unemployment"}  # uitbreidbaar
+
 
 def is_percent_like(transform: str) -> bool:
     return transform in {"YoY % (12m)", "MoM % (1m)"}
 
 
-def apply_percent_axis(fig: go.Figure, percent_like: bool):
+def percent_allowed_for_levels(transform: str) -> bool:
+    """Bij deze transforms blijft de eenheid een % voor reeksen die van nature % zijn."""
+    return transform in {"— Geen —", "3m MA", "6m MA", "Eerste verschillen"}
+
+
+def is_percent_col(col: str) -> bool:
+    """Heuristiek: kolommen die als % moeten worden getoond in raw/MA-modus."""
+    c = col.lower()
+    return (c in PCT_LEVEL_COLS) or c.endswith("_yoy") or ("rate" in c)
+
+
+def apply_percent_axis_single(fig: go.Figure, percent_like: bool):
     if percent_like:
         try:
             fig.update_yaxes(ticksuffix="%")
@@ -98,8 +112,14 @@ def apply_percent_axis(fig: go.Figure, percent_like: bool):
             pass
 
 
-def slug(s: str) -> str:
-    return "".join(c.lower() if c.isalnum() else "-" for c in s).strip("-")
+def apply_percent_axis_dual(fig: go.Figure, left_percent: bool, right_percent: bool):
+    try:
+        if left_percent:
+            fig.update_yaxes(ticksuffix="%", secondary_y=False)
+        if right_percent:
+            fig.update_yaxes(ticksuffix="%", secondary_y=True)
+    except Exception:
+        pass
 
 # ---------- Data access ----------
 
@@ -307,9 +327,14 @@ for i, row in kpis.iterrows():
     name = LABELS.get(row["indicator"], row["indicator"])
     val = row["value"]
     delta = row["delta"]
-    if percent_like:
+    kpi_percent = percent_like or (percent_allowed_for_levels(transform) and is_percent_col(row["indicator"]) and not normalize)
+    if kpi_percent:
         txt_val = "—" if pd.isna(val) else f"{val:,.2f}%"
-        txt_delta = None if pd.isna(delta) else f"{delta:,.2f}pp"
+        # Bij verschillen (Δ) en % reeksen: pp tonen
+        if pd.isna(delta):
+            txt_delta = None
+        else:
+            txt_delta = f"{delta:,.2f}pp" if transform == "Eerste verschillen" else f"{delta:,.2f}pp" if percent_like else f"{delta:,.2f}pp"
     else:
         txt_val = "—" if pd.isna(val) else f"{val:,.2f}"
         txt_delta = None if pd.isna(delta) else f"{delta:,.2f}"
@@ -335,87 +360,28 @@ def plot_single_indicator(col: str):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=series["date"], y=series[col], mode="lines", name=LABELS.get(col, col)))
     fig.update_layout(
-        title=LABELS.get(col, col),
+        title=group_name,
         xaxis_title="Datum",
         yaxis_title=y_title_for(transform),
-        hovermode="x unified",
-        height=420,
-        legend_title="Indicator",
-    )
-    if shade_recessions:
-        add_recession_shading(fig, start_d, end_d)
-    apply_percent_axis(fig, percent_like)
-    st.plotly_chart(fig, use_container_width=True)
-    add_png_download(fig, f"{slug(col)}.png")
-
-
-def plot_group(group_name: str, cols_in_group: list[str], dual_cfg):
-    # Filter op geselecteerde kolommen
-    cols_avail = [c for c in cols_in_group if c in selected]
-    if not cols_avail:
-        return
-
-    left_list = dual_cfg.get("left", [])
-    right_list = dual_cfg.get("right", [])
-
-    # Als geen dual-config: 1-as multi-line
-    if not left_list and not right_list:
-        fig = go.Figure()
-        for col in cols_avail:
-            s = work_tidy[["date", col]].dropna()
-            if s.empty:
-                continue
-            fig.add_trace(go.Scatter(x=s["date"], y=s[col], mode="lines", name=LABELS.get(col, col)))
-        fig.update_layout(
-            title=group_name,
-            xaxis_title="Datum",
-            yaxis_title=y_title_for(transform),
-            hovermode="x unified",
-            height=460,
-            legend_title="Indicator",
-        )
-        if shade_recessions:
-            add_recession_shading(fig, start_d, end_d)
-        apply_percent_axis(fig, percent_like)
-        st.plotly_chart(fig, use_container_width=True)
-        add_png_download(fig, f"{slug(group_name)}.png")
-        return
-
-    # Dual-axis figuur
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-    # Linkeras
-    for col in [c for c in left_list if c in cols_avail]:
-        s = work_tidy[["date", col]].dropna()
-        if s.empty:
-            continue
-        fig.add_trace(
-            go.Scatter(x=s["date"], y=s[col], mode="lines", name=LABELS.get(col, col)),
-            secondary_y=False,
-        )
-
-    # Rechteras
-    for col in [c for c in right_list if c in cols_avail]:
-        s = work_tidy[["date", col]].dropna()
-        if s.empty:
-            continue
-        fig.add_trace(
-            go.Scatter(x=s["date"], y=s[col], mode="lines", name=LABELS.get(col, col), line=dict(dash="dash")),
-            secondary_y=True,
-        )
-
-    fig.update_layout(
-        title=f"{group_name} (dual-axis)",
         hovermode="x unified",
         height=520,
         legend_title="Indicator",
     )
-    fig.update_xaxes(title_text="Datum")
-    fig.update_yaxes(title_text=y_title_for(transform), secondary_y=False)
-    fig.update_yaxes(title_text=y_title_for(transform), secondary_y=True)
     if shade_recessions:
         add_recession_shading(fig, start_d, end_d)
-    apply_percent_axis(fig, percent_like)
+
+    # Per-as %-suffix bepalen (alle reeksen op de as moeten % zijn, tenzij YoY/MoM transform)
+    try:
+        # Binnen deze scope bestaan left_list/right_list
+        left_avail = [c for c in (left_list if 'left_list' in locals() else []) if c in cols_avail]
+        right_avail = [c for c in (right_list if 'right_list' in locals() else []) if c in cols_avail]
+        left_pct = percent_like or (percent_allowed_for_levels(transform) and not normalize and len(left_avail) > 0 and all(is_percent_col(c) for c in left_avail))
+        right_pct = percent_like or (percent_allowed_for_levels(transform) and not normalize and len(right_avail) > 0 and all(is_percent_col(c) for c in right_avail))
+        apply_percent_axis_dual(fig, left_pct, right_pct)
+    except Exception:
+        # fallback als er geen dual context is
+        axis_pct = percent_like or (percent_allowed_for_levels(transform) and not normalize and all(is_percent_col(c) for c in cols_avail))
+        apply_percent_axis_single(fig, axis_pct)
 
     st.plotly_chart(fig, use_container_width=True)
     add_png_download(fig, f"{slug(group_name)}.png")
