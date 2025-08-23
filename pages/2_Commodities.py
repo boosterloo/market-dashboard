@@ -1,75 +1,90 @@
-# pages/2_Commodities.py
-# Werkt met wide-view `marketdata.commodity_prices_wide_v`
-# Verwachte kolommen per instrument: <pfx>_close, _delta_abs, _delta_pct, _ma20, _ma50, _ma200
+# ==============================
+# Combinatiegrafieken (Energy & Metals)
+# Plak dit ergens NA je df/kleuren/helpers (bv. na "Per instrument")
+# ==============================
 
-import streamlit as st
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
-from datetime import timedelta
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-# ---- BigQuery helpers ----
-try:
-    from utils.bq import run_query, bq_ping
-except Exception:
-    import google.cloud.bigquery as bq
-    from google.oauth2 import service_account
+st.markdown("---")
+st.subheader("Combinatiegrafieken")
 
-    @st.cache_resource(show_spinner=False)
-    def _bq_client_from_secrets():
-        creds = st.secrets["gcp_service_account"]
-        credentials = service_account.Credentials.from_service_account_info(creds)
-        return bq.Client(credentials=credentials, project=creds["project_id"])
+# Kleuren (Okabe-Ito) – los van je MA-kleuren
+COLOR_WTI    = "#111111"  # bijna zwart
+COLOR_BRENT  = "#0072B2"  # blauw
+COLOR_GAS    = "#009E73"  # groen
+COLOR_GOLD   = "#E69F00"  # oranje
+COLOR_SILVER = "#56B4E9"  # sky blue (of kies grijs: "#999999")
 
-    def bq_ping() -> bool:
-        try:
-            _bq_client_from_secrets().query("SELECT 1").result(timeout=10)
-            return True
-        except Exception:
-            return False
+def _to_float(s):
+    return pd.to_numeric(s, errors="coerce").astype(float)
 
-    @st.cache_data(ttl=300, show_spinner=False)
-    def run_query(sql: str) -> pd.DataFrame:
-        client = _bq_client_from_secrets()
-        return client.query(sql).to_dataframe()
+# ---------- Energy: WTI + Brent (links) & Natural Gas (rechts) ----------
+have_energy = all(col in df.columns for col in ["wti_close", "brent_close", "natgas_close"])
+energy = df[["date", "wti_close", "brent_close", "natgas_close"]].dropna(how="all") if have_energy else pd.DataFrame()
 
-# ---- Page config ----
-st.set_page_config(page_title="Commodities", layout="wide")
-st.title("🛢️ Commodities Dashboard")
+if have_energy and not energy.empty:
+    e = energy.copy()
+    e["wti_close"]    = _to_float(e["wti_close"])
+    e["brent_close"]  = _to_float(e["brent_close"])
+    e["natgas_close"] = _to_float(e["natgas_close"])
 
-COM_WIDE_VIEW = st.secrets.get("tables", {}).get(
-    "commodities_wide_view",
-    "nth-pier-468314-p7.marketdata.commodity_prices_wide_v"
-)
+    fig_eng = make_subplots(specs=[[{"secondary_y": True}]])
+    fig_eng.add_trace(go.Scatter(
+        x=e["date"], y=e["wti_close"], name="WTI (USD/bbl)",
+        line=dict(width=2, color=COLOR_WTI)
+    ), secondary_y=False)
+    fig_eng.add_trace(go.Scatter(
+        x=e["date"], y=e["brent_close"], name="Brent (USD/bbl)",
+        line=dict(width=2, color=COLOR_BRENT)
+    ), secondary_y=False)
+    fig_eng.add_trace(go.Scatter(
+        x=e["date"], y=e["natgas_close"], name="NatGas (USD/MMBtu)",
+        line=dict(width=2, color=COLOR_GAS)
+    ), secondary_y=True)
 
-# ---- Health check ----
-if not bq_ping():
-    st.error("Geen BigQuery-verbinding. Controleer Secrets ([gcp_service_account]).")
-    st.stop()
+    fig_eng.update_yaxes(title_text="Oil price (USD/bbl)", secondary_y=False)
+    fig_eng.update_yaxes(title_text="Natural Gas (USD/MMBtu)", secondary_y=True)
+    fig_eng.update_layout(
+        height=460,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title="WTI & Brent vs Natural Gas",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+    )
+    st.plotly_chart(fig_eng, use_container_width=True)
+else:
+    st.info("Energy-combo: ontbrekende kolommen of geen data (verwacht: wti_close, brent_close, natgas_close).")
 
-# ---- Data laden ----
-@st.cache_data(ttl=300, show_spinner=False)
-def load_data() -> pd.DataFrame:
-    df = run_query(f"SELECT * FROM `{COM_WIDE_VIEW}` ORDER BY date")
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    # alles behalve 'date' naar float
-    for c in df.columns:
-        if c != "date":
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+# ---------- Metals: Gold (links) & Silver (rechts) ----------
+have_metals = all(col in df.columns for col in ["gold_close", "silver_close"])
+metals = df[["date", "gold_close", "silver_close"]].dropna(how="all") if have_metals else pd.DataFrame()
 
-df_wide = load_data()
-if df_wide.empty:
-    st.warning("Geen data in commodity_prices_wide_v.")
-    st.stop()
+if have_metals and not metals.empty:
+    m = metals.copy()
+    m["gold_close"]   = _to_float(m["gold_close"])
+    m["silver_close"] = _to_float(m["silver_close"])
 
-# ---- Instrumenten afleiden ----
-close_cols = [c for c in df_wide.columns if c.endswith("_close")]
-prefixes = sorted([c.removesuffix("_close") for c in close_cols])
+    fig_met = make_subplots(specs=[[{"secondary_y": True}]])
+    fig_met.add_trace(go.Scatter(
+        x=m["date"], y=m["gold_close"], name="Gold (USD/oz)",
+        line=dict(width=2, color=COLOR_GOLD)
+    ), secondary_y=False)
+    fig_met.add_trace(go.Scatter(
+        x=m["date"], y=m["silver_close"], name="Silver (USD/oz)",
+        line=dict(width=2, color=COLOR_SILVER)
+    ), secondary_y=True)
 
+<<<<<<< HEAD
+    fig_met.update_yaxes(title_text="Gold (USD/oz)", secondary_y=False)
+    fig_met.update_yaxes(title_text="Silver (USD/oz)", secondary_y=True)
+    fig_met.update_layout(
+        height=460,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title="Gold vs Silver",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+=======
 LABELS = {
     "wti": "WTI",
     "brent": "Brent",
@@ -95,7 +110,13 @@ with c1:
         value=(default_start, max_d),
         step=timedelta(days=1),
         format="YYYY-MM-DD",
+>>>>>>> 3243f0a9da8ad473e524b7c4e7a276e03f93429f
     )
+<<<<<<< HEAD
+    st.plotly_chart(fig_met, use_container_width=True)
+else:
+    st.info("Metals-combo: ontbrekende kolommen of geen data (verwacht: gold_close, silver_close).")
+=======
 with c2:
     # standaard: ALLE instrumenten
     sel = st.multiselect(
@@ -109,7 +130,10 @@ with c3:
     avg_mode = st.radio("Gemiddelde", ["EMA", "SMA"], index=0, horizontal=True)
 with c4:
     show_pairs = st.checkbox("Paarvergelijking (dubbele y-as)", value=False)
+>>>>>>> 3243f0a9da8ad473e524b7c4e7a276e03f93429f
 
+<<<<<<< HEAD
+=======
 st.caption("Elke selectie toont z’n eigen 2 grafieken: links prijs + MA/EMA 20/50/200, rechts Δ% bars + YTD% (secundaire as).")
 
 # ---- Filter data ----
@@ -305,3 +329,5 @@ if show_pairs:
             title=f"{lbl1} vs {lbl2}"
         )
         st.plotly_chart(fig, use_container_width=True)
+
+>>>>>>> 3243f0a9da8ad473e524b7c4e7a276e03f93429f
