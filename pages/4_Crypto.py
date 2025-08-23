@@ -55,7 +55,7 @@ with c2:
 mask = (df["date"] >= start) & (df["date"] <= end)
 d = df.loc[mask].copy()
 
-# ---- Helper ----
+# ---- Helpers ----
 def col(asset: str, metric: str) -> str:
     return f"{metric}_{asset}"
 
@@ -101,12 +101,11 @@ for name in pick:
     a = name.lower()
     pc = col(a, "price")
     if pc in d.columns:
-        s = d.set_index("date")[pc].astype(float)
-        s = s.dropna()
+        s = d.set_index("date")[pc].astype(float).dropna()
         if len(s):
             base = s.iloc[0]
             if base != 0:
-                norm[name] = (d.set_index("date")[pc] / base) * 100.0
+                norm[name] = d.set_index("date")[pc] / base * 100.0
 if norm.shape[1]:
     st.line_chart(norm, use_container_width=True)
 else:
@@ -114,25 +113,32 @@ else:
 
 # ---- Dagelijkse Δ% ----
 st.subheader("Dagelijkse verandering (%)")
-delta_wide = pd.DataFrame(index=d["date"])
+idx = pd.DataFrame({"date": d["date"]}).drop_duplicates().set_index("date")
+delta_wide = idx.copy()
 for name in pick:
     a = name.lower()
     colname = col(a, "delta_pct")
     if colname in d.columns:
-        delta_wide[name] = d[colname]
-if delta_wide.shape[1]:
-    st.line_chart(delta_wide.set_index("date"), use_container_width=True)
+        s = d.set_index("date")[colname].astype(float)
+        delta_wide[name] = s.reindex(delta_wide.index)
+if delta_wide.shape[1] > 0:
+    st.line_chart(delta_wide, use_container_width=True)
+else:
+    st.info("Geen Δ%-kolommen gevonden voor de selectie.")
 
 # ---- YTD% ----
 st.subheader("YTD performance (%)")
-ytd_wide = pd.DataFrame(index=d["date"])
+ytd_wide = idx.copy()
 for name in pick:
     a = name.lower()
     colname = col(a, "ytd_pct")
     if colname in d.columns:
-        ytd_wide[name] = d[colname]
-if ytd_wide.shape[1]:
-    st.line_chart(ytd_wide.set_index("date"), use_container_width=True)
+        s = d.set_index("date")[colname].astype(float)
+        ytd_wide[name] = s.reindex(ytd_wide.index)
+if ytd_wide.shape[1] > 0:
+    st.line_chart(ytd_wide, use_container_width=True)
+else:
+    st.info("Geen YTD%-kolommen gevonden voor de selectie.")
 
 # ---- Tabel laatste 30 rijen (eerste asset) ----
 if pick:
@@ -141,6 +147,14 @@ if pick:
                             col(a0, "delta_pct"), col(a0, "ytd_pct")] if c in d.columns]
     if cols_tbl:
         tbl = d[["date"] + cols_tbl].tail(30).copy()
-        tbl.columns = ["date"] + [c.split("_", 1)[0].upper() for c in cols_tbl]
+        # Mooie kolomnamen
+        rename_map = {
+            col(a0, "price"): "PRICE",
+            col(a0, "ma7"): "MA7",
+            col(a0, "ma30"): "MA30",
+            col(a0, "delta_pct"): "DELTA_%",  # dag %
+            col(a0, "ytd_pct"): "YTD_%"
+        }
+        tbl = tbl.rename(columns=rename_map)
         st.subheader(f"Laatst 30 rijen – {pick[0]}")
         st.dataframe(tbl, use_container_width=True)
