@@ -99,10 +99,8 @@ with c1:
         format="YYYY-MM-DD",
     )
 with c2:
-    # Default selectie: ALLES behalve combo-items (kun je in de multiselect alsnog toevoegen)
-    default_sel = [p for p in prefixes if p not in COMBO_SET]
-    if not default_sel:  # fallback als je dataset alleen combo’s bevat
-        default_sel = prefixes[:]
+    # Default selectie: ALLES behalve combo-items (kun je via multiselect alsnog toevoegen)
+    default_sel = [p for p in prefixes if p not in COMBO_SET] or prefixes[:]
     sel = st.multiselect(
         "Instrumenten (individuele grafieken)",
         options=[(p, label_of(p)) for p in prefixes],
@@ -165,22 +163,44 @@ COLOR_GAS    = "#009E73"
 COLOR_GOLD   = "#E69F00"
 COLOR_SILVER = "#56B4E9"
 
-# ---------- KPIs (voor geselecteerde individuele instrumenten) ----------
+# ---------- KPI's (voor geselecteerde individuele instrumenten) ----------
 st.subheader("Kerncijfers")
 kpi_cols = st.columns(min(len(sel), 4) or 1)
+
 for i, pfx in enumerate(sel or prefixes[:1]):
     c = cols_for(pfx)
     label = label_of(pfx)
-    sub = df[["date", c["close"], c["d_abs"], c["d_pct"]]].dropna(subset=[c["close"]]).copy()
+
+    # Alleen kolommen die bestaan meenemen
+    present = ["date"] + [x for x in [c["close"], c["d_abs"], c["d_pct"]] if x in df.columns]
+    sub = df[present].dropna(subset=[c["close"]]).copy() if c["close"] in df.columns else pd.DataFrame()
+
     with kpi_cols[i % len(kpi_cols)]:
         if sub.empty:
             st.metric(label, value="—", delta="—")
+            continue
+
+        last = sub.iloc[-1]
+        val = float(last[c["close"]]) if pd.notna(last.get(c["close"])) else np.nan
+
+        d_abs = float(last[c["d_abs"]]) if (c["d_abs"] in sub.columns and pd.notna(last.get(c["d_abs"]))) else None
+        d_pct = float(last[c["d_pct"]]) if (c["d_pct"] in sub.columns and pd.notna(last.get(c["d_pct"]))) else None  # fractie
+
+        # Delta-opmaak
+        if d_pct is not None:
+            delta_str = f"{(d_abs if d_abs is not None else 0.0):+.2f} ({d_pct*100:+.2f}%)"
+        elif d_abs is not None:
+            # pct ad-hoc op basis van vorige close
+            if len(sub) >= 2 and pd.notna(sub.iloc[-2][c["close"]]) and sub.iloc[-2][c["close"]] != 0:
+                prev_close = float(sub.iloc[-2][c["close"]])
+                pct_calc = (d_abs / prev_close) * 100.0
+                delta_str = f"{d_abs:+.2f} ({pct_calc:+.2f}%)"
+            else:
+                delta_str = f"{d_abs:+.2f}"
         else:
-            last = sub.iloc[-1]
-            val = float(last[c["close"]])
-            d_abs = float(last[c["d_abs"]]) if pd.notnull(last[c["d_abs"]]) else 0.0
-            d_pct = float(last[c["d_pct"]]) if pd.notnull[last[c["d_pct"]]] else 0.0
-            st.metric(label, value=f"{val:,.2f}", delta=f"{d_abs:+.2f} ({d_pct*100:+.2f}%)")
+            delta_str = "—"
+
+        st.metric(label, value=f"{val:,.2f}" if pd.notna(val) else "—", delta=delta_str)
 
 st.markdown("---")
 
@@ -252,11 +272,10 @@ for pfx in (sel or prefixes[:1]):
             fig2.update_yaxes(title_text="Δ% dag", secondary_y=False)
 
             # YTD% op secundaire as
-            close_col = c["close"]
-            if close_col in df.columns:
-                subc = df[["date", close_col]].dropna().copy()
-                subc[close_col] = _to_float(subc[close_col])
-                ytd = ytd_percent_series(subc["date"], subc[close_col])
+            if c["close"] in df.columns:
+                subc = df[["date", c["close"]]].dropna().copy()
+                subc[c["close"]] = _to_float(subc[c["close"]])
+                ytd = ytd_percent_series(subc["date"], subc[c["close"]])
                 ytd = ytd.reindex(pd.to_datetime(bars["date"]))
                 fig2.add_trace(go.Scatter(x=bars["date"], y=ytd.values, name="YTD%",
                                           line=dict(width=2, color=COLOR_YTD)),
