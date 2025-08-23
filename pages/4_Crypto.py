@@ -63,6 +63,14 @@ def last_non_null(series: pd.Series):
     idx = series.last_valid_index()
     return series.loc[idx] if idx is not None else np.nan
 
+# ---- Kleuren (Okabe-Ito: kleurenblind-vriendelijk) ----
+COLOR_PRICE = "#111111"
+COLOR_MA7   = "#E69F00"  # oranje
+COLOR_MA30  = "#009E73"  # groen
+COLOR_BAR_POS = "#009E73"  # groen
+COLOR_BAR_NEG = "#D55E00"  # rood (vermillion)
+COLOR_YTD  = "#CC79A7"  # paars
+
 # ---- Cards (laatste dag in selectie) ----
 st.subheader("Overzicht")
 cols = st.columns(4)
@@ -86,7 +94,7 @@ for name in pick:
 
     c_left, c_right = st.columns(2)
 
-    # Links: prijs + MA7/MA30 (lijnen)
+    # Links: prijs + MA7/MA30 (lijnen) met hoge contrastkleuren
     price_c = col(a, "price")
     ma7_c   = col(a, "ma7")
     ma30_c  = col(a, "ma30")
@@ -94,16 +102,28 @@ for name in pick:
         sub = d[["date", price_c, ma7_c, ma30_c]].copy()
         with c_left:
             fig1 = make_subplots(specs=[[{"secondary_y": False}]])
-            fig1.add_trace(go.Scatter(x=sub["date"], y=sub[price_c], name=f"{name} prijs"))
-            fig1.add_trace(go.Scatter(x=sub["date"], y=sub[ma7_c],   name="MA7"))
-            fig1.add_trace(go.Scatter(x=sub["date"], y=sub[ma30_c],  name="MA30"))
-            fig1.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
+            fig1.add_trace(go.Scatter(
+                x=sub["date"], y=sub[price_c], name=f"{name} prijs",
+                line=dict(width=2, color=COLOR_PRICE)
+            ))
+            fig1.add_trace(go.Scatter(
+                x=sub["date"], y=sub[ma7_c],   name="MA7",
+                line=dict(width=2, color=COLOR_MA7)
+            ))
+            fig1.add_trace(go.Scatter(
+                x=sub["date"], y=sub[ma30_c],  name="MA30",
+                line=dict(width=2, color=COLOR_MA30)
+            ))
+            fig1.update_layout(
+                height=420, margin=dict(l=10, r=10, t=40, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+            )
             st.plotly_chart(fig1, use_container_width=True)
     else:
         with c_left:
             st.info("Nog geen prijs/MA-data voor deze selectie.")
 
-    # Rechts: Δ% als staven + YTD% als lijn (secundaire as)
+    # Rechts: Δ% als staven (groen/rood) + YTD% als lijn (paars) op secundaire as
     dcol  = col(a, "delta_pct")
     ytd_c = col(a, "ytd_pct")
     has_delta = dcol in d.columns
@@ -115,7 +135,12 @@ for name in pick:
             if has_delta:
                 s = d.set_index("date")[dcol].astype(float)
                 s = s[~s.index.duplicated(keep="last")]
-                fig2.add_trace(go.Bar(x=s.index, y=s.values, name="Δ% per dag"), secondary_y=False)
+                bar_colors = [COLOR_BAR_POS if v >= 0 else COLOR_BAR_NEG for v in s.values]
+                fig2.add_trace(
+                    go.Bar(x=s.index, y=s.values, name="Δ% per dag",
+                           marker=dict(color=bar_colors), opacity=0.9),
+                    secondary_y=False
+                )
                 try:
                     fig2.add_hline(y=0, line_dash="dot", opacity=0.5)
                 except Exception:
@@ -123,13 +148,19 @@ for name in pick:
                 fig2.update_yaxes(title_text="Δ% dag", secondary_y=False)
             if has_ytd:
                 y = d.set_index("date")[ytd_c].astype(float)
-                # reindex op delta-index zodat assen gelijk lopen als beide bestaan
                 if has_delta:
                     y = y.reindex(s.index)
-                fig2.add_trace(go.Scatter(x=y.index, y=y.values, name="YTD%"), secondary_y=True)
+                fig2.add_trace(
+                    go.Scatter(x=y.index, y=y.values, name="YTD%",
+                               line=dict(width=2, color=COLOR_YTD)),
+                    secondary_y=True
+                )
                 fig2.update_yaxes(title_text="YTD%", secondary_y=True)
 
-            fig2.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
+            fig2.update_layout(
+                height=420, margin=dict(l=10, r=10, t=40, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+            )
             st.plotly_chart(fig2, use_container_width=True)
     else:
         with c_right:
