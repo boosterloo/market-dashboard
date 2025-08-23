@@ -87,7 +87,7 @@ def label_of(pfx: str) -> str:
 min_d, max_d = df_wide["date"].min(), df_wide["date"].max()
 default_start = max(max_d - timedelta(days=365), min_d)
 
-c1, c2, c3 = st.columns([2, 1, 1])
+c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
 with c1:
     start, end = st.slider(
         "Periode",
@@ -97,22 +97,20 @@ with c1:
         format="YYYY-MM-DD",
     )
 with c2:
-    default_sel = [p for p in ["wti", "brent", "gold", "silver"] if p in prefixes] or prefixes[:4]
+    # standaard: ALLE instrumenten
     sel = st.multiselect(
-        "Instrumenten",
+        "Instrumenten (standaard alle)",
         options=[(p, label_of(p)) for p in prefixes],
-        default=[(p, label_of(p)) for p in default_sel],
+        default=[(p, label_of(p)) for p in prefixes],
         format_func=lambda t: t[1],
     )
-    sel = [p for p, _ in sel]
+    sel = [p for p, _ in sel] or prefixes[:]  # fallback naar alle
 with c3:
-    show_ytd = st.checkbox("Toon YTD-lijn bij Δ%", value=True)
+    avg_mode = st.radio("Gemiddelde", ["EMA", "SMA"], index=0, horizontal=True)
+with c4:
+    show_pairs = st.checkbox("Paarvergelijking (dubbele y-as)", value=False)
 
-st.caption("Tip: je kunt meerdere instrumenten selecteren; elk krijgt z’n eigen 2 grafieken.")
-
-# Pair-vergelijkingen (optioneel)
-PAIR_CANDIDATES = [("wti", "brent"), ("gold", "silver"), ("gasoline", "heatingoil")]
-show_pairs = st.checkbox("Toon paarvergelijkingen (dubbele y-as)", value=False)
+st.caption("Elke selectie toont z’n eigen 2 grafieken: links prijs + MA/EMA 20/50/200, rechts Δ% bars + YTD% (secundaire as).")
 
 # ---- Filter data ----
 mask = (df_wide["date"] >= start) & (df_wide["date"] <= end)
@@ -129,16 +127,19 @@ def cols_for(pfx: str) -> dict:
         "ma200": f"{pfx}_ma200",
     }
 
+def compute_ma_ema(series: pd.Series, kind: str, window: int) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    if kind == "EMA":
+        return s.ewm(span=window, adjust=False, min_periods=window).mean()
+    # SMA
+    return s.rolling(window=window, min_periods=window).mean()
+
 def ytd_percent_series(dates: pd.Series, values: pd.Series) -> pd.Series:
     """YTD% per jaar: (value / first_value_of_year - 1) * 100"""
     s = pd.Series(values.values, index=pd.to_datetime(dates), dtype="float64")
     years = s.index.year
-    def _first_valid(x):
-        xv = x.dropna()
-        return xv.iloc[0] if len(xv) else np.nan
-    base = s.groupby(years).transform(_first_valid)
-    ytd = (s / base - 1.0) * 100.0
-    return ytd
+    base = s.groupby(years).transform(lambda x: x.dropna().iloc[0] if len(x.dropna()) else np.nan)
+    return (s / base - 1.0) * 100.0
 
 # ---- Kleuren (Okabe-Ito) ----
 COLOR_PRICE   = "#111111"  # bijna zwart
@@ -168,7 +169,7 @@ for i, pfx in enumerate(sel or prefixes[:1]):
 
 st.markdown("---")
 
-# ---- Per instrument: 2 grafieken naast elkaar ----
+# ---- Per instrument: 2 grafieken naast elkaar (standaard voor ALLE selectie)
 st.subheader("Per instrument")
 for pfx in (sel or prefixes[:1]):
     c = cols_for(pfx)
@@ -176,34 +177,48 @@ for pfx in (sel or prefixes[:1]):
     st.markdown(f"### {name}")
     left, right = st.columns(2)
 
-    # Links: Close + MA20/50/200
-    needed = [c["close"], c["ma20"], c["ma50"], c["ma200"]]
-    has_any = any(col in df.columns for col in needed)
-    if has_any:
-        sub = df[["date"] + [col for col in needed if col in df.columns]].copy()
-        for colname in sub.columns:
-            if colname != "date":
-                sub[colname] = pd.to_numeric(sub[colname], errors="coerce").astype(float)
+    # Links: Close + MA/EMA 20/50/200
+    needed = [c["close"]]
+    if not all(col in df.columns for col in needed):
+        with left:
+            st.info("Geen prijsdata voor dit instrument.")
+    else:
+        sub = df[["date", c["close"]]].dropna().copy()
+        sub[c["close"]] = pd.to_numeric(sub[c["close"]], errors="coerce").astype(float)
+
+        # Bepaal MA/EMA: voor SMA gebruiken we databasekolommen als ze bestaan; anders berekenen
+        if avg_mode == "SMA":
+            ma20 = df[c["ma20"]] if c["ma20"] in df.columns else compute_ma_ema(sub[c["close"]], "SMA", 20)
+            ma50 = df[c["ma50"]] if c["ma50"] in df.columns else compute_ma_ema(sub[c["close"]], "SMA", 50)
+            ma200 = df[c["ma200"]] if c["ma200"] in df.columns else compute_ma_ema(sub[c["close"]], "SMA", 200)
+            # align op sub
+            ma20 = pd.to_numeric(ma20, errors="coerce").astype(float).reindex(df.index).loc[sub.index]
+            ma50 = pd.to_numeric(ma50, errors="coerce").astype(float).reindex(df.index).loc[sub.index]
+            ma200 = pd.to_numeric(ma200, errors="coerce").astype(float).reindex(df.index).loc[sub.index]
+        else:
+            ma20 = compute_ma_ema(sub[c["close"]], "EMA", 20)
+            ma50 = compute_ma_ema(sub[c["close"]], "EMA", 50)
+            ma200 = compute_ma_ema(sub[c["close"]], "EMA", 200)
+
         with left:
             fig1 = make_subplots(specs=[[{"secondary_y": False}]])
-            if c["close"] in sub.columns:
+            fig1.add_trace(go.Scatter(
+                x=sub["date"], y=sub[c["close"]], name="Close",
+                line=dict(width=2, color=COLOR_PRICE)
+            ))
+            if ma20.notna().any():
                 fig1.add_trace(go.Scatter(
-                    x=sub["date"], y=sub[c["close"]], name="Close",
-                    line=dict(width=2, color=COLOR_PRICE)
-                ))
-            if c["ma20"] in sub.columns and sub[c["ma20"]].notna().any():
-                fig1.add_trace(go.Scatter(
-                    x=sub["date"], y=sub[c["ma20"]], name="MA20",
+                    x=sub["date"], y=ma20.values, name=("EMA20" if avg_mode=="EMA" else "MA20"),
                     line=dict(width=2, color=COLOR_MA20)
                 ))
-            if c["ma50"] in sub.columns and sub[c["ma50"]].notna().any():
+            if ma50.notna().any():
                 fig1.add_trace(go.Scatter(
-                    x=sub["date"], y=sub[c["ma50"]], name="MA50",
+                    x=sub["date"], y=ma50.values, name=("EMA50" if avg_mode=="EMA" else "MA50"),
                     line=dict(width=2, color=COLOR_MA50)
                 ))
-            if c["ma200"] in sub.columns and sub[c["ma200"]].notna().any():
+            if ma200.notna().any():
                 fig1.add_trace(go.Scatter(
-                    x=sub["date"], y=sub[c["ma200"]], name="MA200",
+                    x=sub["date"], y=ma200.values, name=("EMA200" if avg_mode=="EMA" else "MA200"),
                     line=dict(width=2, color=COLOR_MA200)
                 ))
             fig1.update_layout(
@@ -211,23 +226,19 @@ for pfx in (sel or prefixes[:1]):
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
             )
             st.plotly_chart(fig1, use_container_width=True)
-    else:
-        with left:
-            st.info("Geen prijs/MA-data gevonden voor dit instrument in de selectie.")
 
-    # Rechts: Dagelijkse Δ% bars + optioneel YTD-lijn (secundaire as)
+    # Rechts: Δ% bars + YTD% (secundaire as)
     with right:
-        has_delta = c["d_pct"] in df.columns
-        if not has_delta:
+        if c["d_pct"] not in df.columns:
             st.info("Geen dagverandering beschikbaar voor dit instrument.")
         else:
-            s = df[["date", c["d_pct"]]].dropna()
-            s[c["d_pct"]] = pd.to_numeric(s[c["d_pct"]], errors="coerce").astype(float) * 100.0
-            bar_colors = [COLOR_BAR_POS if v >= 0 else COLOR_BAR_NEG for v in s[c["d_pct"]].values]
+            bars = df[["date", c["d_pct"]]].dropna().copy()
+            bars[c["d_pct"]] = pd.to_numeric(bars[c["d_pct"]], errors="coerce").astype(float) * 100.0
+            bar_colors = [COLOR_BAR_POS if v >= 0 else COLOR_BAR_NEG for v in bars[c["d_pct"]].values]
 
             fig2 = make_subplots(specs=[[{"secondary_y": True}]])
             fig2.add_trace(
-                go.Bar(x=s["date"], y=s[c["d_pct"]], name="Δ% per dag",
+                go.Bar(x=bars["date"], y=bars[c["d_pct"]], name="Δ% per dag",
                        marker=dict(color=bar_colors), opacity=0.9),
                 secondary_y=False
             )
@@ -237,15 +248,15 @@ for pfx in (sel or prefixes[:1]):
                 pass
             fig2.update_yaxes(title_text="Δ% dag", secondary_y=False)
 
-            if show_ytd and c["close"] in df.columns:
-                sub_close = df[["date", c["close"]]].dropna().copy()
-                sub_close[c["close"]] = pd.to_numeric(sub_close[c["close"]], errors="coerce").astype(float)
-                ytd = ytd_percent_series(sub_close["date"], sub_close[c["close"]])
+            if c["close"] in df.columns:
+                subc = df[["date", c["close"]]].dropna().copy()
+                subc[c["close"]] = pd.to_numeric(subc[c["close"]], errors="coerce").astype(float)
+                ytd = ytd_percent_series(subc["date"], subc[c["close"]])
                 # align op bar-x
-                ytd = ytd.reindex(pd.to_datetime(s["date"]))
+                ytd = ytd.reindex(pd.to_datetime(bars["date"]))
                 fig2.add_trace(
-                    go.Scatter(x=s["date"], y=ytd.values, name="YTD%",
-                               line=dict(width=2, color="#CC79A7")),
+                    go.Scatter(x=bars["date"], y=ytd.values, name="YTD%",
+                               line=dict(width=2, color=COLOR_YTD)),
                     secondary_y=True
                 )
                 fig2.update_yaxes(title_text="YTD%", secondary_y=True)
@@ -259,6 +270,7 @@ for pfx in (sel or prefixes[:1]):
 st.markdown("---")
 
 # ---- Optionele paarvergelijkingen (dubbele y-as)
+PAIR_CANDIDATES = [("wti", "brent"), ("gold", "silver"), ("gasoline", "heatingoil")]
 if show_pairs:
     st.subheader("Paarvergelijkingen (dubbele y-as)")
     for a1, a2 in PAIR_CANDIDATES:
@@ -293,12 +305,3 @@ if show_pairs:
             title=f"{lbl1} vs {lbl2}"
         )
         st.plotly_chart(fig, use_container_width=True)
-
-# ---- Tabel (laatste 200 rijen binnen selectie)
-st.subheader("Laatste rijen (gefilterd bereik)")
-show_cols = ["date"]
-for pfx in (sel or prefixes[:1]):
-    cc = cols_for(pfx)
-    show_cols += [cc["close"], cc["d_abs"], cc["d_pct"], cc["ma20"], cc["ma50"], cc["ma200"]]
-show_cols = [c for c in show_cols if c in df.columns]
-st.dataframe(df[show_cols].tail(200), use_container_width=True)
