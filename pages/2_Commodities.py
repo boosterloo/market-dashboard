@@ -1,7 +1,6 @@
 # pages/2_Commodities.py
-# Works with wide view: marketdata.commodity_prices_wide_v
-# Expected columns per instrument:
-# <pfx>_close, <pfx>_delta_abs, <pfx>_delta_pct, <pfx>_ma20, <pfx>_ma50, <pfx>_ma200
+# Wide view: marketdata.commodity_prices_wide_v
+# Verwachte kolommen: <pfx>_close, _delta_abs, _delta_pct, _ma20, _ma50, _ma200
 
 import streamlit as st
 import pandas as pd
@@ -81,6 +80,11 @@ LABELS = {
 }
 label_of = lambda p: LABELS.get(p, p.upper())
 
+# Combo-sets (deze staan standaard NIET in de individuele grafieken)
+COMBO_ENERGY = ["wti", "brent", "natgas"]
+COMBO_METALS = ["gold", "silver"]
+COMBO_SET = [p for p in COMBO_ENERGY + COMBO_METALS if p in prefixes]
+
 # ---------- UI filters ----------
 min_d, max_d = df_wide["date"].min(), df_wide["date"].max()
 default_start = max(max_d - timedelta(days=365), min_d)
@@ -95,20 +99,26 @@ with c1:
         format="YYYY-MM-DD",
     )
 with c2:
-    # Default: ALL instruments
+    # Default selectie: ALLES behalve combo-items (kun je in de multiselect alsnog toevoegen)
+    default_sel = [p for p in prefixes if p not in COMBO_SET]
+    if not default_sel:  # fallback als je dataset alleen combo’s bevat
+        default_sel = prefixes[:]
     sel = st.multiselect(
-        "Instrumenten (standaard alle)",
+        "Instrumenten (individuele grafieken)",
         options=[(p, label_of(p)) for p in prefixes],
-        default=[(p, label_of(p)) for p in prefixes],
+        default=[(p, label_of(p)) for p in default_sel],
         format_func=lambda t: t[1],
     )
-    sel = [p for p, _ in sel] or prefixes[:]
+    sel = [p for p, _ in sel] or default_sel
 with c3:
     avg_mode = st.radio("Gemiddelde", ["EMA", "SMA"], index=0, horizontal=True)
 with c4:
     show_pairs = st.checkbox("Combinatiegrafieken (Oil+Gas & Gold+Silver)", value=True)
 
-st.caption("Elk instrument krijgt twee grafieken: links prijs + MA/EMA 20/50/200, rechts Δ% bars + YTD% (secundaire as).")
+st.caption(
+    "Standaard zijn WTI/Brent/NatGas en Gold/Silver **alleen** zichtbaar in de combinatiegrafieken hieronder. "
+    "Wil je ze ook individueel tonen? Selecteer ze in de multiselect."
+)
 
 # ---------- Filtered DF ----------
 mask = (df_wide["date"] >= start) & (df_wide["date"] <= end)
@@ -149,14 +159,13 @@ COLOR_BAR_POS = "#009E73"  # green bars
 COLOR_BAR_NEG = "#D55E00"  # red bars
 COLOR_YTD     = "#CC79A7"  # purple
 
-# extra palette for combos
 COLOR_WTI    = "#111111"
 COLOR_BRENT  = "#0072B2"
 COLOR_GAS    = "#009E73"
 COLOR_GOLD   = "#E69F00"
 COLOR_SILVER = "#56B4E9"
 
-# ---------- KPIs ----------
+# ---------- KPIs (voor geselecteerde individuele instrumenten) ----------
 st.subheader("Kerncijfers")
 kpi_cols = st.columns(min(len(sel), 4) or 1)
 for i, pfx in enumerate(sel or prefixes[:1]):
@@ -170,12 +179,12 @@ for i, pfx in enumerate(sel or prefixes[:1]):
             last = sub.iloc[-1]
             val = float(last[c["close"]])
             d_abs = float(last[c["d_abs"]]) if pd.notnull(last[c["d_abs"]]) else 0.0
-            d_pct = float(last[c["d_pct"]]) if pd.notnull(last[c["d_pct"]]) else 0.0
+            d_pct = float(last[c["d_pct"]]) if pd.notnull[last[c["d_pct"]]] else 0.0
             st.metric(label, value=f"{val:,.2f}", delta=f"{d_abs:+.2f} ({d_pct*100:+.2f}%)")
 
 st.markdown("---")
 
-# ---------- Two charts per instrument ----------
+# ---------- Two charts per selected instrument ----------
 st.subheader("Per instrument")
 for pfx in (sel or prefixes[:1]):
     c = cols_for(pfx)
@@ -189,7 +198,6 @@ for pfx in (sel or prefixes[:1]):
         sub[c["close"]] = _to_float(sub[c["close"]])
 
         if avg_mode == "SMA":
-            # use DB MAs if available, else compute
             ma20 = df[c["ma20"]] if c["ma20"] in df.columns else compute_ma_ema(sub[c["close"]], "SMA", 20)
             ma50 = df[c["ma50"]] if c["ma50"] in df.columns else compute_ma_ema(sub[c["close"]], "SMA", 50)
             ma200 = df[c["ma200"]] if c["ma200"] in df.columns else compute_ma_ema(sub[c["close"]], "SMA", 200)
@@ -243,10 +251,12 @@ for pfx in (sel or prefixes[:1]):
                 pass
             fig2.update_yaxes(title_text="Δ% dag", secondary_y=False)
 
-            if c["close"] in df.columns:
-                subc = df[["date", c["close"]]].dropna().copy()
-                subc[c["close"]] = _to_float(subc[c["close"]])
-                ytd = ytd_percent_series(subc["date"], subc[c["close"]])
+            # YTD% op secundaire as
+            close_col = c["close"]
+            if close_col in df.columns:
+                subc = df[["date", close_col]].dropna().copy()
+                subc[close_col] = _to_float(subc[close_col])
+                ytd = ytd_percent_series(subc["date"], subc[close_col])
                 ytd = ytd.reindex(pd.to_datetime(bars["date"]))
                 fig2.add_trace(go.Scatter(x=bars["date"], y=ytd.values, name="YTD%",
                                           line=dict(width=2, color=COLOR_YTD)),
