@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date, timedelta
+from datetime import timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -46,10 +46,11 @@ for col in ["open","high","low","close","vix_close","ma50","ma200","delta_pct","
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
 # ========= helpers =========
-def ema(s: pd.Series, span: int): return s.ewm(span=span, adjust=False).mean()
+def ema(s: pd.Series, span: int): 
+    return s.ewm(span=span, adjust=False).mean()
 
 def heikin_ashi(src: pd.DataFrame):
-    ha_close = (src["open"] + src["high"] + src["low"] + src["close"]) / 4
+    ha_close = (src["open"] + src["high"] + src["low"] + src["close"]) / 4.0
     ha_open = [src["open"].iloc[0]]
     for i in range(1, len(src)):
         ha_open.append((ha_open[i-1] + ha_close.iloc[i-1]) / 2.0)
@@ -65,7 +66,8 @@ def true_range(d):
         (d["low"] -d["close"].shift()).abs()
     ], axis=1).max(axis=1)
 
-def atr(d, n=10): return true_range(d).rolling(n).mean()
+def atr(d, n=10): 
+    return true_range(d).rolling(n).mean()
 
 def supertrend(d, period=10, mult=3.0):
     hl2 = (d["high"]+d["low"])/2.0
@@ -106,7 +108,6 @@ with left:
         value=(max(default_start, min_d), max_d), format="YYYY-MM-DD"
     )
 with right:
-    use_heikin = st.checkbox("Heikin‑Ashi", value=True)
     show_supertrend = st.checkbox("Supertrend", value=True)
     show_donchian = st.checkbox("Donchian Channel", value=True)
 
@@ -123,9 +124,9 @@ d["dc_high"], d["dc_low"] = dc_high, dc_low
 st_line, st_dir = supertrend(d, period=10, mult=3.0)
 d["supertrend"], d["st_dir"] = st_line, st_dir
 
-if use_heikin:
-    ha = heikin_ashi(d)
-    d = pd.concat([d, ha], axis=1)
+# Heikin‑Ashi data (altijd)
+ha = heikin_ashi(d)
+d = pd.concat([d, ha], axis=1)
 
 # KPI
 last = d.iloc[-1]
@@ -146,33 +147,39 @@ fig = make_subplots(
     vertical_spacing=0.02,
 )
 
-# 1) Price / Ribbon
-if use_heikin:
-    fig.add_trace(go.Candlestick(
-        x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
-        name="AEX (HA)", showlegend=True
-    ), row=1, col=1)
-else:
-    fig.add_trace(go.Candlestick(
-        x=d["date"], open=d["open"], high=d["high"], low=d["low"], close=d["close"],
-        name="AEX", showlegend=True
-    ), row=1, col=1)
+# 1) Heikin‑Ashi + ribbon
+fig.add_trace(go.Candlestick(
+    x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
+    name="AEX (Heikin‑Ashi)", showlegend=True
+), row=1, col=1)
 
 fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"],  mode="lines", name="EMA20"),  row=1, col=1)
 fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"],  mode="lines", name="EMA50"),  row=1, col=1)
 fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"), row=1, col=1)
 
-# Donchian: géén arcering (beter zichtbaar)
+# Donchian — duidelijke lijnen (geen fill)
 if show_donchian:
-    fig.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines",
-                             line=dict(dash="dot", width=1), name="DC High"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=d["date"], y=d["dc_low"],  mode="lines",
-                             line=dict(dash="dot", width=1), name="DC Low"),  row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=d["date"], y=d["dc_high"], mode="lines",
+        line=dict(dash="dot", width=2), name="DC High"
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=d["date"], y=d["dc_low"],  mode="lines",
+        line=dict(dash="dot", width=2), name="DC Low"
+    ), row=1, col=1)
 
-# Supertrend
+# Supertrend — gekleurd (2 traces: up en down)
 if show_supertrend:
-    fig.add_trace(go.Scatter(x=d["date"], y=d["supertrend"], mode="lines", name="Supertrend"),
-                  row=1, col=1)
+    st_up = d["supertrend"].where(d["st_dir"]==1)
+    st_dn = d["supertrend"].where(d["st_dir"]==-1)
+    fig.add_trace(go.Scatter(
+        x=d["date"], y=st_up, mode="lines", line=dict(width=2, color="green"),
+        name="Supertrend (Bullish)"
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=d["date"], y=st_dn, mode="lines", line=dict(width=2, color="red"),
+        name="Supertrend (Bearish)"
+    ), row=1, col=1)
 
 # 2) VIX
 if "vix_close" in d.columns:
@@ -214,7 +221,7 @@ with st.expander("Uitleg & trend-signalen"):
 - **Regime**: Bullish als close > EMA200 én EMA50 > EMA200; Bearish als beide eronder.
 - **EMA‑ribbon (20/50/200)**: kruisingen en positie t.o.v. EMA200 voor trendwissels.
 - **Donchian(20)**: uitbraak boven/onder band markeert start/stop van trends.
-- **Supertrend(10,3)**: dynamische trend-/stoplijn.
+- **Supertrend(10,3)**: dynamische trend-/stoplijn; groen = bullish, rood = bearish.
 - **RSI(14)**: overbought/oversold context binnen de trend.
 - **Histogrammen**: vorm/staarten → volatiliteitsregime.
 """)
