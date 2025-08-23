@@ -1,4 +1,7 @@
 # pages/4_Crypto.py
+# Werkt met wide-view `marketdata.crypto_daily_wide` met kolommen:
+# date, price_<asset>, delta_abs_<asset>, delta_pct_<asset>, ma7_<asset>, ma30_<asset>, ytd_pct_<asset>
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -13,7 +16,7 @@ st.title("🪙 Crypto Dashboard")
 
 # ---- BigQuery check ----
 if not bq_ping():
-    st.error("Geen BigQuery-verbinding (controleer secrets).")
+    st.error("Geen BigQuery-verbinding (controleer secrets/credentials).")
     st.stop()
 
 # ---- Viewnaam ----
@@ -63,13 +66,13 @@ def last_non_null(series: pd.Series):
     idx = series.last_valid_index()
     return series.loc[idx] if idx is not None else np.nan
 
-# ---- Kleuren (Okabe-Ito: kleurenblind-vriendelijk) ----
-COLOR_PRICE = "#111111"
-COLOR_MA7   = "#E69F00"  # oranje
-COLOR_MA30  = "#009E73"  # groen
-COLOR_BAR_POS = "#009E73"  # groen
-COLOR_BAR_NEG = "#D55E00"  # rood (vermillion)
-COLOR_YTD  = "#CC79A7"  # paars
+# ---- Kleuren (Okabe-Ito: kleurenblind-vriendelijk & contrastrijk) ----
+COLOR_PRICE   = "#111111"  # bijna zwart
+COLOR_MA7     = "#E69F00"  # oranje
+COLOR_MA30    = "#009E73"  # groen
+COLOR_BAR_POS = "#009E73"  # groen voor >= 0
+COLOR_BAR_NEG = "#D55E00"  # rood voor < 0
+COLOR_YTD     = "#CC79A7"  # paars
 
 # ---- Cards (laatste dag in selectie) ----
 st.subheader("Overzicht")
@@ -94,7 +97,7 @@ for name in pick:
 
     c_left, c_right = st.columns(2)
 
-    # Links: prijs + MA7/MA30 (lijnen) met hoge contrastkleuren
+    # Links: prijs + MA7/MA30 (lijnen)
     price_c = col(a, "price")
     ma7_c   = col(a, "ma7")
     ma30_c  = col(a, "ma30")
@@ -123,7 +126,7 @@ for name in pick:
         with c_left:
             st.info("Nog geen prijs/MA-data voor deze selectie.")
 
-    # Rechts: Δ% als staven (groen/rood) + YTD% als lijn (paars) op secundaire as
+    # Rechts: Δ% (bars, groen/rood) + YTD% (lijn, paars) op secundaire as
     dcol  = col(a, "delta_pct")
     ytd_c = col(a, "ytd_pct")
     has_delta = dcol in d.columns
@@ -149,7 +152,7 @@ for name in pick:
             if has_ytd:
                 y = d.set_index("date")[ytd_c].astype(float)
                 if has_delta:
-                    y = y.reindex(s.index)
+                    y = y.reindex(s.index)  # dezelfde X-as
                 fig2.add_trace(
                     go.Scatter(x=y.index, y=y.values, name="YTD%",
                                line=dict(width=2, color=COLOR_YTD)),
