@@ -78,7 +78,7 @@ for i, name in enumerate(pick):
         st.metric(label=name, value=f"{p:.2f}" if pd.notna(p) else "—",
                   delta=f"{dp:.2f}%" if pd.notna(dp) else "—")
 
-# ---- Per asset: 2 grafieken over de breedte ----
+# ---- Per asset: twee grafieken naast elkaar ----
 st.subheader("Per asset")
 for name in pick:
     a = name.lower()
@@ -87,38 +87,53 @@ for name in pick:
     c_left, c_right = st.columns(2)
 
     # Links: prijs + MA7/MA30 (lijnen)
-    needed = [col(a, "price"), col(a, "ma7"), col(a, "ma30")]
-    if all(c in d.columns for c in needed):
-        sub = d[["date"] + needed].copy()
+    price_c = col(a, "price")
+    ma7_c   = col(a, "ma7")
+    ma30_c  = col(a, "ma30")
+    if all(c in d.columns for c in [price_c, ma7_c, ma30_c]):
+        sub = d[["date", price_c, ma7_c, ma30_c]].copy()
         with c_left:
             fig1 = make_subplots(specs=[[{"secondary_y": False}]])
-            fig1.add_trace(go.Scatter(x=sub["date"], y=sub[col(a, "price")], name=f"{name} prijs"))
-            fig1.add_trace(go.Scatter(x=sub["date"], y=sub[col(a, "ma7")],   name="MA7"))
-            fig1.add_trace(go.Scatter(x=sub["date"], y=sub[col(a, "ma30")],  name="MA30"))
+            fig1.add_trace(go.Scatter(x=sub["date"], y=sub[price_c], name=f"{name} prijs"))
+            fig1.add_trace(go.Scatter(x=sub["date"], y=sub[ma7_c],   name="MA7"))
+            fig1.add_trace(go.Scatter(x=sub["date"], y=sub[ma30_c],  name="MA30"))
             fig1.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
             st.plotly_chart(fig1, use_container_width=True)
     else:
         with c_left:
             st.info("Nog geen prijs/MA-data voor deze selectie.")
 
-    # Rechts: dagelijkse verandering (%) als staven
-    dcol = col(a, "delta_pct")
-    if dcol in d.columns:
-        s = d.set_index("date")[dcol].astype(float)
-        s = s[~s.index.duplicated(keep="last")]  # voor de zekerheid
+    # Rechts: Δ% als staven + YTD% als lijn (secundaire as)
+    dcol  = col(a, "delta_pct")
+    ytd_c = col(a, "ytd_pct")
+    has_delta = dcol in d.columns
+    has_ytd   = ytd_c in d.columns
+
+    if has_delta or has_ytd:
         with c_right:
-            fig2 = go.Figure()
-            fig2.add_trace(go.Bar(x=s.index, y=s.values, name="Δ% per dag"))
-            # 0-lijn voor referentie
-            try:
-                fig2.add_hline(y=0, line_dash="dot", opacity=0.5)
-            except Exception:
-                pass
+            fig2 = make_subplots(specs=[[{"secondary_y": True}]])
+            if has_delta:
+                s = d.set_index("date")[dcol].astype(float)
+                s = s[~s.index.duplicated(keep="last")]
+                fig2.add_trace(go.Bar(x=s.index, y=s.values, name="Δ% per dag"), secondary_y=False)
+                try:
+                    fig2.add_hline(y=0, line_dash="dot", opacity=0.5)
+                except Exception:
+                    pass
+                fig2.update_yaxes(title_text="Δ% dag", secondary_y=False)
+            if has_ytd:
+                y = d.set_index("date")[ytd_c].astype(float)
+                # reindex op delta-index zodat assen gelijk lopen als beide bestaan
+                if has_delta:
+                    y = y.reindex(s.index)
+                fig2.add_trace(go.Scatter(x=y.index, y=y.values, name="YTD%"), secondary_y=True)
+                fig2.update_yaxes(title_text="YTD%", secondary_y=True)
+
             fig2.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
             st.plotly_chart(fig2, use_container_width=True)
     else:
         with c_right:
-            st.info("Geen dagverandering beschikbaar voor deze selectie.")
+            st.info("Geen Δ%/YTD beschikbaar voor deze selectie.")
 
 # ---- Tabel laatste 30 rijen (eerste asset) ----
 if pick:
