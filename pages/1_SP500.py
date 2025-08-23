@@ -3,421 +3,279 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import date, timedelta
-from plotly.subplots import make_subplots
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-from utils.bq import run_query, get_bq_client, bq_ping
+from utils.bq import run_query, bq_ping
 
-st.set_page_config(page_title="S&P 500", layout="wide")
+st.set_page_config(page_title="📈 S&P 500", layout="wide")
 st.title("📈 S&P 500")
 
-# ---- Verbindingscheck ----
-try:
-    with st.spinner("BigQuery check…"):
-        bq_ping()
-except Exception as e:
-    st.error("Geen BigQuery-verbinding. Controleer Secrets ([gcp_service_account]).")
-    st.caption(f"Details: {e}")
-    st.stop()
-
-# ---- Config uit Secrets (view vastzetten) ----
+# ---------- Config ----------
 SPX_VIEW = st.secrets.get("tables", {}).get(
-    "spx_view",
-    "nth-pier-468314-p7.marketdata.spx_with_vix_v"  # fallback
+    "spx_view", "nth-pier-468314-p7.marketdata.spx_with_vix_v"
 )
 
-# ---- Bepaal dynamisch het maximum bereik ----
+# ---------- Health ----------
 try:
-    df_min = run_query(f"SELECT MIN(DATE(date)) AS d FROM `{SPX_VIEW}`", timeout=10)
-    min_date = pd.to_datetime(df_min["d"].iloc[0]).date()
-    today = date.today()
-    dyn_max_days = max(30, (today - min_date).days)
-    dyn_max_days = min(dyn_max_days, 3650)  # cap ±10 jaar
-except Exception:
-    today = date.today()
-    dyn_max_days = 3650
-
-# ---- Sidebar ----
-with st.sidebar:
-    st.subheader("⚙️ Instellingen")
-    days = st.slider("Periode (dagen terug)", 30, int(dyn_max_days), min(180, int(dyn_max_days)), step=30)
-    end_d = today
-    start_d = end_d - timedelta(days=days)
-
-    fast_mode     = st.checkbox("Snelle modus (alleen Close)", value=True)
-    show_ma       = st.checkbox("Toon MA50/MA200 (op Close)", value=True)
-    show_vix      = st.checkbox("Toon VIX overlay (2e as)", value=True)
-    show_ha_chart = st.checkbox("Toon Heikin Ashi + SuperTrend + Donchian", value=True)
-
-    st.divider()
-    st.markdown("### 📊 Delta histogrammen")
-    show_hist     = st.checkbox("Toon delta-histogrammen (abs & %)", value=True)
-    bins          = st.slider("Aantal bins", 10, 120, 50, 5)
-
-    st.divider()
-    st.markdown("### 📐 Kerncijfers")
-    show_stats    = st.checkbox("Toon kerncijfers onder histogrammen", value=True)
-
-    st.divider()
-    st.markdown("### 📉 Realized Vol vs VIX")
-    show_rv       = st.checkbox("Toon rolling realized vol", value=True)
-    rv_w1         = st.number_input("RV window 1 (dagen)", min_value=5,  value=20, step=1)
-    rv_w2         = st.number_input("RV window 2 (dagen)", min_value=5,  value=60, step=1)
-
-    with st.expander("🔧 Indicator-instellingen (HA/ST/DC)"):
-        st_len  = st.number_input("SuperTrend length", min_value=1, max_value=200, value=10, step=1)
-        st_mult = st.number_input("SuperTrend multiplier", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
-        dc_len  = st.number_input("Donchian Channel length", min_value=1, max_value=400, value=20, step=1)
-        dc_fill = st.checkbox("Vul Donchian-band", value=False)
-        dc_opacity = st.slider("Donchian opacity", 0.0, 0.4, 0.08, 0.01, disabled=not dc_fill)
-
-    st.caption(f"Databron: `{SPX_VIEW}`")
-
-status = st.status("Data laden…", expanded=False)
-
-# ---- Queries via de VIEW ----
-def fetch_close_only():
-    sql = f"""
-    SELECT DATE(date) AS date,
-           CAST(close     AS FLOAT64) AS close,
-           CAST(vix_close AS FLOAT64) AS vix_close
-    FROM `{SPX_VIEW}`
-    WHERE DATE(date) BETWEEN @start AND @end
-    ORDER BY date
-    """
-    return run_query(sql, params={"start": start_d, "end": end_d}, timeout=25)
-
-def fetch_ohlc():
-    sql = f"""
-    SELECT DATE(date) AS date,
-           CAST(open  AS FLOAT64) AS open,
-           CAST(high  AS FLOAT64) AS high,
-           CAST(low   AS FLOAT64) AS low,
-           CAST(close AS FLOAT64) AS close,
-           CAST(volume AS INT64)  AS volume,
-           CAST(vix_close AS FLOAT64) AS vix_close
-    FROM `{SPX_VIEW}`
-    WHERE DATE(date) BETWEEN @start AND @end
-    ORDER BY date
-    """
-    return run_query(sql, params={"start": start_d, "end": end_d}, timeout=25)
-
-# ---- Heikin Ashi helper ----
-def heikin_ashi(ohlc: pd.DataFrame) -> pd.DataFrame:
-    df = ohlc[["date", "open", "high", "low", "close"]].copy().reset_index(drop=True)
-    ha_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
-    ha_open = []
-    for i in range(len(df)):
-        if i == 0:
-            ha_open.append((df.loc[i, "open"] + df.loc[i, "close"]) / 2.0)
-        else:
-            ha_open.append((ha_open[-1] + ha_close.iloc[i - 1]) / 2.0)
-    ha_open = pd.Series(ha_open, index=df.index, name="ha_open")
-    ha_high = pd.concat([df["high"], ha_open, ha_close], axis=1).max(axis=1).rename("ha_high")
-    ha_low  = pd.concat([df["low"],  ha_open, ha_close], axis=1).min(axis=1).rename("ha_low")
-    out = pd.DataFrame({
-        "date": df["date"],
-        "ha_open": ha_open,
-        "ha_high": ha_high,
-        "ha_low":  ha_low,
-        "ha_close": ha_close,
-    })
-    return out
-
-# ---- ATR (RMA) + SuperTrend op HA ----
-def atr_rma(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low).abs(),
-        (high - prev_close).abs(),
-        (low  - prev_close).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/length, adjust=False).mean()
-    return atr
-
-def supertrend_on_ha(ha: pd.DataFrame, length: int = 10, multiplier: float = 1.0) -> pd.DataFrame:
-    high, low, close = ha["ha_high"], ha["ha_low"], ha["ha_close"]
-    atr = atr_rma(high, low, close, length)
-    hl2 = (high + low) / 2.0
-
-    upper_basic = hl2 + multiplier * atr
-    lower_basic = hl2 - multiplier * atr
-
-    final_upper = np.zeros(len(ha))
-    final_lower = np.zeros(len(ha))
-    trend = np.ones(len(ha))  # +1 up, -1 down
-    final_upper[:] = np.nan
-    final_lower[:] = np.nan
-
-    for i in range(len(ha)):
-        if i == 0:
-            final_upper[i] = upper_basic.iloc[i]
-            final_lower[i] = lower_basic.iloc[i]
-            trend[i] = 1
-            continue
-
-        if (upper_basic.iloc[i] < final_upper[i-1]) or (close.iloc[i-1] > final_upper[i-1]):
-            final_upper[i] = upper_basic.iloc[i]
-        else:
-            final_upper[i] = final_upper[i-1]
-
-        if (lower_basic.iloc[i] > final_lower[i-1]) or (close.iloc[i-1] < final_lower[i-1]):
-            final_lower[i] = lower_basic.iloc[i]
-        else:
-            final_lower[i] = final_lower[i-1]
-
-        if close.iloc[i] > final_upper[i-1]:
-            trend[i] = 1
-        elif close.iloc[i] < final_lower[i-1]:
-            trend[i] = -1
-        else:
-            trend[i] = trend[i-1]
-
-    st_line = pd.Series(np.where(trend == 1, final_lower, final_upper), index=ha.index, name="st_line")
-    trend_s = pd.Series(trend, index=ha.index, name="trend")
-    return pd.DataFrame({"date": ha["date"], "st_line": st_line, "trend": trend_s})
-
-# ---- Donchian op HA ----
-def donchian_on_ha(ha: pd.DataFrame, length: int = 20) -> pd.DataFrame:
-    upper = ha["ha_high"].rolling(length).max().rename("dc_upper")
-    lower = ha["ha_low"].rolling(length).min().rename("dc_lower")
-    mid = ((upper + lower) / 2.0).rename("dc_mid")
-    return pd.concat([ha["date"], upper, lower, mid], axis=1)
-
-# ---- Laden met fallback ----
-try:
-    df = fetch_close_only() if fast_mode else fetch_ohlc()
-    if df.empty:
-        raise RuntimeError("Lege dataset voor de gekozen periode/view.")
-    status.update(label="✅ Data geladen", state="complete", expanded=False)
+    if not bq_ping():
+        st.error("Geen BigQuery-verbinding."); st.stop()
 except Exception as e:
-    status.update(label="⚠️ Trage/mislukte query — fallback naar 90 dagen close-only", state="error", expanded=True)
-    st.caption(f"Details: {e}")
+    st.error("Geen BigQuery-verbinding."); st.caption(f"Details: {e}"); st.stop()
+
+# ---------- Data ----------
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_spx():
+    return run_query(f"SELECT * FROM `{SPX_VIEW}` ORDER BY date")
+
+with st.spinner("SPX data laden…"):
+    df = load_spx()
+if df.empty:
+    st.warning("Geen data in view."); st.stop()
+
+df["date"] = pd.to_datetime(df["date"]).dt.date
+for col in ["open","high","low","close","vix_close","ma50","ma200","delta_pct","delta_abs"]:
+    if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# ---------- Helpers ----------
+def ema(s: pd.Series, span: int): return s.ewm(span=span, adjust=False).mean()
+
+def heikin_ashi(src: pd.DataFrame):
+    ha_close = (src["open"] + src["high"] + src["low"] + src["close"]) / 4.0
+    ha_open = [src["open"].iloc[0]]
+    for i in range(1, len(src)):
+        ha_open.append((ha_open[i-1] + ha_close.iloc[i-1]) / 2.0)
+    ha_open = pd.Series(ha_open, index=src.index)
+    ha_high = pd.concat([src["high"], ha_open, ha_close], axis=1).max(axis=1)
+    ha_low  = pd.concat([src["low"],  ha_open, ha_close], axis=1).min(axis=1)
+    return pd.DataFrame({"ha_open":ha_open,"ha_high":ha_high,"ha_low":ha_low,"ha_close":ha_close}, index=src.index)
+
+def true_range(d):
+    return pd.concat([d["high"]-d["low"],
+                      (d["high"]-d["close"].shift()).abs(),
+                      (d["low"] -d["close"].shift()).abs()], axis=1).max(axis=1)
+
+def atr(d, n=10): return true_range(d).rolling(n).mean()
+
+def supertrend(d, period=10, mult=3.0):
+    hl2 = (d["high"]+d["low"])/2.0
+    _atr = atr(d, period)
+    upper = hl2 + mult*_atr
+    lower = hl2 - mult*_atr
+    st_line = pd.Series(index=d.index, dtype=float)
+    st_dir  = pd.Series(index=d.index, dtype=int)
+    st_line.iloc[0] = upper.iloc[0]; st_dir.iloc[0] = 1
+    for i in range(1, len(d)):
+        up, lo = upper.iloc[i], lower.iloc[i]
+        prev = st_line.iloc[i-1]; prev_dir = st_dir.iloc[i-1]
+        close = d["close"].iloc[i]
+        if prev_dir==1: up = min(up, prev)
+        else:           lo = max(lo, prev)
+        if close>up:    st_dir.iloc[i]=1;  st_line.iloc[i]=lo
+        elif close<lo:  st_dir.iloc[i]=-1; st_line.iloc[i]=up
+        else:           st_dir.iloc[i]=prev_dir; st_line.iloc[i]=lo if prev_dir==1 else up
+    return st_line, st_dir
+
+def donchian(d, n=20): return d["high"].rolling(n).max(), d["low"].rolling(n).min()
+
+def rsi(s, n=14):
+    delta = s.diff()
+    up = pd.Series(np.where(delta>0, delta, 0.0), index=s.index).rolling(n).mean()
+    dn = pd.Series(np.where(delta<0, -delta,0.0), index=s.index).rolling(n).mean()
+    rs = up/dn
+    return 100 - (100/(1+rs))
+
+def cci(df_, n=20):
+    tp = (df_["high"]+df_["low"]+df_["close"])/3
+    sma = tp.rolling(n).mean()
+    mad = (tp - sma).abs().rolling(n).mean()
+    return (tp - sma) / (0.015*mad)
+
+# YTD / PYTD over VOLLEDIGE dataset
+def ytd_return_full(full_df: pd.DataFrame):
+    max_d = full_df["date"].max()
+    start = date(max_d.year, 1, 1)
+    sub = full_df[full_df["date"] >= start]
+    if len(sub) >= 2: return (sub["close"].iloc[-1]/sub["close"].iloc[0]-1)*100
+    return None
+
+def pytd_return_full(full_df: pd.DataFrame):
+    max_d = full_df["date"].max()
+    prev_year = max_d.year - 1
+    start = date(prev_year, 1, 1)
     try:
-        fallback_days = 90
-        df = run_query(
-            f"""
-            SELECT DATE(date) AS date,
-                   CAST(close     AS FLOAT64) AS close,
-                   CAST(vix_close AS FLOAT64) AS vix_close
-            FROM `{SPX_VIEW}`
-            WHERE DATE(date) BETWEEN @start AND @end
-            ORDER BY date
-            """,
-            params={"start": end_d - timedelta(days=fallback_days), "end": end_d},
-            timeout=20
-        )
-        if df.empty:
-            st.error("Nog steeds geen data. Controleer de view-naam en inhoud in BigQuery.")
-            st.stop()
-        fast_mode = True
-    except Exception as e2:
-        st.error(f"Fallback faalde ook: {e2}")
-        st.stop()
+        end = max_d.replace(year=prev_year)
+    except ValueError:
+        end = date(prev_year, 12, 31)
+    sub = full_df[(full_df["date"] >= start) & (full_df["date"] <= end)]
+    if len(sub) >= 2: return (sub["close"].iloc[-1]/sub["close"].iloc[0]-1)*100
+    return None
 
-df = df.sort_values("date").reset_index(drop=True)
+# ---------- UI ----------
+min_d, max_d = df["date"].min(), df["date"].max()
+default_start = max(max_d - timedelta(days=365), min_d)
+start_date, end_date = st.slider(
+    "Periode", min_value=min_d, max_value=max_d,
+    value=(default_start, max_d), format="YYYY-MM-DD"
+)
 
-# ---- MA's op close ----
-if show_ma and "close" in df.columns:
-    df["ma50"]  = df["close"].rolling(50).mean()
-    df["ma200"] = df["close"].rolling(200).mean()
+top1, top2, top3, top4 = st.columns(4)
+with top1:
+    show_supertrend = st.checkbox("Supertrend", value=True)
+with top2:
+    show_donchian  = st.checkbox("Donchian Channel", value=True)
+with top3:
+    show_rsi       = st.checkbox("Toon RSI", value=True)
+with top4:
+    show_cci       = st.checkbox("Toon CCI", value=False)
 
-# ---- Daily delta (abs & %) ----
-if "delta_abs" in df.columns:
-    df["delta_abs"] = pd.to_numeric(df["delta_abs"], errors="coerce")
-else:
-    df["delta_abs"] = df["close"].diff()
+show_vix = st.checkbox("Toon VIX‑paneel", value=False)
 
-if "delta_pct" in df.columns:
-    cand = pd.to_numeric(df["delta_pct"], errors="coerce")
-    df["delta_pct"] = cand * 100.0 if cand.dropna().abs().mean() < 1 else cand
-else:
-    df["delta_pct"] = df["close"].pct_change() * 100.0
+# gefilterde data voor grafiek
+mask = (df["date"] >= start_date) & (df["date"] <= end_date)
+d = df.loc[mask].reset_index(drop=True).copy()
 
-# ---- Hoofdgrafiek (VIX op 2e as) ----
-fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
-if fast_mode:
-    fig.add_trace(go.Scatter(x=df["date"], y=df["close"], mode="lines", name="SPX Close"),
-                  row=1, col=1, secondary_y=False)
-else:
-    fig.add_trace(go.Candlestick(
-        x=df["date"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="SPX OHLC"
-    ), row=1, col=1, secondary_y=False)
+# ---------- Indicators ----------
+d["ema20"], d["ema50"], d["ema200"] = ema(d["close"],20), ema(d["close"],50), ema(d["close"],200)
+d["rsi14"] = rsi(d["close"],14)
+d["cci20"] = cci(d,20)
+dc_high, dc_low = donchian(d,20)
+d["dc_high"], d["dc_low"] = dc_high, dc_low
+st_line, st_dir = supertrend(d,10,3.0)
+d["supertrend"], d["st_dir"] = st_line, st_dir
+ha = heikin_ashi(d)
+d = pd.concat([d, ha], axis=1)
 
-if show_ma and fast_mode:
-    if df["ma50"].notna().any():
-        fig.add_trace(go.Scatter(x=df["date"], y=df["ma50"], mode="lines", name="MA50"),
-                      row=1, col=1, secondary_y=False)
-    if df["ma200"].notna().any():
-        fig.add_trace(go.Scatter(x=df["date"], y=df["ma200"], mode="lines", name="MA200"),
-                      row=1, col=1, secondary_y=False)
+# ---------- KPI's ----------
+last = d.iloc[-1]
+regime = ("Bullish" if (last["close"]>last["ema200"]) and (last["ema50"]>last["ema200"])
+          else "Bearish" if (last["close"]<last["ema200"]) and (last["ema50"]<last["ema200"])
+          else "Neutraal")
+ytd_full  = ytd_return_full(df)
+pytd_full = pytd_return_full(df)
 
-if show_vix and "vix_close" in df.columns and df["vix_close"].notna().any():
-    fig.add_trace(go.Scatter(x=df["date"], y=df["vix_close"], mode="lines", name="VIX"),
-                  row=1, col=1, secondary_y=True)
+k1,k2,k3,k4,k5,k6 = st.columns(6)
+k1.metric("Laatste close", f"{last['close']:.2f}")
+k2.metric("Δ % (dag)", f"{(last['close']/d['close'].shift(1).iloc[-1]-1)*100:.2f}%" if len(d)>1 else "—")
+k3.metric("VIX (close)", f"{last['vix_close']:.2f}" if pd.notnull(last.get("vix_close")) else "—")
+k4.metric("Regime", regime)
+k5.metric("YTD Return",  f"{ytd_full:.2f}%"  if ytd_full  is not None else "—")
+k6.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—")
 
-fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=520, legend_orientation="h")
-fig.update_yaxes(title_text="SPX", secondary_y=False)
-if show_vix:
-    fig.update_yaxes(title_text="VIX", secondary_y=True)
-fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)
+# ---------- Chart (HA + EMA, geen rangeslider) ----------
+rows = 3 if show_vix else 2
+row_heights = [0.62, 0.38] if rows==2 else [0.54, 0.23, 0.23]
+fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
+                    row_heights=row_heights, vertical_spacing=0.02)
+
+fig.add_trace(go.Candlestick(
+    x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
+    name="SPX (Heikin‑Ashi)"
+), row=1, col=1)
+
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"],  mode="lines", name="EMA20"),  row=1,col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"],  mode="lines", name="EMA50"),  row=1,col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"), row=1,col=1)
+
+if show_donchian:
+    fig.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines",
+                             line=dict(dash="dot", width=2), name="DC High"), row=1,col=1)
+    fig.add_trace(go.Scatter(x=d["date"], y=d["dc_low"], mode="lines",
+                             line=dict(dash="dot", width=2), name="DC Low"),  row=1,col=1)
+
+if show_supertrend:
+    st_up = d["supertrend"].where(d["st_dir"]==1)
+    st_dn = d["supertrend"].where(d["st_dir"]==-1)
+    fig.add_trace(go.Scatter(x=d["date"], y=st_up, mode="lines",
+                             line=dict(width=2, color="green"),
+                             name="Supertrend (Bullish)"), row=1,col=1)
+    fig.add_trace(go.Scatter(x=d["date"], y=st_dn, mode="lines",
+                             line=dict(width=2, color="red"),
+                             name="Supertrend (Bearish)"), row=1,col=1)
+
+next_row = 2
+if show_vix and "vix_close" in d.columns:
+    fig.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX"),
+                  row=2, col=1)
+    next_row = 3
+
+if show_rsi:
+    fig.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)"),
+                  row=next_row, col=1)
+    fig.add_hline(y=70, line_dash="dot", row=next_row, col=1)
+    fig.add_hline(y=30, line_dash="dot", row=next_row, col=1)
+if show_cci:
+    fig.add_trace(go.Scatter(x=d["date"], y=d["cci20"], mode="lines", name="CCI(20)"),
+                  row=next_row, col=1)
+    fig.add_hline(y=100, line_dash="dot", row=next_row, col=1)
+    fig.add_hline(y=-100, line_dash="dot", row=next_row, col=1)
+
+fig.update_layout(xaxis_rangeslider_visible=False)  # verwijdert de “2e mini-grafiek”
+fig.update_xaxes(rangeslider_visible=False)
+fig.update_layout(height=860, margin=dict(l=20, r=20, t=30, b=20))
 st.plotly_chart(fig, use_container_width=True)
 
-# ---- Heikin Ashi + SuperTrend + Donchian ----
-if show_ha_chart:
-    st.subheader("🕯️ Heikin Ashi + SuperTrend + Donchian")
+# ---------- Histogrammen ----------
+st.subheader("Histogram dagrendementen")
+bins = st.slider("Aantal bins", 10, 120, 60, 5)
+c1, c2 = st.columns(2)
+hist_df = d.dropna(subset=["delta_abs","delta_pct"]).copy()
+with c1:
+    fig_abs = go.Figure()
+    fig_abs.add_trace(go.Histogram(x=hist_df["delta_abs"], nbinsx=int(bins), name="Δ abs"))
+    fig_abs.update_layout(height=300, bargap=0.02, margin=dict(l=10,r=10,t=10,b=10))
+    st.plotly_chart(fig_abs, use_container_width=True)
+with c2:
+    fig_pct = go.Figure()
+    fig_pct.add_trace(go.Histogram(x=hist_df["delta_pct"]*100.0, nbinsx=int(bins), name="Δ %"))
+    fig_pct.update_layout(height=300, bargap=0.02, margin=dict(l=10,r=10,t=10,b=10))
+    st.plotly_chart(fig_pct, use_container_width=True)
 
-    df_ohlc = fetch_ohlc() if fast_mode else df
-    needed = {"open", "high", "low", "close"}
-    if df_ohlc.empty or not needed.issubset(df_ohlc.columns):
-        st.info("Geen OHLC-data beschikbaar om Heikin Ashi te berekenen.")
-    else:
-        ha = heikin_ashi(df_ohlc).dropna().reset_index(drop=True)
-        st_df = supertrend_on_ha(ha, length=int(st_len), multiplier=float(st_mult))
-        dc = donchian_on_ha(ha, length=int(dc_len))
+# ---------- Kerncijfers ----------
+show_stats = st.checkbox("Toon kerncijfers (daily deltas)", value=True)
+if show_stats:
+    da = pd.to_numeric(d["delta_abs"], errors="coerce").dropna()
+    dp = pd.to_numeric(d["delta_pct"], errors="coerce").dropna()
+    def extrema(s: pd.Series):
+        if s.empty: return np.nan, pd.NaT, np.nan, pd.NaT
+        i_max, i_min = int(s.idxmax()), int(s.idxmin())
+        return s.max(), d.loc[i_max,"date"], s.min(), d.loc[i_min,"date"]
+    max_up_abs, max_up_abs_d, max_dn_abs, max_dn_abs_d = extrema(da)
+    max_up_pct, max_up_pct_d, max_dn_pct, max_dn_pct_d = extrema(dp)
 
-        ha_fig = make_subplots(rows=1, cols=1)
+    stats_df = pd.DataFrame({
+        "Metric": ["Mean","Median","Stdev","Skew","Excess Kurtosis",
+                   "Max Up (abs)","Max Down (abs)","Max Up (%)","Max Down (%)"],
+        "Value": [da.mean(), da.median(), da.std(), da.skew(), da.kurt(),
+                  max_up_abs, max_dn_abs, max_up_pct, max_dn_pct],
+        "Date":  ["","","","","", max_up_abs_d, max_dn_abs_d, max_up_pct_d, max_dn_pct_d]
+    })
+    def fmt(v):
+        if pd.isna(v): return ""
+        if isinstance(v,(float,np.floating)): return f"{v:,.4f}"
+        return str(v)
+    stats_df["Value"] = stats_df["Value"].apply(fmt)
+    stats_df["Date"]  = stats_df["Date"].apply(lambda x: "" if pd.isna(x) else str(x))
+    st.dataframe(stats_df, hide_index=True, use_container_width=True)
 
-        ha_fig.add_trace(go.Candlestick(
-            x=ha["date"], open=ha["ha_open"], high=ha["ha_high"], low=ha["ha_low"], close=ha["ha_close"],
-            name="Heikin Ashi"
-        ))
+# ---------- Rolling Realized Vol vs VIX ----------
+show_rv = st.checkbox("Toon Rolling Realized Vol vs VIX", value=True)
+rv_c1, rv_c2 = st.columns(2)
+with rv_c1:
+    rv_w1 = st.number_input("RV window 1 (dagen)", min_value=5, value=20, step=1)
+with rv_c2:
+    rv_w2 = st.number_input("RV window 2 (dagen)", min_value=5, value=60, step=1)
 
-        ha_fig.add_trace(go.Scatter(x=dc["date"], y=dc["dc_upper"], mode="lines", name="DC Upper", line=dict(width=1)))
-        ha_fig.add_trace(go.Scatter(x=dc["date"], y=dc["dc_lower"], mode="lines", name="DC Lower", line=dict(width=1)))
-        if dc_fill:
-            ha_fig.add_trace(go.Scatter(
-                x=dc["date"], y=dc["dc_upper"], mode="lines", showlegend=False, line=dict(width=0)
-            ))
-            ha_fig.add_trace(go.Scatter(
-                x=dc["date"], y=dc["dc_lower"], mode="lines", showlegend=False,
-                fill="tonexty", fillcolor=f"rgba(150,150,220,{dc_opacity})", line=dict(width=0)
-            ))
-
-        st_up = st_df.where(st_df["trend"] == 1)["st_line"]
-        st_dn = st_df.where(st_df["trend"] == -1)["st_line"]
-        if st_up.notna().any():
-            ha_fig.add_trace(go.Scatter(x=st_df["date"], y=st_up, mode="lines", name="SuperTrend Up",
-                                        line=dict(width=2, color="green")))
-        if st_dn.notna().any():
-            ha_fig.add_trace(go.Scatter(x=st_df["date"], y=st_dn, mode="lines", name="SuperTrend Down",
-                                        line=dict(width=2, color="red")))
-
-        ha_fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), height=460, legend_orientation="h")
-        ha_fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)
-        st.plotly_chart(ha_fig, use_container_width=True)
-
-# ---- Delta histogrammen (abs & %) ----
-if show_hist:
-    st.subheader("📊 Daily Delta Histogrammen")
-
-    c1, c2 = st.columns(2)
-
-    # Histogram Δ abs (punten)
-    with c1:
-        hist_abs = go.Figure()
-        x_abs = df["delta_abs"].dropna()
-        hist_abs.add_trace(go.Histogram(x=x_abs, nbinsx=int(bins), name="Δ abs (punten)"))
-        hist_abs.add_shape(type="line", x0=0, x1=0, y0=0, y1=1, xref="x", yref="paper")
-        hist_abs.update_layout(
-            margin=dict(l=10, r=10, t=30, b=10),
-            height=340,
-            showlegend=False,
-            xaxis_title="Δ (punten)",
-            yaxis_title="Frequentie"
-        )
-        st.plotly_chart(hist_abs, use_container_width=True)
-
-    # Histogram Δ % (in procenten)
-    with c2:
-        hist_pct = go.Figure()
-        x_pct = df["delta_pct"].dropna()
-        hist_pct.add_trace(go.Histogram(x=x_pct, nbinsx=int(bins), name="Δ % (pct-points)"))
-        hist_pct.add_shape(type="line", x0=0, x1=0, y0=0, y1=1, xref="x", yref="paper")
-        hist_pct.update_layout(
-            margin=dict(l=10, r=10, t=30, b=10),
-            height=340,
-            showlegend=False,
-            xaxis_title="Δ (%)",
-            yaxis_title="Frequentie"
-        )
-        hist_pct.update_xaxes(tickformat=".2f")
-        st.plotly_chart(hist_pct, use_container_width=True)
-
-    # ---- Kerncijfers onder histogrammen ----
-    if show_stats:
-        st.markdown("#### 📐 Kerncijfers (daily changes)")
-        # Veilig casten
-        da = pd.to_numeric(df["delta_abs"], errors="coerce").dropna()
-        dp = pd.to_numeric(df["delta_pct"], errors="coerce").dropna()
-
-        def extrema_series(s: pd.Series):
-            if s.empty:
-                return np.nan, pd.NaT, np.nan, pd.NaT
-            i_max = int(s.idxmax())
-            i_min = int(s.idxmin())
-            return s.max(), df.loc[i_max, "date"], s.min(), df.loc[i_min, "date"]
-
-        max_up_abs, max_up_abs_d, max_dn_abs, max_dn_abs_d = extrema_series(da)
-        max_up_pct, max_up_pct_d, max_dn_pct, max_dn_pct_d = extrema_series(dp)
-
-        stats_df = pd.DataFrame({
-            "Metric": [
-                "Mean", "Median", "Stdev", "Skewness", "Excess Kurtosis",
-                "Max Up (abs)", "Max Down (abs)",
-                "Max Up (%)", "Max Down (%)"
-            ],
-            "Value": [
-                da.mean(), da.median(), da.std(), da.skew(), da.kurt(),
-                max_up_abs, max_dn_abs,
-                max_up_pct, max_dn_pct
-            ],
-            "Date": [
-                "", "", "", "", "",
-                max_up_abs_d, max_dn_abs_d,
-                max_up_pct_d, max_dn_pct_d
-            ]
-        })
-        # Nettere weergave
-        def fmt_val(v):
-            if pd.isna(v):
-                return ""
-            if isinstance(v, (np.float32, np.float64, float)):
-                return f"{v:,.4f}"
-            return str(v)
-
-        stats_df["Value"] = stats_df["Value"].apply(fmt_val)
-        stats_df["Date"]  = stats_df["Date"].apply(lambda d: "" if pd.isna(d) else str(d))
-        st.dataframe(stats_df, hide_index=True, use_container_width=True)
-
-# ---- Rolling realized volatility vs VIX ----
 if show_rv:
-    st.subheader("📉 Rolling Realized Volatility vs VIX (annualized, %)")
-
-    # returns in decimal
-    r = pd.to_numeric(df["delta_pct"], errors="coerce") / 100.0
-    rv1 = r.rolling(int(rv_w1)).std() * np.sqrt(252) * 100.0
-    rv2 = r.rolling(int(rv_w2)).std() * np.sqrt(252) * 100.0
+    r = pd.to_numeric(d["delta_pct"], errors="coerce")/100.0
+    rv1 = r.rolling(int(rv_w1)).std()*np.sqrt(252)*100.0
+    rv2 = r.rolling(int(rv_w2)).std()*np.sqrt(252)*100.0
 
     rv_fig = go.Figure()
-    rv_fig.add_trace(go.Scatter(x=df["date"], y=rv1, mode="lines", name=f"RV {int(rv_w1)}d"))
-    rv_fig.add_trace(go.Scatter(x=df["date"], y=rv2, mode="lines", name=f"RV {int(rv_w2)}d"))
-
-    if "vix_close" in df.columns and df["vix_close"].notna().any():
-        rv_fig.add_trace(go.Scatter(x=df["date"], y=df["vix_close"], mode="lines", name="VIX (close)"))
-
-    rv_fig.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10),
-        height=420,
-        legend_orientation="h",
-        yaxis_title="%",
-    )
-    rv_fig.update_xaxes(showspikes=True, spikemode="across", rangeslider_visible=False)
+    rv_fig.add_trace(go.Scatter(x=d["date"], y=rv1, mode="lines", name=f"RV {int(rv_w1)}d"))
+    rv_fig.add_trace(go.Scatter(x=d["date"], y=rv2, mode="lines", name=f"RV {int(rv_w2)}d"))
+    if "vix_close" in d.columns and d["vix_close"].notna().any():
+        rv_fig.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX (close)"))
+    rv_fig.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend_orientation="h", yaxis_title="%")
+    rv_fig.update_xaxes(rangeslider_visible=False)
     st.plotly_chart(rv_fig, use_container_width=True)
-
-# ---- Footer info ----
-st.caption(
-    f"Periode: {start_d} → {end_d} • Rijen: {len(df):,} • Modus: {'Close-only' if fast_mode else 'OHLC'} • "
-    f"VIX overlay: {'aan' if show_vix else 'uit'} • ST({int(st_len)},{float(st_mult)}) DC({int(dc_len)}) • "
-    f"RV windows: {int(rv_w1)}/{int(rv_w2)}"
-)
