@@ -60,7 +60,6 @@ def true_range(d):
 def atr(d, n=10): return true_range(d).rolling(n).mean()
 
 def supertrend(d, period=10, mult=3.0):
-    """Klassieke supertrend; we kleuren met 2 traces (up groen, down rood)."""
     hl2 = (d["high"]+d["low"])/2.0
     _atr = atr(d, period)
     upper = hl2 + mult*_atr
@@ -123,7 +122,6 @@ start_date, end_date = st.slider(
     value=(default_start, max_d), format="YYYY-MM-DD"
 )
 
-# gefilterd voor grafieken
 mask = (df["date"] >= start_date) & (df["date"] <= end_date)
 d = df.loc[mask].reset_index(drop=True).copy()
 
@@ -138,7 +136,7 @@ d["supertrend"], d["st_dir"] = st_line, st_dir
 ha = heikin_ashi(d)
 d = pd.concat([d, ha], axis=1)
 
-# ---------- KPI's (YTD/PYTD los van slider) ----------
+# ---------- KPI's ----------
 last = d.iloc[-1]
 regime = ("Bullish" if (last["close"]>last["ema200"]) and (last["ema50"]>last["ema200"])
           else "Bearish" if (last["close"]<last["ema200"]) and (last["ema50"]<last["ema200"])
@@ -154,71 +152,59 @@ k4.metric("Regime", regime)
 k5.metric("YTD Return",  f"{ytd_full:.2f}%"  if ytd_full  is not None else "—")
 k6.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—")
 
-# ---------- Multi-panel chart (met titels) ----------
+# ---------- Multi-panel chart ----------
 fig = make_subplots(
     rows=5, cols=1, shared_xaxes=True,
     subplot_titles=[
-        "SP500 Heikin‑Ashi + Supertrend + Donchian",
+        "SP500 Heikin-Ashi + Supertrend + Donchian",
         "Close + EMA(20/50/200)",
         "VIX (Close)",
         "RSI(14)",
         "CCI(20)"
     ],
-    row_heights=[0.42, 0.20, 0.13, 0.12, 0.13],
+    row_heights=[0.40, 0.20, 0.15, 0.12, 0.13],
     vertical_spacing=0.06
 )
 
-# (1) HA + Donchian + Supertrend (groen/rood)
+# (1) HA + Donchian + Supertrend
 fig.add_trace(go.Candlestick(
     x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
-    name="SPX (Heikin‑Ashi)", showlegend=True
+    name="SPX (Heikin-Ashi)"
 ), row=1, col=1)
-
-fig.add_trace(go.Scatter(
-    x=d["date"], y=d["dc_high"], mode="lines",
-    line=dict(dash="dot", width=2), name="DC High", showlegend=True
-), row=1, col=1)
-fig.add_trace(go.Scatter(
-    x=d["date"], y=d["dc_low"], mode="lines",
-    line=dict(dash="dot", width=2), name="DC Low", showlegend=True
-), row=1, col=1)
-
+fig.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines",
+                         line=dict(dash="dot", width=2), name="DC High"), row=1, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["dc_low"], mode="lines",
+                         line=dict(dash="dot", width=2), name="DC Low"), row=1, col=1)
 st_up = d["supertrend"].where(d["st_dir"]==1)
 st_dn = d["supertrend"].where(d["st_dir"]==-1)
-fig.add_trace(go.Scatter(
-    x=d["date"], y=st_up, mode="lines",
-    line=dict(width=2, color="green"),
-    name="Supertrend ↑ (bullish)", showlegend=True
-), row=1, col=1)
-fig.add_trace(go.Scatter(
-    x=d["date"], y=st_dn, mode="lines",
-    line=dict(width=2, color="red"),
-    name="Supertrend ↓ (bearish)", showlegend=True
-), row=1, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=st_up, mode="lines",
+                         line=dict(width=2, color="green"), name="Supertrend ↑"), row=1, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=st_dn, mode="lines",
+                         line=dict(width=2, color="red"), name="Supertrend ↓"), row=1, col=1)
 
 # (2) Close + EMA’s
-fig.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close", showlegend=True), row=2, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"],  mode="lines", name="EMA20", showlegend=True),  row=2, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"],  mode="lines", name="EMA50", showlegend=True),  row=2, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200", showlegend=True), row=2, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close"), row=2, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], mode="lines", name="EMA20"), row=2, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], mode="lines", name="EMA50"), row=2, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"), row=2, col=1)
 
 # (3) VIX
 if "vix_close" in d.columns and d["vix_close"].notna().any():
-    fig.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX", showlegend=True), row=3, col=1)
+    fig.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX"), row=3, col=1)
 
 # (4) RSI
-fig.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)", showlegend=True), row=4, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)"), row=4, col=1)
 fig.add_hline(y=70, line_dash="dot", row=4, col=1)
 fig.add_hline(y=30, line_dash="dot", row=4, col=1)
 
 # (5) CCI
-fig.add_trace(go.Scatter(x=d["date"], y=d["cci20"], mode="lines", name="CCI(20)", showlegend=True), row=5, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["cci20"], mode="lines", name="CCI(20)"), row=5, col=1)
 fig.add_hline(y=100, line_dash="dot", row=5, col=1)
 fig.add_hline(y=-100, line_dash="dot", row=5, col=1)
 
-# opmaak
+# Layout
 fig.update_layout(
-    height=1050, margin=dict(l=20, r=20, t=60, b=20),
+    height=1400, margin=dict(l=20, r=20, t=60, b=20),
     legend_orientation="h", legend_yanchor="top", legend_y=1.08, legend_x=0
 )
 fig.update_layout(xaxis_rangeslider_visible=False)
