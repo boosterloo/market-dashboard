@@ -1,4 +1,3 @@
-# pages/1_SP500.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -59,7 +58,8 @@ def true_range(d):
 
 def atr(d, n=10): return true_range(d).rolling(n).mean()
 
-def supertrend(d, period=10, mult=3.0):
+def supertrend(d, period=10, mult=1.0):
+    """Klassieke supertrend; we retourneren lijn + richting (+1/-1)."""
     hl2 = (d["high"]+d["low"])/2.0
     _atr = atr(d, period)
     upper = hl2 + mult*_atr
@@ -122,8 +122,15 @@ start_date, end_date = st.slider(
     value=(default_start, max_d), format="YYYY-MM-DD"
 )
 
+# gefilterd voor grafieken
 mask = (df["date"] >= start_date) & (df["date"] <= end_date)
 d = df.loc[mask].reset_index(drop=True).copy()
+
+# Fallbacks voor delta's
+if "delta_abs" not in d.columns or d["delta_abs"].isna().all():
+    d["delta_abs"] = d["close"].diff()
+if "delta_pct" not in d.columns or d["delta_pct"].isna().all():
+    d["delta_pct"] = d["close"].pct_change() * 100.0
 
 # ---------- Indicators ----------
 d["ema20"], d["ema50"], d["ema200"] = ema(d["close"],20), ema(d["close"],50), ema(d["close"],200)
@@ -131,12 +138,12 @@ d["rsi14"] = rsi(d["close"],14)
 d["cci20"] = cci(d,20)
 dc_high, dc_low = donchian(d,20)
 d["dc_high"], d["dc_low"] = dc_high, dc_low
-st_line, st_dir = supertrend(d,10,3.0)
+st_line, st_dir = supertrend(d, period=10, mult=1.0)   # <<< vaste instelling 10,1
 d["supertrend"], d["st_dir"] = st_line, st_dir
 ha = heikin_ashi(d)
 d = pd.concat([d, ha], axis=1)
 
-# ---------- KPI's ----------
+# ---------- KPI's (YTD/PYTD los van slider) ----------
 last = d.iloc[-1]
 regime = ("Bullish" if (last["close"]>last["ema200"]) and (last["ema50"]>last["ema200"])
           else "Bearish" if (last["close"]<last["ema200"]) and (last["ema50"]<last["ema200"])
@@ -156,7 +163,7 @@ k6.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—"
 fig = make_subplots(
     rows=5, cols=1, shared_xaxes=True,
     subplot_titles=[
-        "SP500 Heikin-Ashi + Supertrend + Donchian",
+        "SP500 Heikin‑Ashi + Supertrend (10,1) + Donchian",
         "Close + EMA(20/50/200)",
         "VIX (Close)",
         "RSI(14)",
@@ -166,26 +173,28 @@ fig = make_subplots(
     vertical_spacing=0.06
 )
 
-# (1) HA + Donchian + Supertrend
+# (1) HA + Donchian + Supertrend (groen/rood, als één lijn door 2 segment-traces)
 fig.add_trace(go.Candlestick(
     x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
-    name="SPX (Heikin-Ashi)"
+    name="SPX (Heikin‑Ashi)"
 ), row=1, col=1)
+
 fig.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines",
                          line=dict(dash="dot", width=2), name="DC High"), row=1, col=1)
 fig.add_trace(go.Scatter(x=d["date"], y=d["dc_low"], mode="lines",
                          line=dict(dash="dot", width=2), name="DC Low"), row=1, col=1)
+
 st_up = d["supertrend"].where(d["st_dir"]==1)
 st_dn = d["supertrend"].where(d["st_dir"]==-1)
 fig.add_trace(go.Scatter(x=d["date"], y=st_up, mode="lines",
-                         line=dict(width=2, color="green"), name="Supertrend ↑"), row=1, col=1)
+                         line=dict(width=2, color="green"), name="Supertrend ↑ (10,1)"), row=1, col=1)
 fig.add_trace(go.Scatter(x=d["date"], y=st_dn, mode="lines",
-                         line=dict(width=2, color="red"), name="Supertrend ↓"), row=1, col=1)
+                         line=dict(width=2, color="red"), name="Supertrend ↓ (10,1)"), row=1, col=1)
 
 # (2) Close + EMA’s
 fig.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close"), row=2, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], mode="lines", name="EMA20"), row=2, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], mode="lines", name="EMA50"), row=2, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"],  mode="lines", name="EMA20"), row=2, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"],  mode="lines", name="EMA50"), row=2, col=1)
 fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"), row=2, col=1)
 
 # (3) VIX
