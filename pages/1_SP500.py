@@ -60,7 +60,7 @@ def true_range(d):
 def atr(d, n=10): return true_range(d).rolling(n).mean()
 
 def supertrend(d, period=10, mult=3.0):
-    """Klassieke supertrend; we geven 1 enkele lijn terug (geen kleursegmenten)."""
+    """Klassieke supertrend; we kleuren met 2 traces (up groen, down rood)."""
     hl2 = (d["high"]+d["low"])/2.0
     _atr = atr(d, period)
     upper = hl2 + mult*_atr
@@ -127,7 +127,7 @@ start_date, end_date = st.slider(
 mask = (df["date"] >= start_date) & (df["date"] <= end_date)
 d = df.loc[mask].reset_index(drop=True).copy()
 
-# ---------- Indicators (op gefilterde data) ----------
+# ---------- Indicators ----------
 d["ema20"], d["ema50"], d["ema200"] = ema(d["close"],20), ema(d["close"],50), ema(d["close"],200)
 d["rsi14"] = rsi(d["close"],14)
 d["cci20"] = cci(d,20)
@@ -154,66 +154,97 @@ k4.metric("Regime", regime)
 k5.metric("YTD Return",  f"{ytd_full:.2f}%"  if ytd_full  is not None else "—")
 k6.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—")
 
-# ---------- Multi-panel chart ----------
-# 1) HA + Supertrend (1 lijn) + Donchian
-# 2) Close + EMA20/50/200
-# 3) VIX
-# 4) RSI(14)
-# 5) CCI(20)
+# ---------- Multi-panel chart (met titels) ----------
 fig = make_subplots(
     rows=5, cols=1, shared_xaxes=True,
+    subplot_titles=[
+        "SP500 Heikin‑Ashi + Supertrend + Donchian",
+        "Close + EMA(20/50/200)",
+        "VIX (Close)",
+        "RSI(14)",
+        "CCI(20)"
+    ],
     row_heights=[0.42, 0.20, 0.13, 0.12, 0.13],
-    vertical_spacing=0.02
+    vertical_spacing=0.06
 )
 
-# (1) HA + ST + Donchian
+# (1) HA + Donchian + Supertrend (groen/rood)
 fig.add_trace(go.Candlestick(
     x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
-    name="SPX (Heikin‑Ashi)"
+    name="SPX (Heikin‑Ashi)", showlegend=True
 ), row=1, col=1)
 
-# Donchian — duidelijker
 fig.add_trace(go.Scatter(
     x=d["date"], y=d["dc_high"], mode="lines",
-    line=dict(dash="dot", width=2), name="DC High"
+    line=dict(dash="dot", width=2), name="DC High", showlegend=True
 ), row=1, col=1)
 fig.add_trace(go.Scatter(
     x=d["date"], y=d["dc_low"], mode="lines",
-    line=dict(dash="dot", width=2), name="DC Low"
+    line=dict(dash="dot", width=2), name="DC Low", showlegend=True
 ), row=1, col=1)
 
-# Supertrend — enkele lijn (neutraal kleur)
+st_up = d["supertrend"].where(d["st_dir"]==1)
+st_dn = d["supertrend"].where(d["st_dir"]==-1)
 fig.add_trace(go.Scatter(
-    x=d["date"], y=d["supertrend"], mode="lines",
-    line=dict(width=2, color="orange"),
-    name="Supertrend"
+    x=d["date"], y=st_up, mode="lines",
+    line=dict(width=2, color="green"),
+    name="Supertrend ↑ (bullish)", showlegend=True
+), row=1, col=1)
+fig.add_trace(go.Scatter(
+    x=d["date"], y=st_dn, mode="lines",
+    line=dict(width=2, color="red"),
+    name="Supertrend ↓ (bearish)", showlegend=True
 ), row=1, col=1)
 
-# (2) Close + EMA's in apart paneel
-fig.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close"), row=2, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"],  mode="lines", name="EMA20"),  row=2, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"],  mode="lines", name="EMA50"),  row=2, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"), row=2, col=1)
+# (2) Close + EMA’s
+fig.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close", showlegend=True), row=2, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"],  mode="lines", name="EMA20", showlegend=True),  row=2, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"],  mode="lines", name="EMA50", showlegend=True),  row=2, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200", showlegend=True), row=2, col=1)
 
 # (3) VIX
 if "vix_close" in d.columns and d["vix_close"].notna().any():
-    fig.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX"),
-                  row=3, col=1)
+    fig.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX", showlegend=True), row=3, col=1)
 
 # (4) RSI
-fig.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)"),
-              row=4, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)", showlegend=True), row=4, col=1)
 fig.add_hline(y=70, line_dash="dot", row=4, col=1)
 fig.add_hline(y=30, line_dash="dot", row=4, col=1)
 
 # (5) CCI
-fig.add_trace(go.Scatter(x=d["date"], y=d["cci20"], mode="lines", name="CCI(20)"),
-              row=5, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["cci20"], mode="lines", name="CCI(20)", showlegend=True), row=5, col=1)
 fig.add_hline(y=100, line_dash="dot", row=5, col=1)
 fig.add_hline(y=-100, line_dash="dot", row=5, col=1)
 
-# Opmaak
-fig.update_layout(xaxis_rangeslider_visible=False)   # geen “2e mini-grafiek”
+# opmaak
+fig.update_layout(
+    height=1050, margin=dict(l=20, r=20, t=60, b=20),
+    legend_orientation="h", legend_yanchor="top", legend_y=1.08, legend_x=0
+)
+fig.update_layout(xaxis_rangeslider_visible=False)
 fig.update_xaxes(rangeslider_visible=False)
-fig.update_layout(height=1000, margin=dict(l=20, r=20, t=30, b=20))
+fig.update_yaxes(title_text="Index", row=1, col=1)
+fig.update_yaxes(title_text="Close/EMA", row=2, col=1)
+fig.update_yaxes(title_text="VIX", row=3, col=1)
+fig.update_yaxes(title_text="RSI", row=4, col=1)
+fig.update_yaxes(title_text="CCI", row=5, col=1)
+
 st.plotly_chart(fig, use_container_width=True)
+
+# ---------- Histogrammen ----------
+st.subheader("Histogram dagrendementen")
+bins = st.slider("Aantal bins", 10, 120, 60, 5)
+c1, c2 = st.columns(2)
+hist_df = d.dropna(subset=["delta_abs","delta_pct"]).copy()
+with c1:
+    fig_abs = go.Figure()
+    fig_abs.add_trace(go.Histogram(x=hist_df["delta_abs"], nbinsx=int(bins), name="Δ abs"))
+    fig_abs.update_layout(title="Δ abs (punten)", height=320, bargap=0.02,
+                          margin=dict(l=10,r=10,t=40,b=10), showlegend=False)
+    st.plotly_chart(fig_abs, use_container_width=True)
+with c2:
+    fig_pct = go.Figure()
+    fig_pct.add_trace(go.Histogram(x=hist_df["delta_pct"]*100.0, nbinsx=int(bins), name="Δ %"))
+    fig_pct.update_layout(title="Δ %", height=320, bargap=0.02,
+                          margin=dict(l=10,r=10,t=40,b=10), showlegend=False)
+    st.plotly_chart(fig_pct, use_container_width=True)
