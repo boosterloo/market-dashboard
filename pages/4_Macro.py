@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date, timedelta
+from datetime import timedelta
 import plotly.graph_objects as go
 from google.api_core.exceptions import NotFound, BadRequest
 
@@ -11,15 +11,14 @@ from utils.bq import run_query, bq_ping
 st.set_page_config(page_title="📊 Grafieken per categorie", layout="wide")
 st.title("Grafieken per categorie")
 
-DEFAULT_INFL_VIEW = "nth-pier-468314-p7.marketdata.macro_inflation_v"
-DEFAULT_ACT_VIEW  = "nth-pier-468314-p7.marketdata.macro_activity_v"
-INFL_VIEW = st.secrets.get("tables", {}).get("infl_view", DEFAULT_INFL_VIEW)
-ACT_VIEW  = st.secrets.get("tables", {}).get("act_view",  DEFAULT_ACT_VIEW)
+# ---------- Config ----------
+DEFAULT_MACRO_VIEW = "nth-pier-468314-p7.marketdata.macro_series_wide_monthly_fill_v"
+MACRO_VIEW = st.secrets.get("tables", {}).get("macro_view", DEFAULT_MACRO_VIEW)
 
-# Contrastrijke kleuren
-COL_BLUE = "#2563eb"   # primair
-COL_CYAN = "#0891b2"   # secundair
-COL_RED  = "#dc2626"   # secondaire-as (rood)
+# Kleuren (contrastrijk)
+COL_BLUE = "#2563eb"   # primaire lijn
+COL_CYAN = "#0891b2"   # secundaire lijn (links)
+COL_RED  = "#dc2626"   # secundaire as (rechts)
 
 def best_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     lower = {c.lower(): c for c in df.columns}
@@ -28,7 +27,7 @@ def best_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
         if c.lower() in lower: return lower[c.lower()]
     return None
 
-def padded_range(s: pd.Series, pad_ratio: float = 0.05) -> list[float] | None:
+def padded_range(s: pd.Series, pad_ratio: float = 0.05):
     s = s.dropna()
     if s.empty: return None
     lo, hi = float(s.min()), float(s.max())
@@ -54,7 +53,7 @@ def add_metric_chip(col, title: str, value: float, delta: float):
         unsafe_allow_html=True,
     )
 
-# --- BQ check ---
+# ---------- BigQuery health ----------
 try:
     with st.spinner("BigQuery check…"):
         if not bq_ping():
@@ -66,96 +65,72 @@ except Exception as e:
     st.stop()
 
 @st.cache_data(ttl=1800)
-def load_infl():
-    df = run_query(f"SELECT * FROM `{INFL_VIEW}` ORDER BY date")
+def load_macro():
+    df = run_query(f"SELECT * FROM `{MACRO_VIEW}` ORDER BY date")
     if "date" not in df.columns:
-        raise ValueError(f"Kolom 'date' niet aanwezig in view {INFL_VIEW}")
+        raise ValueError(f"Kolom 'date' niet aanwezig in view {MACRO_VIEW}")
 
-    cpi_h = best_col(df, ["cpi_headline","cpi","cpi_index"])
-    cpi_c = best_col(df, ["cpi_core","core_cpi","cpi_ex_food_energy"])
-    pce_h = best_col(df, ["pce_headline","pce","pce_index"])
+    # Map kolommen naar namen die de grafiek verwacht
+    cpi_h = best_col(df, ["cpi_headline","cpi_all","cpi","cpi_index"])
+    cpi_c = best_col(df, ["cpi_core","core_cpi"])
+    pce_h = best_col(df, ["pce_headline","pce_all","pce","pce_index"])
 
-    need = dict(cpi_headline=cpi_h, cpi_core=cpi_c, pce_headline=pce_h)
+    ip    = best_col(df, ["industrial_production","ind_production","ind_prod","ip_index"])
+    retail= best_col(df, ["retail_sales","retail"])
+    house = best_col(df, ["housing_starts","housing","starts"])
+
+    need = dict(cpi_headline=cpi_h, cpi_core=cpi_c, pce_headline=pce_h,
+                industrial_production=ip, retail_sales=retail, housing_starts=house)
     missing = [k for k,v in need.items() if v is None]
     if missing:
-        raise ValueError(f"Inflatie-velden ontbreken: {', '.join(missing)}")
+        raise ValueError(f"Verplichte velden ontbreken in {MACRO_VIEW}: {', '.join(missing)}")
 
-    return df.rename(columns={cpi_h:"cpi_headline", cpi_c:"cpi_core", pce_h:"pce_headline"})
+    df = df.rename(columns={
+        cpi_h:"cpi_headline", cpi_c:"cpi_core", pce_h:"pce_headline",
+        ip:"industrial_production", retail:"retail_sales", house:"housing_starts"
+    })
+    return df
 
-@st.cache_data(ttl=1800)
-def load_act():
-    df = run_query(f"SELECT * FROM `{ACT_VIEW}` ORDER BY date")
-    if "date" not in df.columns:
-        raise ValueError(f"Kolom 'date' niet aanwezig in view {ACT_VIEW}")
-
-    ip     = best_col(df, ["industrial_production","ind_prod","ip_index"])
-    retail = best_col(df, ["retail_sales","retail","retail_index"])
-    house  = best_col(df, ["housing_starts","housing","starts"])
-
-    need = dict(industrial_production=ip, retail_sales=retail, housing_starts=house)
-    missing = [k for k,v in need.items() if v is None]
-    if missing:
-        raise ValueError(f"Activiteit-velden ontbreken: {', '.join(missing)}")
-
-    return df.rename(columns={ip:"industrial_production", retail:"retail_sales", house:"housing_starts"})
-
-# --- Views laden met nette fouten ---
+# Laden met nette foutmeldingen
 try:
-    df_infl = load_infl()
+    df = load_macro()
 except NotFound:
-    st.error(f"View niet gevonden: `{INFL_VIEW}`. Zet de juiste naam in secrets.toml onder [tables].")
+    st.error(f"View niet gevonden: `{MACRO_VIEW}`. Pas [tables].macro_view in secrets.toml aan.")
     st.stop()
 except (BadRequest, ValueError) as e:
-    st.error(f"Inflatie-view probleem: {e}")
+    st.error(f"Macro-view probleem: {e}")
     st.stop()
 
-try:
-    df_act = load_act()
-except NotFound:
-    st.error(f"View niet gevonden: `{ACT_VIEW}`. Zet de juiste naam in secrets.toml onder [tables].")
-    st.stop()
-except (BadRequest, ValueError) as e:
-    st.error(f"Activiteit-view probleem: {e}")
-    st.stop()
+# Datums
+if not np.issubdtype(df["date"].dtype, np.datetime64):
+    df["date"] = pd.to_datetime(df["date"])
 
-# Datatypes
-for df in (df_infl, df_act):
-    if not np.issubdtype(df["date"].dtype, np.datetime64):
-        df["date"] = pd.to_datetime(df["date"])
-
-# --- Periode-slider over volle breedte ---
-all_min = min(df_infl["date"].min(), df_act["date"].min()).date()
-all_max = max(df_infl["date"].max(), df_act["date"].max()).date()
+# ---------- Periode over volle breedte ----------
+all_min, all_max = df["date"].min().date(), df["date"].max().date()
 default_start = all_max - timedelta(days=5*365)
 start, end = st.slider("Periode", min_value=all_min, max_value=all_max,
                        value=(default_start, all_max), format="YYYY-MM-DD")
 
-def subset(df: pd.DataFrame) -> pd.DataFrame:
-    return df[(df["date"].dt.date >= start) & (df["date"].dt.date <= end)].copy()
-
-df_infl_p = subset(df_infl)
-df_act_p  = subset(df_act)
+dfp = df[(df["date"].dt.date >= start) & (df["date"].dt.date <= end)].copy()
 
 st.divider()
 
-# ================= Inflatie =================
+# ================== Inflatie (dual-axis) ==================
 st.subheader("Inflatie (dual-axis)")
-if df_infl_p.empty:
+if dfp.empty:
     st.info("Geen inflatie-data in de gekozen periode.")
 else:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df_infl_p["date"], y=df_infl_p["cpi_headline"],
+    fig.add_trace(go.Scatter(x=dfp["date"], y=dfp["cpi_headline"],
                              mode="lines", name="CPI (headline)",
                              line=dict(color=COL_BLUE, width=3)))
-    fig.add_trace(go.Scatter(x=df_infl_p["date"], y=df_infl_p["cpi_core"],
+    fig.add_trace(go.Scatter(x=dfp["date"], y=dfp["cpi_core"],
                              mode="lines", name="CPI (core)",
                              line=dict(color=COL_CYAN, width=2, dash="dash")))
-
-    right_range = padded_range(df_infl_p["pce_headline"])
-    fig.add_trace(go.Scatter(x=df_infl_p["date"], y=df_infl_p["pce_headline"],
+    right_range = padded_range(dfp["pce_headline"])
+    fig.add_trace(go.Scatter(x=dfp["date"], y=dfp["pce_headline"],
                              mode="lines", name="PCE (headline)",
                              line=dict(color=COL_RED, width=2, dash="dash"), yaxis="y2"))
-
     fig.update_layout(
         height=420, legend=dict(orientation="h"),
         margin=dict(l=0,r=0,t=10,b=0),
@@ -165,34 +140,32 @@ else:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    last2 = df_infl_p.tail(2)
+    last2 = dfp[["cpi_headline","cpi_core","pce_headline"]].tail(2)
     if len(last2) == 2:
-        last, prev = last2.iloc[-1], last2.iloc[-2]
-        c1, c2, c3 = st.columns(3)
-        add_metric_chip(c1, "CPI (headline)", float(last["cpi_headline"]), float(last["cpi_headline"] - prev["cpi_headline"]))
-        add_metric_chip(c2, "CPI (core)",     float(last["cpi_core"]),     float(last["cpi_core"]     - prev["cpi_core"]))
-        add_metric_chip(c3, "PCE (headline)", float(last["pce_headline"]), float(last["pce_headline"] - prev["pce_headline"]))
+        (c1, c2, c3) = st.columns(3)
+        l, p = last2.iloc[-1], last2.iloc[-2]
+        add_metric_chip(c1, "CPI (headline)", float(l["cpi_headline"]), float(l["cpi_headline"] - p["cpi_headline"]))
+        add_metric_chip(c2, "CPI (core)",     float(l["cpi_core"]),     float(l["cpi_core"]     - p["cpi_core"]))
+        add_metric_chip(c3, "PCE (headline)", float(l["pce_headline"]), float(l["pce_headline"] - p["pce_headline"]))
 
 st.divider()
 
-# ================= Activiteit =================
+# ================== Activiteit (dual-axis) ==================
 st.subheader("Activiteit (dual-axis)")
-if df_act_p.empty:
+if dfp.empty:
     st.info("Geen activiteit-data in de gekozen periode.")
 else:
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=df_act_p["date"], y=df_act_p["industrial_production"],
+    fig2.add_trace(go.Scatter(x=dfp["date"], y=dfp["industrial_production"],
                               mode="lines", name="Industrial production",
                               line=dict(color=COL_BLUE, width=3)))
-    fig2.add_trace(go.Scatter(x=df_act_p["date"], y=df_act_p["retail_sales"],
+    fig2.add_trace(go.Scatter(x=dfp["date"], y=dfp["retail_sales"],
                               mode="lines", name="Retail sales",
                               line=dict(color=COL_CYAN, width=2, dash="dash")))
-
-    right_range2 = padded_range(df_act_p["housing_starts"])
-    fig2.add_trace(go.Scatter(x=df_act_p["date"], y=df_act_p["housing_starts"],
+    right_range2 = padded_range(dfp["housing_starts"])
+    fig2.add_trace(go.Scatter(x=dfp["date"], y=dfp["housing_starts"],
                               mode="lines", name="Housing starts",
                               line=dict(color=COL_RED, width=2, dash="dash"), yaxis="y2"))
-
     fig2.update_layout(
         height=420, legend=dict(orientation="h"),
         margin=dict(l=0,r=0,t=10,b=0),
@@ -202,10 +175,10 @@ else:
     )
     st.plotly_chart(fig2, use_container_width=True)
 
-    last2 = df_act_p.tail(2)
+    last2 = dfp[["industrial_production","retail_sales","housing_starts"]].tail(2)
     if len(last2) == 2:
-        last, prev = last2.iloc[-1], last2.iloc[-2]
-        c1, c2, c3 = st.columns(3)
-        add_metric_chip(c1, "Industrial production", float(last["industrial_production"]), float(last["industrial_production"] - prev["industrial_production"]))
-        add_metric_chip(c2, "Retail sales",          float(last["retail_sales"]),          float(last["retail_sales"]          - prev["retail_sales"]))
-        add_metric_chip(c3, "Housing starts",        float(last["housing_starts"]),        float(last["housing_starts"]        - prev["housing_starts"]))
+        (c1, c2, c3) = st.columns(3)
+        l, p = last2.iloc[-1], last2.iloc[-2]
+        add_metric_chip(c1, "Industrial production", float(l["industrial_production"]), float(l["industrial_production"] - p["industrial_production"]))
+        add_metric_chip(c2, "Retail sales",          float(l["retail_sales"]),          float(l["retail_sales"]          - p["retail_sales"]))
+        add_metric_chip(c3, "Housing starts",        float(l["housing_starts"]),        float(l["housing_starts"]        - p["housing_starts"]))
