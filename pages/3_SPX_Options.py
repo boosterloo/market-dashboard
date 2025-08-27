@@ -3,12 +3,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, date
+import math
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from plotly import colors as pc
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from scipy.stats import norm
 
 # ───────────────────────────── Small helpers ─────────────────────────────
 def pick_closest_date(options: list[date], target: date):
@@ -34,6 +36,11 @@ def is_round(x: float) -> int:
 def smooth_series(y: pd.Series, window: int = 3) -> pd.Series:
     if len(y) < 3: return y
     return y.rolling(window, center=True, min_periods=1).median()
+
+def annualize_std(s: pd.Series, periods_per_year: int = 252) -> float:
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    if len(s) < 2: return np.nan
+    return float(s.std(ddof=0) * math.sqrt(periods_per_year))
 
 # ── BigQuery client via st.secrets ────────────────────────────────
 def get_bq_client():
@@ -569,7 +576,7 @@ if not pv.empty:
     fig_pcr.update_layout(height=520, title_text="Put/Call-ratio per Expiratie")
     st.plotly_chart(fig_pcr, use_container_width=True)
 
-# ── G) NIEUW: Volume-heatmap (strike × expiratie) ─────────────────
+# ── G) Volume-heatmap (strike × expiratie) ────────────────────────
 st.subheader("Volume-heatmap — strike × expiratie")
 use_last_for_vol = st.checkbox("Gebruik alleen laatste snapshot", value=True, key="vol_last_snap")
 vol_center_best  = st.checkbox("Centreer rond best-strike", value=True, key="vol_center")
@@ -600,7 +607,157 @@ else:
     fig_vol.update_layout(title=title_vol, xaxis_title="Strike", yaxis_title="Expiratie", height=520)
     st.plotly_chart(fig_vol, use_container_width=True)
 
-# VIX vs IV
+# ── H) VOL & RISK: ATM-IV, HV20, VRP, IV-Rank, Expected-Move ──────
+st.markdown("### 📊 Vol & Risk (ATM-IV, HV, VRP, IV-Rank, Expected-Move)")
+
+# 1) Dagelijkse close van onderliggende en HV20
+u_daily = (df.assign(dte=df["snapshot_date"].dt.date)
+             .sort_values(["dte","snapshot_date"])
+             .groupby("dte", as_index=False)
+             .agg(close=("underlying_price","last")))
+
+u_daily["ret"] = u_daily["close"].pct_change()
+hv20 = annualize_std(u_daily["ret"].tail(21).dropna())  # ~20d
+hv_percent = hv20
+
+# 2) ATM-IV ≈ median IV van near-ATM (|mny|<=1%) & DTE≈30
+near_atm = df_last[(df_last["days_to_exp"].between(20, 40)) & (df_last["moneyness"].abs() <= 0.01)]
+iv_atm = float(near_atm["implied_volatility"].median()) if not near_atm.empty else float(df_last["implied_volatility"].median())
+
+# 3) IV-Rank over 1 jaar (dagelijkse ATM-IV proxy)
+iv_hist = (df.assign(day=df["snapshot_date"].dt.date)
+             .query("days_to_exp>=20 and days_to_exp<=40 and abs(moneyness)<=0.01")
+             .groupby("day", as_index=False)["implied_volatility"].median()
+             .rename(columns={"implied_volatility":"iv"}))
+iv_1y = iv_hist.tail(252)["iv"] if not iv_hist.empty else pd.Series(dtype=float)
+if not iv_1y.empty:
+    iv_rank = float((iv_1y.rank(pct=True)[iv_1y.index[-1]]))  # percentiel van laatste
+else:
+    iv_rank = np.nan
+
+# 4) Expected Move voor gekozen serie_exp (of dichtst bij 30D als fallback)
+if series_exp:
+    dte_selected = int(df_last[df_last["expiration"]==series_exp]["days_to_exp"].median() or 30)
+else:
+    dte_selected = 30
+em_sigma = (underlying_now * iv_atm * math.sqrt(max(dte_selected,1)/365.0)) if not np.isnan(underlying_now) else np.nan
+
+colv1, colv2, colv3, colv4, colv5 = st.columns(5)
+with colv1: st.metric("ATM-IV (~30D)", f"{iv_atm:.2%}" if not np.isnan(iv_atm) else "—")
+with colv2: st.metric("HV20", f"{hv_percent:.2%}" if not np.isnan(hv_percent) else "—")
+with colv3: st.metric("VRP (IV−HV)", f"{(iv_atm-hv_percent):.2%}" if (not np.isnan(iv_atm) and not np.isnan(hv_percent)) else "—")
+with colv4: st.metric("IV-Rank (1y)", f"{iv_rank*100:.0f}%" if not np.isnan(iv_rank) else "—")
+with colv5:
+    em_txt = f"±{em_sigma:,.0f} pts ({em_sigma/underlying_now:.2%})" if (not np.isnan(em_sigma) and not np.isnan(underlying_now)) else "—"
+    st.metric("Expected Move (σ)", em_txt)
+
+st.caption("**VRP**>0 impliceert dat impliciete vol boven gerealiseerde ligt → relatief gunstig voor premie-verkopers. **IV-Rank** hoog (=in bovenste percentielen) = extra marge voor mean-reversion van vol (met event-risico in acht).")
+
+# ── I) STRANGLE HELPER — target σ / strikes & metrics ─────────────
+st.markdown("### 🧠 Strangle Helper (σ-doel / quick pick)")
+
+colsh1, colsh2, colsh3, colsh4 = st.columns([1.2, 1, 1, 1])
+with colsh1:
+    exp_for_str = st.selectbox("Expiratie voor strangle", options=exps_all or [series_exp], index=(exps_all.index(series_exp) if (exps_all and series_exp in exps_all) else 0))
+with colsh2:
+    sigma_target = st.slider("σ-doel per zijde", 0.5, 2.5, 1.0, step=0.1, help="1.0σ ≈ ca. 68% band (totaal).")
+with colsh3:
+    price_source = st.radio("Prijsbron", ["mid_price","last_price"], index=0, horizontal=True)
+with colsh4:
+    show_table = st.checkbox("Toon details tabel", value=False)
+
+# Voor strangle hebben we beide types nodig → aparte query (alle types) op laatste snapshot
+@st.cache_data(ttl=300, show_spinner=False)
+def load_strangle_slice(expiration, snap_min):
+    sql = f"""
+      SELECT snapshot_date, type, expiration, days_to_exp, strike, underlying_price,
+             implied_volatility, open_interest, volume, last_price, mid_price
+      FROM `{VIEW}`
+      WHERE DATE(snapshot_date) BETWEEN @d1 AND @d2
+        AND expiration = @exp
+        AND TIMESTAMP_TRUNC(snapshot_date, MINUTE) = @snap
+    """
+    d1 = min_date; d2 = max_date
+    return run_query(sql, {"d1": d1, "d2": d2, "exp": expiration, "snap": pd.to_datetime(snap_min)})
+
+df_str = load_strangle_slice(exp_for_str, sel_snapshot)
+df_str["type"] = df_str["type"].str.lower()
+
+# ATM-IV specifiek voor deze expiratie (median |mny|<=1%)
+df_str["mny"] = df_str["strike"]/df_str["underlying_price"] - 1.0
+iv_atm_exp = float(df_str.loc[(df_str["days_to_exp"].between(20,60)) & (df_str["mny"].abs()<=0.01),"implied_volatility"].median()) if not df_str.empty else iv_atm
+dte_exp = int(df_str["days_to_exp"].median()) if not df_str.empty else dte_selected
+sigma_pts = underlying_now * iv_atm_exp * math.sqrt(max(dte_exp,1)/365.0) if (not np.isnan(underlying_now) and not np.isnan(iv_atm_exp)) else np.nan
+
+# Doelstrikes op ± sigma_target * sigma_pts → rond naar beschikbare strikes (dichtsbij)
+def nearest_strike(side: str, target_price: float) -> float:
+    # side: "put" of "call"
+    s_list = sorted(df_str[df_str["type"]==side]["strike"].unique().tolist())
+    return pick_closest_value(s_list, target_price, fallback=(s_list[len(s_list)//2] if s_list else 6000.0))
+
+target_put  = nearest_strike("put",  underlying_now - sigma_target * sigma_pts) if not np.isnan(sigma_pts) else np.nan
+target_call = nearest_strike("call", underlying_now + sigma_target * sigma_pts) if not np.isnan(sigma_pts) else np.nan
+
+put_row  = df_str[(df_str["type"]=="put")  & (df_str["strike"]==target_put)].copy()
+call_row = df_str[(df_str["type"]=="call") & (df_str["strike"]==target_call)].copy()
+
+def _val(row, col):
+    return float(pd.to_numeric(row[col], errors="coerce").median()) if (not row.empty and col in row) else np.nan
+
+put_px  = _val(put_row,  price_source)
+call_px = _val(call_row, price_source)
+total_credit = (put_px + call_px) if (not np.isnan(put_px) and not np.isnan(call_px)) else np.nan
+
+# σ-afstand & probabilities (normal-approx)
+def sigma_distance(strike: float) -> float:
+    if np.isnan(sigma_pts) or np.isnan(underlying_now): return np.nan
+    return abs(strike - underlying_now) / sigma_pts
+
+sd_put  = sigma_distance(target_put)
+sd_call = sigma_distance(target_call)
+
+def p_itm_at_exp(sd: float) -> float:
+    if np.isnan(sd): return np.nan
+    # P(|Z| > sd) / 2 per zijde, maar voor unilaterale kant:
+    return 1.0 - float(norm.cdf(sd))
+
+p_itm_put  = p_itm_at_exp(sd_put)
+p_itm_call = p_itm_at_exp(sd_call)
+p_touch_put  = min(1.0, 2.0 * p_itm_put)  if not np.isnan(p_itm_put)  else np.nan
+p_touch_call = min(1.0, 2.0 * p_itm_call) if not np.isnan(p_itm_call) else np.nan
+p_both_touch_approx = min(1.0, p_touch_put + p_touch_call)  # ruwe bovengrens
+
+ppd_total = float(total_credit / max(dte_exp,1)) if not np.isnan(total_credit) else np.nan
+
+colk1, colk2, colk3, colk4, colk5, colk6 = st.columns(6)
+with colk1: st.metric("Expiratie", str(exp_for_str))
+with colk2: st.metric("σ (30D-ATM) pts", f"{sigma_pts:,.0f}" if not np.isnan(sigma_pts) else "—")
+with colk3: st.metric("Strikes", f"P {target_put:.0f} / C {target_call:.0f}")
+with colk4: st.metric("Credit", f"{total_credit:,.2f}" if not np.isnan(total_credit) else "—")
+with colk5: st.metric("PPD (tot.)", f"{ppd_total:,.2f}" if not np.isnan(ppd_total) else "—")
+with colk6: st.metric("~P(touch) max", f"{p_both_touch_approx*100:.0f}%" if not np.isnan(p_both_touch_approx) else "—")
+
+if show_table and not df_str.empty:
+    show_cols = ["type","strike","implied_volatility","open_interest","volume","last_price","mid_price"]
+    st.dataframe(df_str.sort_values(["type","strike"])[show_cols], use_container_width=True)
+
+# Quick verdict
+verdict = []
+if not np.isnan(iv_rank):
+    if iv_rank >= 0.7: verdict.append("IV-Rank is **hoog** → premie-verkopen aantrekkelijker (wel events checken).")
+    elif iv_rank <= 0.3: verdict.append("IV-Rank is **laag** → premie lager; overweeg smaller/konservatiever of kalender.")
+if not np.isnan(hv_percent) and not np.isnan(iv_atm):
+    if (iv_atm - hv_percent) > 0.03: verdict.append("**VRP** duidelijk positief (IV≫HV) → kans op mean-reversion van vol.")
+    elif (iv_atm - hv_percent) < -0.01: verdict.append("**VRP** negatief → markt prijst minder risico dan gerealiseerd; voorzichtig met net-short vol.")
+if not np.isnan(p_both_touch_approx):
+    if p_both_touch_approx <= 0.40: verdict.append("~**P(touch)** beide zijden ≲40% → comfortabele band (voor strangle).")
+    elif p_both_touch_approx >= 0.60: verdict.append("~**P(touch)** hoog → overweeg grotere σ-afstand of langere DTE.")
+if verdict:
+    st.markdown("- " + "\n- ".join(verdict))
+
+st.markdown("---")
+
+# ── J) VIX vs IV (gem.) ───────────────────────────────────────────
 vix_vs_iv = (df.assign(snap_date=df["snapshot_date"].dt.date)
                .groupby("snap_date", as_index=False)
                .agg(vix=("vix","median"), iv=("implied_volatility","median"))
