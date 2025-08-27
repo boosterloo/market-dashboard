@@ -5,7 +5,6 @@ import numpy as np
 from datetime import timedelta
 import plotly.graph_objects as go
 from google.api_core.exceptions import NotFound, BadRequest
-
 from utils.bq import run_query, bq_ping
 
 st.set_page_config(page_title="📊 Grafieken per categorie", layout="wide")
@@ -17,8 +16,9 @@ MACRO_VIEW = st.secrets.get("tables", {}).get("macro_view", DEFAULT_MACRO_VIEW)
 
 # Kleuren (contrastrijk)
 COL_BLUE = "#2563eb"   # primaire lijn
-COL_CYAN = "#0891b2"   # secundaire lijn (links)
-COL_RED  = "#dc2626"   # secundaire as (rechts)
+COL_CYAN = "#0891b2"   # secundaire (links)
+COL_RED  = "#dc2626"   # secundaire-as (rechts)
+PALETTE  = ["#2563eb","#0891b2","#dc2626","#16a34a","#9333ea","#f59e0b","#0ea5e9","#ef4444"]
 
 def best_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     lower = {c.lower(): c for c in df.columns}
@@ -70,7 +70,7 @@ def load_macro():
     if "date" not in df.columns:
         raise ValueError(f"Kolom 'date' niet aanwezig in view {MACRO_VIEW}")
 
-    # Map kolommen naar namen die de grafiek verwacht
+    # Map kernkolommen naar vaste namen
     cpi_h = best_col(df, ["cpi_headline","cpi_all","cpi","cpi_index"])
     cpi_c = best_col(df, ["cpi_core","core_cpi"])
     pce_h = best_col(df, ["pce_headline","pce_all","pce","pce_index"])
@@ -127,6 +127,7 @@ else:
     fig.add_trace(go.Scatter(x=dfp["date"], y=dfp["cpi_core"],
                              mode="lines", name="CPI (core)",
                              line=dict(color=COL_CYAN, width=2, dash="dash")))
+    # Rechteras (rood) met autoscaling
     right_range = padded_range(dfp["pce_headline"])
     fig.add_trace(go.Scatter(x=dfp["date"], y=dfp["pce_headline"],
                              mode="lines", name="PCE (headline)",
@@ -150,28 +151,41 @@ else:
 
 st.divider()
 
-# ================== Activiteit (dual-axis) ==================
+# ================== Activiteit (dual-axis, met autoscaling voor IP) ==================
 st.subheader("Activiteit (dual-axis)")
 if dfp.empty:
     st.info("Geen activiteit-data in de gekozen periode.")
 else:
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=dfp["date"], y=dfp["industrial_production"],
-                              mode="lines", name="Industrial production",
-                              line=dict(color=COL_BLUE, width=3)))
-    fig2.add_trace(go.Scatter(x=dfp["date"], y=dfp["retail_sales"],
-                              mode="lines", name="Retail sales",
-                              line=dict(color=COL_CYAN, width=2, dash="dash")))
-    right_range2 = padded_range(dfp["housing_starts"])
-    fig2.add_trace(go.Scatter(x=dfp["date"], y=dfp["housing_starts"],
-                              mode="lines", name="Housing starts",
-                              line=dict(color=COL_RED, width=2, dash="dash"), yaxis="y2"))
+
+    # y (links): Retail sales
+    fig2.add_trace(go.Scatter(
+        x=dfp["date"], y=dfp["retail_sales"], mode="lines",
+        name="Retail sales", line=dict(color=COL_CYAN, width=2, dash="dash")
+    ))
+
+    # y2 (rechts): Housing starts (rood, autoscaling via range)
+    y2_range = padded_range(dfp["housing_starts"])
+    fig2.add_trace(go.Scatter(
+        x=dfp["date"], y=dfp["housing_starts"], mode="lines", yaxis="y2",
+        name="Housing starts", line=dict(color=COL_RED, width=2, dash="dash")
+    ))
+
+    # y3 (extra links, overlay): Industrial production met EIGEN autoscale
+    y3_range = padded_range(dfp["industrial_production"])
+    fig2.add_trace(go.Scatter(
+        x=dfp["date"], y=dfp["industrial_production"], mode="lines", yaxis="y3",
+        name="Industrial production", line=dict(color=COL_BLUE, width=3)
+    ))
+
     fig2.update_layout(
         height=420, legend=dict(orientation="h"),
         margin=dict(l=0,r=0,t=10,b=0),
-        yaxis=dict(title="Niveau (IP / Retail)"),
-        yaxis2=dict(title="Niveau (Housing starts)", overlaying="y", side="right", range=right_range2),
-        xaxis=dict(title="Datum")
+        xaxis=dict(title="Datum"),
+        yaxis=dict(title="Niveau (Retail)"),
+        yaxis2=dict(title="Niveau (Housing starts)", overlaying="y", side="right", range=y2_range),
+        # y3: eigen schaal, overlapt links; we verbergen ticks om rommel te voorkomen
+        yaxis3=dict(overlaying="y", side="left", range=y3_range, showticklabels=False, showgrid=False)
     )
     st.plotly_chart(fig2, use_container_width=True)
 
@@ -182,3 +196,70 @@ else:
         add_metric_chip(c1, "Industrial production", float(l["industrial_production"]), float(l["industrial_production"] - p["industrial_production"]))
         add_metric_chip(c2, "Retail sales",          float(l["retail_sales"]),          float(l["retail_sales"]          - p["retail_sales"]))
         add_metric_chip(c3, "Housing starts",        float(l["housing_starts"]),        float(l["housing_starts"]        - p["housing_starts"]))
+
+st.divider()
+
+# ================== Overige macro-indicatoren ==================
+st.subheader("Overige macro-indicatoren")
+# Kandidaten op basis van jouw view (excl. reeds gebruikte)
+exclude = {"date","cpi_headline","cpi_core","pce_headline","industrial_production","retail_sales","housing_starts"}
+cands = [c for c in dfp.columns if c not in exclude]
+
+# Voorzetje met veelvoorkomende velden:
+defaults_order = [c for c in ["unemployment","payrolls","init_claims","m2","m2_yoy","m2_real","m2_vel","m2_real_yoy"] if c in cands]
+sel = st.multiselect("Kies indicatoren", options=cands, default=defaults_order or cands[:4])
+
+mode = st.radio("Weergave", ["Genormaliseerd (index = 100)", "Eigen as per serie"], horizontal=True, index=0)
+
+if sel:
+    fig3 = go.Figure()
+    if mode.startswith("Genormaliseerd"):
+        # normaliseer op eerste waarde binnen de gefilterde periode
+        for i, col in enumerate(sel):
+            series = dfp[col].astype(float)
+            base = series.dropna().iloc[0] if series.notna().any() else np.nan
+            norm = series / base * 100.0 if pd.notna(base) and base != 0 else series
+            fig3.add_trace(go.Scatter(x=dfp["date"], y=norm, mode="lines",
+                                      name=col, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
+        fig3.update_layout(
+            height=420, legend=dict(orientation="h"),
+            margin=dict(l=0,r=0,t=10,b=0),
+            yaxis=dict(title="Index (=100)"),
+            xaxis=dict(title="Datum")
+        )
+    else:
+        # eigen as per serie via y, y2, y3, ...
+        for i, col in enumerate(sel):
+            ax_id = "" if i == 0 else str(i+1)   # y, y2, y3, ...
+            ax_name = f"yaxis{ax_id}" if ax_id else "yaxis"
+            # voeg trace
+            fig3.add_trace(go.Scatter(
+                x=dfp["date"], y=dfp[col].astype(float), mode="lines",
+                name=col, yaxis=f"y{ax_id}" if ax_id else "y",
+                line=dict(width=2, color=PALETTE[i % len(PALETTE)])
+            ))
+            # layout voor de as
+            if i == 0:
+                fig3.update_layout(yaxis=dict(title=col, range=padded_range(dfp[col])))
+            elif i == 1:
+                fig3.update_layout(yaxis2=dict(title=col, overlaying="y", side="right", range=padded_range(dfp[col])))
+            else:
+                # extra assen overlappen links/rechts, zonder ticklabels
+                side = "left" if i % 2 == 0 else "right"
+                fig3["layout"][ax_name] = dict(overlaying="y", side=side, range=padded_range(dfp[col]),
+                                               showticklabels=False, showgrid=False)
+
+        fig3.update_layout(height=420, legend=dict(orientation="h"), margin=dict(l=0,r=0,t=10,b=0), xaxis=dict(title="Datum"))
+
+    st.plotly_chart(fig3, use_container_width=True)
+
+    # Delta-chips voor selectie
+    last2 = dfp[sel].tail(2)
+    if len(last2) == 2:
+        cols = st.columns(min(5, len(sel)))
+        for i, col in enumerate(sel):
+            c = cols[i % len(cols)]
+            l, p = float(last2[col].iloc[-1]), float(last2[col].iloc[-2])
+            add_metric_chip(c, col, l, l - p)
+else:
+    st.info("Selecteer één of meer indicatoren.")

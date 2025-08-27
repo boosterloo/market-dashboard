@@ -1,248 +1,281 @@
-# pages/macro_categories.py
+# pages/yield_curve.py
 import streamlit as st
 import pandas as pd
-import numpy as np
-from datetime import date, timedelta
 import plotly.graph_objects as go
+from utils.bq import run_query
 
-from utils.bq import run_query, bq_ping
+st.set_page_config(page_title="Yield Curve Dashboard", layout="wide")
+st.title("🧯 Yield Curve Dashboard")
 
-st.set_page_config(page_title="📊 Grafieken per categorie", layout="wide")
-st.title("Grafieken per categorie")
+PROJECT_ID = st.secrets["gcp_service_account"]["project_id"]
+TABLES     = st.secrets.get("tables", {})
+YIELD_VIEW = TABLES.get("yield_view", f"{PROJECT_ID}.marketdata.yield_curve_analysis_wide")
 
-# ---------------------------
-# Config & helpers
-# ---------------------------
-DEFAULT_INFL_VIEW = "nth-pier-468314-p7.marketdata.macro_inflation_v"
-DEFAULT_ACT_VIEW  = "nth-pier-468314-p7.marketdata.macro_activity_v"
+# ---------- Recessie-perioden (NBER, recente) ----------
+# (Je kunt hier later eenvoudig meer perioden aan toevoegen.)
+NBER_RECESSIONS = [
+    ("1990-07-01", "1991-03-01"),
+    ("2001-03-01", "2001-11-01"),
+    ("2007-12-01", "2009-06-01"),
+    ("2020-02-01", "2020-04-30"),
+]
 
-INFL_VIEW = st.secrets.get("tables", {}).get("infl_view", DEFAULT_INFL_VIEW)
-ACT_VIEW  = st.secrets.get("tables", {}).get("act_view",  DEFAULT_ACT_VIEW)
+# ---------- Kolommen ophalen & SELECT dynamisch opbouwen ----------
+def list_columns(fqtn: str) -> set[str]:
+    proj, dset, tbl = fqtn.split(".")
+    sql = f"""
+    SELECT column_name
+    FROM `{proj}.{dset}.INFORMATION_SCHEMA.COLUMNS`
+    WHERE table_name = @tbl
+    """
+    dfc = run_query(sql, params={"tbl": tbl}, timeout=30)
+    return set([c.lower() for c in dfc["column_name"].astype(str)])
 
-# Sterke, contrastrijke kleuren
-COL_BLUE   = "#2563eb"  # CPI headline / Industrial production
-COL_CYAN   = "#0891b2"  # CPI core / Retail sales
-COL_RED    = "#dc2626"  # PCE headline / Housing starts  (secundaire as)
+cols = list_columns(YIELD_VIEW)
+def have(c: str) -> bool: return c.lower() in cols
 
-def best_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols_lower = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c in df.columns:
-            return c
-        if c.lower() in cols_lower:
-            return cols_lower[c.lower()]
-    return None
-
-def padded_range(s: pd.Series, pad_ratio: float = 0.05) -> list[float]:
-    s = s.dropna()
-    if s.empty:
-        return None
-    lo, hi = float(s.min()), float(s.max())
-    if lo == hi:
-        pad = abs(lo) * pad_ratio if lo != 0 else 1.0
-        return [lo - pad, hi + pad]
-    span = hi - lo
-    pad = span * pad_ratio
-    return [lo - pad, hi + pad]
-
-def add_metric_chip(col, title: str, value: float, delta: float):
-    # Groen positief, rood negatief
-    delta_str = f"{delta:+.2f}"
-    color = "#16a34a" if delta > 0 else ("#dc2626" if delta < 0 else "#6b7280")
-    col.markdown(f"**{title}**")
-    col.markdown(
-        f"""
-        <div style="display:flex;gap:12px;align-items:baseline;">
-          <div style="font-size:1.4rem;font-weight:700;">{value:.2f}</div>
-          <div style="padding:2px 8px;border-radius:999px;background:{color}20;color:{color};font-weight:700;">
-            {delta_str}
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# ---------------------------
-# BigQuery check & data
-# ---------------------------
-try:
-    with st.spinner("BigQuery check…"):
-        if not bq_ping():
-            st.error("Geen BigQuery-verbinding. Controleer Secrets ([gcp_service_account]).")
-            st.stop()
-except Exception as e:
-    st.error("Geen BigQuery-verbinding. Controleer Secrets ([gcp_service_account]).")
-    st.caption(f"Details: {e}")
+y2y_col = "y_2y_synth" if have("y_2y_synth") else ("y_2y" if have("y_2y") else None)
+if not y2y_col:
+    st.error(f"`{YIELD_VIEW}` bevat geen `y_2y_synth` of `y_2y`.")
     st.stop()
 
-@st.cache_data(ttl=1800)
-def load_infl():
-    # Neem alles en map kolommen dynamisch
-    df = run_query(f"SELECT * FROM `{INFL_VIEW}` ORDER BY date")
-    if "date" not in df.columns:
-        raise ValueError(f"Kolom 'date' niet aanwezig in view {INFL_VIEW}")
+select_parts = ["date"]
+for src, alias in [("y_3m","y_3m"), (y2y_col,"y_2y"), ("y_5y","y_5y"), ("y_10y","y_10y"), ("y_30y","y_30y")]:
+    if have(src): select_parts.append(f"SAFE_CAST({src} AS FLOAT64) AS {alias}")
+if have("spread_10_2"):  select_parts.append("SAFE_CAST(spread_10_2 AS FLOAT64) AS spread_10_2")
+if have("spread_30_10"): select_parts.append("SAFE_CAST(spread_30_10 AS FLOAT64) AS spread_30_10")
+if have("snapshot_date"): select_parts.append("snapshot_date")
 
-    cpi_h  = best_col(df, ["cpi_headline","cpi","cpi_index","cpi_h"])
-    cpi_c  = best_col(df, ["cpi_core","core_cpi","cpi_ex_food_energy"])
-    pce_h  = best_col(df, ["pce_headline","pce","pce_index","pce_h"])
+sql = f"SELECT {', '.join(select_parts)} FROM `{YIELD_VIEW}` ORDER BY date"
 
-    need = dict(cpi_headline=cpi_h, cpi_core=cpi_c, pce_headline=pce_h)
-    missing = [k for k,v in need.items() if v is None]
-    if missing:
-        raise ValueError(f"Inflatie-velden ontbreken: {', '.join(missing)}")
+with st.spinner("Data ophalen uit BigQuery…"):
+    df = run_query(sql, timeout=60)
+if df.empty:
+    st.warning("Geen data gevonden.")
+    st.stop()
 
-    df = df.rename(columns={cpi_h:"cpi_headline", cpi_c:"cpi_core", pce_h:"pce_headline"})
-    return df
+# ---------- Filters ----------
+topA, topB, topC = st.columns([1.2,1,1])
+with topA:
+    strict = st.toggle("Strikt filter (alle looptijden aanwezig)", value=False,
+                       help="Als uit, filtert alleen op aanwezigheid van 2Y & 10Y.")
+with topB:
+    round_dp = st.slider("Decimalen", 1, 4, 2)
+with topC:
+    show_table = st.toggle("Tabel tonen", value=False)
 
-@st.cache_data(ttl=1800)
-def load_act():
-    df = run_query(f"SELECT * FROM `{ACT_VIEW}` ORDER BY date")
-    if "date" not in df.columns:
-        raise ValueError(f"Kolom 'date' niet aanwezig in view {ACT_VIEW}")
+df_f = df.copy()
+needed = ["y_3m","y_2y","y_5y","y_10y","y_30y"]
+if strict:
+    present = [c for c in needed if c in df_f.columns]
+    if present: df_f = df_f.dropna(subset=present)
+else:
+    subset = [c for c in ["y_2y","y_10y"] if c in df_f.columns]
+    if subset: df_f = df_f.dropna(subset=subset)
 
-    ip     = best_col(df, ["industrial_production","ind_prod","ip_index"])
-    retail = best_col(df, ["retail_sales","retail","retail_index"])
-    house  = best_col(df, ["housing_starts","housing","starts"])
+if df_f.empty:
+    st.info("Na filteren geen data over.")
+    st.stop()
 
-    need = dict(industrial_production=ip, retail_sales=retail, housing_starts=house)
-    missing = [k for k,v in need.items() if v is None]
-    if missing:
-        raise ValueError(f"Activiteit-velden ontbreken: {', '.join(missing)}")
+# ---------- Quick presets + Periode ----------
+dmin = pd.to_datetime(min(df_f["date"]))
+dmax = pd.to_datetime(max(df_f["date"]))
+this_year_start = pd.Timestamp(year=dmax.year, month=1, day=1)
 
-    df = df.rename(columns={ip:"industrial_production", retail:"retail_sales", house:"housing_starts"})
-    return df
+st.subheader("Periode")
+left, right = st.columns([1.5, 1])
+with left:
+    preset = st.radio(
+        "Quick presets",
+        ["Max", "YTD", "1Y", "3Y", "5Y", "10Y", "Custom"],
+        horizontal=True,
+        index=2,  # standaard 1Y
+    )
+with right:
+    show_recessions = st.toggle("Toon US recessies (NBER)", value=True)
 
-with st.spinner("Data laden…"):
-    df_infl = load_infl()
-    df_act  = load_act()
+def clamp_start(ts: pd.Timestamp) -> pd.Timestamp:
+    return max(dmin, ts)
 
-for df in (df_infl, df_act):
-    if not np.issubdtype(df["date"].dtype, np.datetime64):
-        df["date"] = pd.to_datetime(df["date"])
+if preset == "Max":
+    start_date, end_date = dmin, dmax
+elif preset == "YTD":
+    start_date, end_date = clamp_start(this_year_start), dmax
+elif preset == "1Y":
+    start_date, end_date = clamp_start(dmax - pd.DateOffset(years=1)), dmax
+elif preset == "3Y":
+    start_date, end_date = clamp_start(dmax - pd.DateOffset(years=3)), dmax
+elif preset == "5Y":
+    start_date, end_date = clamp_start(dmax - pd.DateOffset(years=5)), dmax
+elif preset == "10Y":
+    start_date, end_date = clamp_start(dmax - pd.DateOffset(years=10)), dmax
+else:
+    # Custom slider
+    date_range = st.slider(
+        "Selecteer periode (Custom)",
+        min_value=dmin.to_pydatetime().date(),
+        max_value=dmax.to_pydatetime().date(),
+        value=(clamp_start(dmax - pd.DateOffset(years=1)).to_pydatetime().date(), dmax.to_pydatetime().date()),
+    )
+    start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
 
-# ---------------------------
-# Periode-slider over volle breedte
-# ---------------------------
-all_min = min(df_infl["date"].min(), df_act["date"].min()).date()
-all_max = max(df_infl["date"].max(), df_act["date"].max()).date()
-default_start = all_max - timedelta(days=5*365)
+mask = (pd.to_datetime(df_f["date"]) >= start_date) & (pd.to_datetime(df_f["date"]) <= end_date)
+df_range = df_f.loc[mask].copy()
+if df_range.empty:
+    st.info("Geen data in de gekozen periode.")
+    st.stop()
 
-start, end = st.slider(
-    "Periode",
-    min_value=all_min,
-    max_value=all_max,
-    value=(default_start, all_max),
-    format="YYYY-MM-DD"
+# ---------- Snapshot-keuze ----------
+st.sidebar.header("Snapshot")
+all_dates = list(df_f["date"].dropna().unique())
+sel_date = st.sidebar.selectbox("Kies datum", all_dates, index=len(all_dates)-1, format_func=str)
+snap = df_f[df_f["date"] == sel_date].tail(1)
+
+# ---------- KPI’s ----------
+def fmt_pct(x): 
+    return "—" if pd.isna(x) else f"{round(float(x), round_dp)}%"
+
+k1, k2, k3, k4, k5 = st.columns(5)
+for col, box in zip(["y_3m","y_2y","y_5y","y_10y","y_30y"], [k1,k2,k3,k4,k5]):
+    val = fmt_pct(snap[col].values[0]) if (col in snap.columns and not snap.empty) else "—"
+    box.metric(col.upper().replace("_",""), val)
+
+# Extra KPI's
+extra1, extra2 = st.columns(2)
+# 10Y–2Y nu
+if "spread_10_2" in df_f.columns:
+    latest_spread = float(df_f.dropna(subset=["spread_10_2"]).iloc[-1]["spread_10_2"])
+elif {"y_10y","y_2y"}.issubset(df_f.columns):
+    tmp = df_f.dropna(subset=["y_10y","y_2y"]).copy()
+    latest_spread = float(tmp.iloc[-1]["y_10y"] - tmp.iloc[-1]["y_2y"])
+else:
+    latest_spread = None
+extra1.metric("10Y – 2Y (nu)", "—" if latest_spread is None else f"{round(latest_spread, 2)} pp",
+              help="Positief = normale/steile curve; negatief = inversie (recessierisico).")
+
+# Dagen inverted (12m)
+inv_days = "—"
+try:
+    cutoff = dmax - pd.DateOffset(years=1)
+    df_last12 = df_f[pd.to_datetime(df_f["date"]) >= cutoff].copy()
+    if "spread_10_2" in df_last12.columns:
+        inv_days = int((df_last12["spread_10_2"] < 0).sum())
+    elif {"y_10y","y_2y"}.issubset(df_last12.columns):
+        inv_days = int((df_last12["y_10y"] - df_last12["y_2y"] < 0).sum())
+except Exception:
+    pass
+extra2.metric("Dagen inverted (12m)", inv_days,
+              help="Aantal kalenderdagen in de laatste 12 maanden dat 10Y–2Y < 0.")
+
+# ---------- Helper: Recessie-achtergrond in figuur ----------
+def add_recession_shapes(fig: go.Figure, show: bool, x_start: pd.Timestamp, x_end: pd.Timestamp):
+    if not show:
+        return fig
+    for start, end in NBER_RECESSIONS:
+        s = pd.to_datetime(start); e = pd.to_datetime(end)
+        # alleen tekenen als overlap met huidige range
+        if (e >= x_start) and (s <= x_end):
+            fig.add_vrect(
+                x0=max(s, x_start), x1=min(e, x_end),
+                fillcolor="LightGray", opacity=0.25, layer="below", line_width=0,
+            )
+    return fig
+
+# ---------- Grafieken + Uitleg (onder elkaar) ----------
+
+# 1) Term Structure (snapshot)
+st.subheader(f"Term Structure • {sel_date}")
+maturities, values = [], []
+order = [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y")]
+for col, label in order:
+    if col in snap.columns:
+        maturities.append(label)
+        values.append(snap[col].values[0] if not snap.empty else None)
+ts_fig = go.Figure()
+ts_fig.add_trace(go.Scatter(x=maturities, y=values, mode="lines+markers", name="Snapshot"))
+ts_fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Maturity")
+st.plotly_chart(ts_fig, use_container_width=True)
+st.markdown(
+    """
+**Wat je ziet:** de rentecurve (3M–30Y) op de gekozen datum.  
+**Interpretatie:**
+- *Normaal (oplopend)* → gezonde groei/verwachte inflatie.
+- *Vlak* → einde van de rente-cyclus / onzekerheid.
+- *Invers* (kort > lang) → verhoogd recessierisico.
+"""
 )
 
-def subset(df: pd.DataFrame) -> pd.DataFrame:
-    return df[(df["date"].dt.date >= start) & (df["date"].dt.date <= end)].copy()
-
-df_infl_p = subset(df_infl)
-df_act_p  = subset(df_act)
-
-st.divider()
-
-# ===========================
-# Inflatie (dual-axis)
-# ===========================
-st.subheader("Inflatie (dual-axis)")
-if df_infl_p.empty:
-    st.info("Geen inflatie-data in de gekozen periode.")
+# 2) Spreads (tijdreeks, met recessies)
+st.subheader("Spreads")
+if "spread_10_2" in df_range.columns or "spread_30_10" in df_range.columns:
+    sp = go.Figure()
+    if "spread_10_2" in df_range.columns:
+        sp.add_trace(go.Scatter(x=df_range["date"], y=df_range["spread_10_2"], name="10Y - 2Y"))
+    if "spread_30_10" in df_range.columns:
+        sp.add_trace(go.Scatter(x=df_range["date"], y=df_range["spread_30_10"], name="30Y - 10Y"))
+    sp.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Spread (pp)", xaxis_title="Date")
+    sp = add_recession_shapes(sp, show_recessions, pd.to_datetime(start_date), pd.to_datetime(end_date))
+    st.plotly_chart(sp, use_container_width=True)
 else:
-    fig = go.Figure()
+    st.info("Spreads niet beschikbaar in de view.")
+st.markdown(
+    """
+**Wat je ziet:** verschil tussen lange en kortere looptijden.  
+**Interpretatie:**
+- **10Y–2Y < 0** = inversie → historisch vaak 6–18 maanden vóór recessies.
+- Terug naar **positief** net vóór/tijdens de daadwerkelijke krimp.
+- **30Y–10Y** reflecteert vooral lange-termijn inflatiepremie/verwachtingen.
+"""
+)
 
-    # Linkeras: CPI headline + CPI core
-    fig.add_trace(go.Scatter(
-        x=df_infl_p["date"], y=df_infl_p["cpi_headline"],
-        mode="lines", name="CPI (headline)", line=dict(color=COL_BLUE, width=3)
-    ))
-    fig.add_trace(go.Scatter(
-        x=df_infl_p["date"], y=df_infl_p["cpi_core"],
-        mode="lines", name="CPI (core)", line=dict(color=COL_CYAN, width=2, dash="dash")
-    ))
+# 3) Rentes per looptijd (tijdreeks, met recessies)
+st.subheader("Rentes per looptijd (tijdreeks)")
+avail_yields = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
+default_sel = [c for c in ["y_2y","y_10y","y_30y"] if c in avail_yields] or avail_yields[:2]
+sel = st.multiselect("Selecteer looptijden", avail_yields, default=default_sel)
+if sel:
+    yf = go.Figure()
+    for col in sel:
+        yf.add_trace(go.Scatter(x=df_range["date"], y=df_range[col], name=col.upper()))
+    yf.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Date")
+    yf = add_recession_shapes(yf, show_recessions, pd.to_datetime(start_date), pd.to_datetime(end_date))
+    st.plotly_chart(yf, use_container_width=True)
+st.markdown(
+    """
+**Wat je ziet:** afzonderlijke rentecurves door de tijd (gefilterd op je periode).  
+**Interpretatie:**
+- **Stijgende 2Y** → markt prijst meer/strakker beleid.
+- **Dalende 10Y/30Y** terwijl 2Y hoog blijft → groeistress/afkoeling.
+- **Parallelle verschuiving** (alles op/af) → macro-shock (CPI, FOMC, geopolitiek).
+"""
+)
 
-    # Rechteras: PCE headline (ROOD) met dynamische schaal
-    right_range = padded_range(df_infl_p["pce_headline"])
-    fig.add_trace(go.Scatter(
-        x=df_infl_p["date"], y=df_infl_p["pce_headline"],
-        mode="lines", name="PCE (headline)", line=dict(color=COL_RED, width=2, dash="dash"),
-        yaxis="y2"
-    ))
+# 4) Heatmap (periode)
+st.subheader("Heatmap van rentes")
+hm = df_range[["date"] + avail_yields].set_index("date")
+hfig = go.Figure(data=go.Heatmap(
+    z=hm[avail_yields].T.values,
+    x=hm.index.astype(str),
+    y=[c.replace("y_","").upper() for c in avail_yields],
+    coloraxis="coloraxis"
+))
+hfig.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="Viridis")
+st.plotly_chart(hfig, use_container_width=True)
+st.markdown(
+    """
+**Wat je ziet:** kleurintensiteit van rentes per looptijd door de tijd.  
+**Interpretatie:** clusters tonen **periodes van hoge/lage rentes** en **snelle verschuivingen** (bijv. na CPI/FOMC).
+"""
+)
 
-    fig.update_layout(
-        height=420,
-        legend=dict(orientation="h"),
-        margin=dict(l=0,r=0,t=10,b=0),
-        yaxis=dict(title="Niveau (CPI)"),
-        yaxis2=dict(
-            title="Niveau (PCE)",
-            overlaying="y",
-            side="right",
-            range=right_range  # <-- dynamische schaal
-        ),
-        xaxis=dict(title="Datum")
-    )
-    st.plotly_chart(fig, use_container_width=True)
+# Tabel + download (periode)
+if show_table:
+    st.subheader("Tabel")
+    st.dataframe(df_range.sort_values("date", ascending=False).round(round_dp))
 
-    # Deltas (laatste vs vorige punt)
-    latest = df_infl_p.tail(2).copy()
-    if len(latest) >= 2:
-        last, prev = latest.iloc[-1], latest.iloc[-2]
-        c1, c2, c3 = st.columns(3)
-        add_metric_chip(c1, "CPI (headline)", float(last["cpi_headline"]), float(last["cpi_headline"] - prev["cpi_headline"]))
-        add_metric_chip(c2, "CPI (core)",     float(last["cpi_core"]),     float(last["cpi_core"]     - prev["cpi_core"]))
-        add_metric_chip(c3, "PCE (headline)", float(last["pce_headline"]), float(last["pce_headline"] - prev["pce_headline"]))
+csv = df_range.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download CSV (gefilterd op periode)", data=csv,
+                   file_name="yield_curve_filtered.csv", mime="text/csv")
 
-st.divider()
-
-# ===========================
-# Activiteit (dual-axis)
-# ===========================
-st.subheader("Activiteit (dual-axis)")
-if df_act_p.empty:
-    st.info("Geen activiteit-data in de gekozen periode.")
-else:
-    fig2 = go.Figure()
-
-    # Linkeras: Industrial production + Retail sales
-    fig2.add_trace(go.Scatter(
-        x=df_act_p["date"], y=df_act_p["industrial_production"],
-        mode="lines", name="Industrial production", line=dict(color=COL_BLUE, width=3)
-    ))
-    fig2.add_trace(go.Scatter(
-        x=df_act_p["date"], y=df_act_p["retail_sales"],
-        mode="lines", name="Retail sales", line=dict(color=COL_CYAN, width=2, dash="dash")
-    ))
-
-    # Rechteras: Housing starts (ROOD) met dynamische schaal
-    right_range2 = padded_range(df_act_p["housing_starts"])
-    fig2.add_trace(go.Scatter(
-        x=df_act_p["date"], y=df_act_p["housing_starts"],
-        mode="lines", name="Housing starts", line=dict(color=COL_RED, width=2, dash="dash"),
-        yaxis="y2"
-    ))
-
-    fig2.update_layout(
-        height=420,
-        legend=dict(orientation="h"),
-        margin=dict(l=0,r=0,t=10,b=0),
-        yaxis=dict(title="Niveau (IP / Retail)"),
-        yaxis2=dict(
-            title="Niveau (Housing starts)",
-            overlaying="y",
-            side="right",
-            range=right_range2  # <-- dynamische schaal
-        ),
-        xaxis=dict(title="Datum")
-    )
-    st.plotly_chart(fig2, use_container_width=True)
-
-    # Deltas (laatste vs vorige punt)
-    latest = df_act_p.tail(2).copy()
-    if len(latest) >= 2:
-        last, prev = latest.iloc[-1], latest.iloc[-2]
-        c1, c2, c3 = st.columns(3)
-        add_metric_chip(c1, "Industrial production", float(last["industrial_production"]), float(last["industrial_production"] - prev["industrial_production"]))
-        add_metric_chip(c2, "Retail sales",          float(last["retail_sales"]),          float(last["retail_sales"]          - prev["retail_sales"]))
-        add_metric_chip(c3, "Housing starts",        float(last["housing_starts"]),        float(last["housing_starts"]        - prev["housing_starts"]))
+with st.expander("Debug: kolommen in view"):
+    st.write(sorted(list(cols)))
