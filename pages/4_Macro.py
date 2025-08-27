@@ -14,11 +14,11 @@ st.title("Grafieken per categorie")
 DEFAULT_MACRO_VIEW = "nth-pier-468314-p7.marketdata.macro_series_wide_monthly_fill_v"
 MACRO_VIEW = st.secrets.get("tables", {}).get("macro_view", DEFAULT_MACRO_VIEW)
 
-# Kleuren (contrastrijk)
+# Kleuren
 COL_BLUE = "#2563eb"   # primaire lijn
 COL_CYAN = "#0891b2"   # secundaire (links)
 COL_RED  = "#dc2626"   # secundaire-as (rechts)
-PALETTE  = ["#2563eb","#0891b2","#dc2626","#16a34a","#9333ea","#f59e0b","#0ea5e9","#ef4444"]
+PALETTE  = ["#2563eb","#0891b2","#dc2626","#16a34a","#9333ea","#f59e0b","#0ea5e9","#ef4444","#14b8a6","#f97316"]
 
 def best_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     lower = {c.lower(): c for c in df.columns}
@@ -52,6 +52,15 @@ def add_metric_chip(col, title: str, value: float, delta: float):
         """,
         unsafe_allow_html=True,
     )
+
+def normalize_100(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    base = s.dropna().iloc[0] if s.notna().any() else np.nan
+    return s / base * 100.0 if pd.notna(base) and base != 0 else s
+
+def is_pct_like(name: str) -> bool:
+    name_l = name.lower()
+    return ("yoy" in name_l) or ("unemployment" in name_l) or name_l.endswith("_rate") or name_l.endswith("_pct")
 
 # ---------- BigQuery health ----------
 try:
@@ -121,15 +130,14 @@ if dfp.empty:
     st.info("Geen inflatie-data in de gekozen periode.")
 else:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dfp["date"], y=dfp["cpi_headline"],
+    fig.add_trace(go.Scatter(x=dfp["date"], y=pd.to_numeric(dfp["cpi_headline"], errors="coerce"),
                              mode="lines", name="CPI (headline)",
                              line=dict(color=COL_BLUE, width=3)))
-    fig.add_trace(go.Scatter(x=dfp["date"], y=dfp["cpi_core"],
+    fig.add_trace(go.Scatter(x=dfp["date"], y=pd.to_numeric(dfp["cpi_core"], errors="coerce"),
                              mode="lines", name="CPI (core)",
                              line=dict(color=COL_CYAN, width=2, dash="dash")))
-    # Rechteras (rood) met autoscaling
-    right_range = padded_range(dfp["pce_headline"])
-    fig.add_trace(go.Scatter(x=dfp["date"], y=dfp["pce_headline"],
+    right_range = padded_range(pd.to_numeric(dfp["pce_headline"], errors="coerce"))
+    fig.add_trace(go.Scatter(x=dfp["date"], y=pd.to_numeric(dfp["pce_headline"], errors="coerce"),
                              mode="lines", name="PCE (headline)",
                              line=dict(color=COL_RED, width=2, dash="dash"), yaxis="y2"))
     fig.update_layout(
@@ -151,7 +159,7 @@ else:
 
 st.divider()
 
-# ================== Activiteit (dual-axis, met autoscaling voor IP) ==================
+# ================== Activiteit (dual-axis, IP autoscale) ==================
 st.subheader("Activiteit (dual-axis)")
 if dfp.empty:
     st.info("Geen activiteit-data in de gekozen periode.")
@@ -160,22 +168,22 @@ else:
 
     # y (links): Retail sales
     fig2.add_trace(go.Scatter(
-        x=dfp["date"], y=dfp["retail_sales"], mode="lines",
-        name="Retail sales", line=dict(color=COL_CYAN, width=2, dash="dash")
+        x=dfp["date"], y=pd.to_numeric(dfp["retail_sales"], errors="coerce"),
+        mode="lines", name="Retail sales", line=dict(color=COL_CYAN, width=2, dash="dash")
     ))
 
-    # y2 (rechts): Housing starts (rood, autoscaling via range)
-    y2_range = padded_range(dfp["housing_starts"])
+    # y2 (rechts): Housing starts (rood, autoscaling)
+    y2_range = padded_range(pd.to_numeric(dfp["housing_starts"], errors="coerce"))
     fig2.add_trace(go.Scatter(
-        x=dfp["date"], y=dfp["housing_starts"], mode="lines", yaxis="y2",
-        name="Housing starts", line=dict(color=COL_RED, width=2, dash="dash")
+        x=dfp["date"], y=pd.to_numeric(dfp["housing_starts"], errors="coerce"),
+        mode="lines", name="Housing starts", line=dict(color=COL_RED, width=2, dash="dash"), yaxis="y2"
     ))
 
-    # y3 (extra links, overlay): Industrial production met EIGEN autoscale
-    y3_range = padded_range(dfp["industrial_production"])
+    # y3 (extra links overlay): Industrial production eigen schaal
+    y3_range = padded_range(pd.to_numeric(dfp["industrial_production"], errors="coerce"))
     fig2.add_trace(go.Scatter(
-        x=dfp["date"], y=dfp["industrial_production"], mode="lines", yaxis="y3",
-        name="Industrial production", line=dict(color=COL_BLUE, width=3)
+        x=dfp["date"], y=pd.to_numeric(dfp["industrial_production"], errors="coerce"),
+        mode="lines", name="Industrial production", line=dict(color=COL_BLUE, width=3), yaxis="y3"
     ))
 
     fig2.update_layout(
@@ -184,7 +192,6 @@ else:
         xaxis=dict(title="Datum"),
         yaxis=dict(title="Niveau (Retail)"),
         yaxis2=dict(title="Niveau (Housing starts)", overlaying="y", side="right", range=y2_range),
-        # y3: eigen schaal, overlapt links; we verbergen ticks om rommel te voorkomen
         yaxis3=dict(overlaying="y", side="left", range=y3_range, showticklabels=False, showgrid=False)
     )
     st.plotly_chart(fig2, use_container_width=True)
@@ -199,67 +206,77 @@ else:
 
 st.divider()
 
-# ================== Overige macro-indicatoren ==================
-st.subheader("Overige macro-indicatoren")
-# Kandidaten op basis van jouw view (excl. reeds gebruikte)
-exclude = {"date","cpi_headline","cpi_core","pce_headline","industrial_production","retail_sales","housing_starts"}
-cands = [c for c in dfp.columns if c not in exclude]
+# ================== Overige macro-indicatoren — GECLUSTerd ==================
+st.subheader("Overige macro-indicatoren (geclusterd)")
 
-# Voorzetje met veelvoorkomende velden:
-defaults_order = [c for c in ["unemployment","payrolls","init_claims","m2","m2_yoy","m2_real","m2_vel","m2_real_yoy"] if c in cands]
-sel = st.multiselect("Kies indicatoren", options=cands, default=defaults_order or cands[:4])
+# Beschikbare kolommen (excl. al getoonde)
+exclude_used = {"date","cpi_headline","cpi_core","pce_headline","industrial_production","retail_sales","housing_starts"}
+cols_available = [c for c in dfp.columns if c not in exclude_used]
 
-mode = st.radio("Weergave", ["Genormaliseerd (index = 100)", "Eigen as per serie"], horizontal=True, index=0)
+# Groepen definiëren (alleen tonen als aanwezig)
+groups = {
+    "Arbeidsmarkt": [c for c in ["unemployment","payrolls","init_claims"] if c in cols_available],
+    "Geld & Velocity": [c for c in ["m2","m2_yoy","m2_real","m2_real_yoy","m2_vel","m2_vel_yoy","m2_ma3","m2_real_ma3","m2_vel_ma3"] if c in cols_available],
+    "Overig": [c for c in cols_available if c not in {"unemployment","payrolls","init_claims","m2","m2_yoy","m2_real","m2_real_yoy","m2_vel","m2_vel_yoy","m2_ma3","m2_real_ma3","m2_vel_ma3"}]
+}
 
-if sel:
-    fig3 = go.Figure()
+# Eén instelling voor alle groepsgrafieken
+mode = st.radio("Weergave overige grafieken", ["Genormaliseerd (index = 100)", "Eigen as per serie"], horizontal=True, index=0)
+
+def render_group(title: str, cols: list[str]):
+    if not cols: 
+        return
+    st.markdown(f"### {title}")
+    fig = go.Figure()
+
     if mode.startswith("Genormaliseerd"):
-        # normaliseer op eerste waarde binnen de gefilterde periode
-        for i, col in enumerate(sel):
-            series = dfp[col].astype(float)
-            base = series.dropna().iloc[0] if series.notna().any() else np.nan
-            norm = series / base * 100.0 if pd.notna(base) and base != 0 else series
-            fig3.add_trace(go.Scatter(x=dfp["date"], y=norm, mode="lines",
-                                      name=col, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
-        fig3.update_layout(
+        for i, col in enumerate(cols):
+            series = pd.to_numeric(dfp[col], errors="coerce")
+            # pct-achtige reeksen niet normaliseren
+            y = series if is_pct_like(col) else normalize_100(series)
+            fig.add_trace(go.Scatter(
+                x=dfp["date"], y=y, mode="lines",
+                name=col, line=dict(width=2, color=PALETTE[i % len(PALETTE)])
+            ))
+        fig.update_layout(
             height=420, legend=dict(orientation="h"),
             margin=dict(l=0,r=0,t=10,b=0),
-            yaxis=dict(title="Index (=100)"),
+            yaxis=dict(title="Index (=100) / %"),
             xaxis=dict(title="Datum")
         )
     else:
-        # eigen as per serie via y, y2, y3, ...
-        for i, col in enumerate(sel):
+        # eigen as per serie (y, y2, y3, ...)
+        for i, col in enumerate(cols):
             ax_id = "" if i == 0 else str(i+1)   # y, y2, y3, ...
             ax_name = f"yaxis{ax_id}" if ax_id else "yaxis"
-            # voeg trace
-            fig3.add_trace(go.Scatter(
-                x=dfp["date"], y=dfp[col].astype(float), mode="lines",
+            series = pd.to_numeric(dfp[col], errors="coerce")
+            fig.add_trace(go.Scatter(
+                x=dfp["date"], y=series, mode="lines",
                 name=col, yaxis=f"y{ax_id}" if ax_id else "y",
                 line=dict(width=2, color=PALETTE[i % len(PALETTE)])
             ))
-            # layout voor de as
+            rng = padded_range(series)
             if i == 0:
-                fig3.update_layout(yaxis=dict(title=col, range=padded_range(dfp[col])))
+                fig.update_layout(yaxis=dict(title=col, range=rng))
             elif i == 1:
-                fig3.update_layout(yaxis2=dict(title=col, overlaying="y", side="right", range=padded_range(dfp[col])))
+                fig.update_layout(yaxis2=dict(title=col, overlaying="y", side="right", range=rng))
             else:
-                # extra assen overlappen links/rechts, zonder ticklabels
                 side = "left" if i % 2 == 0 else "right"
-                fig3["layout"][ax_name] = dict(overlaying="y", side=side, range=padded_range(dfp[col]),
-                                               showticklabels=False, showgrid=False)
+                fig["layout"][ax_name] = dict(overlaying="y", side=side, range=rng, showticklabels=False, showgrid=False)
 
-        fig3.update_layout(height=420, legend=dict(orientation="h"), margin=dict(l=0,r=0,t=10,b=0), xaxis=dict(title="Datum"))
+        fig.update_layout(height=420, legend=dict(orientation="h"), margin=dict(l=0,r=0,t=10,b=0), xaxis=dict(title="Datum"))
 
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Delta-chips voor selectie
-    last2 = dfp[sel].tail(2)
+    # Delta-chips (laatste vs vorige datapunt)
+    last2 = dfp[cols].tail(2)
     if len(last2) == 2:
-        cols = st.columns(min(5, len(sel)))
-        for i, col in enumerate(sel):
-            c = cols[i % len(cols)]
+        cols_grid = st.columns(min(5, len(cols)))
+        for i, col in enumerate(cols):
+            c = cols_grid[i % len(cols_grid)]
             l, p = float(last2[col].iloc[-1]), float(last2[col].iloc[-2])
             add_metric_chip(c, col, l, l - p)
-else:
-    st.info("Selecteer één of meer indicatoren.")
+
+# Render de groepen in vaste volgorde
+for gtitle in ["Arbeidsmarkt", "Geld & Velocity", "Overig"]:
+    render_group(gtitle, groups[gtitle])
