@@ -154,78 +154,75 @@ for col, box in zip(["y_3m","y_2y","y_5y","y_10y","y_30y"], [k1,k2,k3,k4,k5]):
 st.subheader("Signals")
 sigL, sigR = st.columns([1.3, 1])
 
-# Instelbare drempels
+# Kies regime-horizon
 with sigR:
-    st.caption("Drempels (21d Δ in basispunten)")
-    thr_steepen = st.slider("Steil/plat drempel (|Δ(10Y–2Y)|)", 5, 50, 10, step=1)
-    thr_bigmove = st.slider("Grote move per looptijd/spread", 5, 50, 15, step=1)
+    regime_horizon = st.radio("Regime-horizon", ["5d", "21d"], horizontal=True, index=1)
+    suffix = "_delta_5d_bp" if regime_horizon == "5d" else "_delta_21d_bp"
 
-# Bepaal 21d delta's
+    # Drempels per horizon (iets strakker voor 5d)
+    default_steepen = 8 if regime_horizon == "5d" else 10
+    default_bigmove = 10 if regime_horizon == "5d" else 15
+
+    st.caption(f"Drempels ({regime_horizon} Δ in basispunten)")
+    thr_steepen = st.slider("Steil/plat drempel |Δ(10Y–2Y)|", 5, 50, default_steepen, step=1)
+    thr_bigmove  = st.slider("Grote move per looptijd/spread", 5, 50, default_bigmove, step=1)
+
 def last_val(col: str):
     if col not in df_range.columns: return None
     s = df_range[col].dropna()
     return None if s.empty else float(s.iloc[-1])
 
-d21_spread = None
-if "spread_10_2_delta_21d_bp" in df_range.columns:
-    d21_spread = last_val("spread_10_2_delta_21d_bp")
-elif {"y_10y_delta_21d_bp","y_2y_delta_21d_bp"}.issubset(df_range.columns):
-    d21_spread = last_val("y_10y_delta_21d_bp")
-    if d21_spread is not None:
-        d21_spread = d21_spread - (last_val("y_2y_delta_21d_bp") or 0.0)
+# Δ(10Y–2Y) op gekozen horizon
+d_spread = None
+spread_col = f"spread_10_2{suffix}"
+if spread_col in df_range.columns:
+    d_spread = last_val(spread_col)
+elif {f"y_10y{suffix}", f"y_2y{suffix}"}.issubset(df_range.columns):
+    d10 = last_val(f"y_10y{suffix}") or 0.0
+    d2  = last_val(f"y_2y{suffix}")  or 0.0
+    d_spread = d10 - d2
 
-d21_2y  = last_val("y_2y_delta_21d_bp")
-d21_10y = last_val("y_10y_delta_21d_bp")
+# Δ’s per looptijd
+d_2y  = last_val(f"y_2y{suffix}")
+d_10y = last_val(f"y_10y{suffix}")
 
-# Huidige spread
+# Huidige spreadniveau (pp)
 if "spread_10_2" in df_f.columns:
     latest_spread = float(df_f.dropna(subset=["spread_10_2"]).iloc[-1]["spread_10_2"])
 elif {"y_10y","y_2y"}.issubset(df_f.columns):
-    tmp = df_f.dropna(subset=["y_10y","y_2y"]).copy()
+    tmp = df_f.dropna(subset=["y_10y","y_2y"])
     latest_spread = float(tmp.iloc[-1]["y_10y"] - tmp.iloc[-1]["y_2y"])
 else:
     latest_spread = None
 
-# Regime detectie
-regime = "—"
-explanation = []
-if d21_spread is not None and d21_2y is not None and d21_10y is not None:
-    if d21_spread >= thr_steepen:
-        # curve steiler
-        if d21_2y <= 0 and d21_10y >= 0:
-            regime = "✅ Bull steepening"
-            explanation.append("Kort ↓ en Lang ↑ (easing/positief voor risicobereidheid).")
-        elif d21_2y > 0 and d21_10y > 0:
-            regime = "⚠️ Bear steepening"
-            explanation.append("Beide ↑, lang harder (inflatie/term-premie).")
+# Regime-detectie
+regime = "—"; explanation = []
+if (d_spread is not None) and (d_2y is not None) and (d_10y is not None):
+    if d_spread >= thr_steepen:
+        if d_2y <= 0 and d_10y >= 0:
+            regime = "✅ Bull steepening"; explanation.append("Kort ↓ en Lang ↑ (easing/risico-on).")
+        elif d_2y > 0 and d_10y > 0:
+            regime = "⚠️ Bear steepening"; explanation.append("Beide ↑, lang harder (inflatiepremie).")
         else:
             regime = "ℹ️ Mixed steepening"
-    elif d21_spread <= -thr_steepen:
-        # curve vlakker
-        if d21_2y >= 0 and d21_10y <= 0:
-            regime = "❌ Bear flattening"
-            explanation.append("Kort ↑ en Lang ↓ (tightening/negatief voor groei).")
-        elif d21_2y < 0 and d21_10y < 0:
-            regime = "🟦 Bull flattening"
-            explanation.append("Beide ↓, lang harder (flight-to-quality/recessierisico).")
+    elif d_spread <= -thr_steepen:
+        if d_2y >= 0 and d_10y <= 0:
+            regime = "❌ Bear flattening"; explanation.append("Kort ↑ en Lang ↓ (tightening/groei-stress).")
+        elif d_2y < 0 and d_10y < 0:
+            regime = "🟦 Bull flattening"; explanation.append("Beide ↓, lang harder (flight-to-quality).")
         else:
             regime = "ℹ️ Mixed flattening"
     else:
         regime = "⏸️ Neutraal"
 
 with sigL:
-    if regime.startswith("✅"):
-        st.success(f"{regime} — Δ21d(10Y–2Y): {round(d21_spread,1)} bp", icon="✅")
-    elif regime.startswith("❌"):
-        st.error(f"{regime} — Δ21d(10Y–2Y): {round(d21_spread,1)} bp", icon="❌")
-    elif regime.startswith("⚠️"):
-        st.warning(f"{regime} — Δ21d(10Y–2Y): {round(d21_spread,1)} bp", icon="⚠️")
-    elif regime.startswith("🟦"):
-        st.info(f"{regime} — Δ21d(10Y–2Y): {round(d21_spread,1)} bp", icon="ℹ️")
-    else:
-        st.info(f"{regime} — Δ21d(10Y–2Y): {round(d21_spread or 0.0,1)} bp", icon="⏸️")
-    if explanation:
-        st.caption(" • ".join(explanation))
+    label = f"{regime} — Δ{regime_horizon}(10Y–2Y): {round(d_spread or 0.0,1)} bp"
+    if regime.startswith("✅"): st.success(label, icon="✅")
+    elif regime.startswith("❌"): st.error(label, icon="❌")
+    elif regime.startswith("⚠️"): st.warning(label, icon="⚠️")
+    elif regime.startswith("🟦"): st.info(label, icon="ℹ️")
+    else: st.info(label, icon="⏸️")
+    if explanation: st.caption(" • ".join(explanation))
 
 # Inversie-alert
 if latest_spread is not None and latest_spread < 0:
@@ -233,18 +230,18 @@ if latest_spread is not None and latest_spread < 0:
 else:
     st.caption(f"10Y–2Y = { '—' if latest_spread is None else str(round(latest_spread,2)) + ' pp' }")
 
-# Grote moves alert (21d)
+# Grote bewegingen (gekozen horizon)
 big_moves = []
 for base, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
                     ("spread_10_2","10Y–2Y"), ("spread_30_10","30Y–10Y")]:
-    col = f"{base}_delta_21d_bp"
+    col = f"{base}{suffix}"
     if col in df_range.columns:
         v = last_val(col)
         if v is not None and abs(v) >= thr_bigmove:
             big_moves.append(f"{label}: {round(v,1)} bp")
 
 if big_moves:
-    st.info("📣 Grote bewegingen laatste 21 dagen → " + " | ".join(big_moves))
+    st.info(f"📣 Grote bewegingen laatste {regime_horizon}: " + " | ".join(big_moves))
 
 # ---------- Helper recessie overlay ----------
 def add_recession_shapes(fig: go.Figure, show: bool, x_start: pd.Timestamp, x_end: pd.Timestamp):
@@ -318,9 +315,9 @@ st.header("Δ Deltas (basispunten)")
 
 # Detecteer beschikbare delta-horizons
 available_horizons = []
-for hname, suffix in HORIZONS:
-    if any([(f"{b}{suffix}" in df_range.columns) for b_alias, b in DELTA_BASES]):
-        available_horizons.append((hname, suffix))
+for hname, suffix_h in HORIZONS:
+    if any([(f"{b}{suffix_h}" in df_range.columns) for _, b in DELTA_BASES]):
+        available_horizons.append((hname, suffix_h))
 
 # 4a) Delta-matrix heatmap (laatste dag)
 try:
@@ -328,10 +325,10 @@ try:
     base_items = [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
                   ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]
     mat_labels, data_by_h = [], []
-    for hname, suffix in available_horizons:
+    for hname, suffix_h in available_horizons:
         vals, labs = [], []
         for base, label in base_items:
-            col = f"{base}{suffix}"
+            col = f"{base}{suffix_h}"
             if col in df_range.columns:
                 vals.append(last_row[col]); labs.append(label)
         if vals:
@@ -356,10 +353,10 @@ if available_horizons:
     target_cols = [colL, colR]
     base_items = [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
                   ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]
-    for idx, (hname, suffix) in enumerate(available_horizons):
+    for idx, (hname, suffix_h) in enumerate(available_horizons):
         vals, labs = [], []
         for base, label in base_items:
-            col = f"{base}{suffix}"
+            col = f"{base}{suffix_h}"
             if col in df_range.columns:
                 vals.append(last_row[col]); labs.append(label)
         if not vals: continue
@@ -375,11 +372,11 @@ st.subheader("Delta tijdreeks")
 hoptions = [h for h, _ in available_horizons] or []
 if hoptions:
     hsel = st.selectbox("Horizon", hoptions, index=0)
-    suffix = dict(available_horizons)[hsel]
+    suffix_sel = dict(available_horizons)[hsel]
     candidates, labels_map = [], {}
     for base, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
                         ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]:
-        col = f"{base}{suffix}"
+        col = f"{base}{suffix_sel}"
         if col in df_range.columns:
             candidates.append(col); labels_map[col] = f"{label} ({hsel})"
     default_pick = [c for c in candidates if c.startswith("y_10y")] or candidates[:1]
