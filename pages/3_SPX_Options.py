@@ -116,6 +116,14 @@ st.set_page_config(page_title="SPX Options Dashboard", layout="wide")
 st.title("🧩 SPX Options Dashboard")
 VIEW = "marketdata.spx_options_enriched_v"
 
+# Global Plotly config: scroll-zoom + double-click reset
+PLOTLY_CONFIG = {
+    "scrollZoom": True,       # mouse wheel zoom
+    "doubleClick": "reset",   # dbl-click auto re-scales
+    "displaylogo": False,
+    "modeBarButtonsToRemove": ["lasso2d", "select2d"]
+}
+
 # ── Basisfilters ──────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
 def load_date_bounds():
@@ -213,7 +221,7 @@ st.markdown("---")
 
 # ── Outlier-instellingen ─────────────────────────────────────────
 st.caption("Outliers kunnen de schaal verstoren. Kies een methode.")
-col_out1, col_out2 = st.columns([1.2, 1])
+col_out1, col_out2, col_out3 = st.columns([1.1, 1, 1])
 with col_out1:
     outlier_mode = st.radio(
         "Outlier-methode",
@@ -222,9 +230,14 @@ with col_out1:
     )
 with col_out2:
     pct_clip = st.slider("Percentiel clip (links/rechts)", 0, 10, 5, step=1,
-                         help="Alleen gebruikt bij 'Percentiel clip' (default 5/95).")
+                         help="Alleen gebruikt bij 'Percentiel clip' (default 5/95).",
+                         disabled=(outlier_mode != "Percentiel clip"))
+with col_out3:
+    z_thr = st.slider("Z-score drempel", 2.0, 5.0, 3.0, step=0.1,
+                      help="Alleen gebruikt bij 'Z-score filter'.",
+                      disabled=(outlier_mode != "Z-score filter"))
 
-def apply_outlier(series: pd.Series, mode: str, pct: int) -> pd.Series:
+def apply_outlier(series: pd.Series, mode: str, pct: int, zthr: float = 3.0) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").astype(float)
     if mode == "Geen":
         return s
@@ -244,8 +257,18 @@ def apply_outlier(series: pd.Series, mode: str, pct: int) -> pd.Series:
         mu, sd = np.nanmean(s), np.nanstd(s)
         if sd == 0 or np.isnan(sd): return s
         z = (s - mu) / sd
-        return s.where(np.abs(z) <= 3.0, np.nan)
+        return s.where(np.abs(z) <= zthr, np.nan)
     return s
+
+# Effect meter
+def show_cleaning_effect(raw: pd.Series, cleaned: pd.Series, label: str):
+    n = int(raw.notna().sum())
+    n_kept = int(cleaned.notna().sum())
+    if n > 0 and n_kept <= n:
+        st.caption(f"🔎 {label}: {n - n_kept} / {n} waarden geclipt/verwijderd ({(n-n_kept)/n:.1%}).")
+_ppd_raw = pd.to_numeric(df["ppd"], errors="coerce")
+_ppd_cln = apply_outlier(_ppd_raw, outlier_mode, pct_clip, z_thr)
+show_cleaning_effect(_ppd_raw, _ppd_cln, "PPD (globaal)")
 
 # ── PPD-unit toggle (points ↔︎ bp/day) ────────────────────────────
 ppd_unit = st.radio(
@@ -310,7 +333,6 @@ def choose_best_strike(df_all: pd.DataFrame, typ: str, underlying: float) -> flo
     return float(best)
 
 default_series_strike = choose_best_strike(df, sel_type, underlying_now)
-
 exps_all = exps
 target_exp = date.today() + timedelta(days=14)
 default_series_exp = pick_first_on_or_after(exps_all, target_exp) or (pick_closest_date(exps_all, target_exp) if exps_all else None)
@@ -351,7 +373,7 @@ else:
         fig_price = make_subplots(specs=[[{"secondary_y": True}]])
         fig_price.add_trace(go.Scatter(
             x=serie["snapshot_date"],
-            y=apply_outlier(serie[series_price_col], outlier_mode, pct_clip),
+            y=apply_outlier(serie[series_price_col], outlier_mode, pct_clip, z_thr),
             name="Price", mode="lines+markers", connectgaps=True
         ), secondary_y=False)
         if show_underlying:
@@ -361,18 +383,19 @@ else:
             ), secondary_y=True)
         fig_price.update_layout(
             title=f"{sel_type.upper()} {series_strike} — exp {series_exp} | Price vs SP500",
-            height=420, hovermode="x unified"
+            height=420, hovermode="x unified", dragmode="zoom"
         )
         fig_price.update_xaxes(title_text="Meetmoment")
         fig_price.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
         fig_price.update_yaxes(title_text="SP500", secondary_y=True)
-        st.plotly_chart(fig_price, use_container_width=True)
+        st.plotly_chart(fig_price, use_container_width=True, config=PLOTLY_CONFIG)
+        st.caption("💡 Zoom met scroll/pinch; dubbelklik om te resetten.")
 
     with c2:
         fig_ppd = make_subplots(specs=[[{"secondary_y": True}]])
         fig_ppd.add_trace(go.Scatter(
             x=serie["snapshot_date"],
-            y=apply_outlier(ppd_series(serie), outlier_mode, pct_clip),
+            y=apply_outlier(ppd_series(serie), outlier_mode, pct_clip, z_thr),
             name="PPD", mode="lines+markers", connectgaps=True
         ), secondary_y=False)
         if show_underlying:
@@ -382,12 +405,12 @@ else:
             ), secondary_y=True)
         fig_ppd.update_layout(
             title=f"{sel_type.upper()} {series_strike} — exp {series_exp} | PPD vs SP500",
-            height=420, hovermode="x unified"
+            height=420, hovermode="x unified", dragmode="zoom"
         )
         fig_ppd.update_xaxes(title_text="Meetmoment")
         fig_ppd.update_yaxes(title_text=ppd_y_label(), secondary_y=False, rangemode="tozero")
         fig_ppd.update_yaxes(title_text="SP500", secondary_y=True)
-        st.plotly_chart(fig_ppd, use_container_width=True)
+        st.plotly_chart(fig_ppd, use_container_width=True, config=PLOTLY_CONFIG)
         st.caption("**Interpretatie:** stijgende PPD bij gelijkblijvende DTE wijst op oplopende implied volatility of toenemende vraag naar bescherming.")
 
 # ── B) PPD & Afstand tot Uitoefenprijs ───────────────────────────
@@ -411,9 +434,9 @@ if df_last.empty:
 
 df_last["abs_dist_pct"] = ((df_last["dist_points"].abs() / df_last["underlying_price"]) * 100.0)
 df_last = df_last.assign(ppd_u=ppd_series(df_last))
-
 bins = np.arange(0, 15.25, 0.25)
 df_last["dist_bin"] = pd.cut(df_last["abs_dist_pct"], bins=bins, include_lowest=True)
+
 g = (df_last.groupby("dist_bin")
             .agg(ppd=("ppd_u","median"), n=("ppd_u","count"))
             .reset_index())
@@ -422,17 +445,36 @@ g["bin_mid"] = g["dist_bin"].apply(lambda iv: iv.mid if pd.notna(iv) else np.nan
 g = g.dropna(subset=["bin_mid"]).sort_values("bin_mid")
 g["ppd_s"] = smooth_series(g["ppd"], window=3)
 
+best_idx = g["ppd"].idxmax() if not g.empty else None
+
 fig_ppd_dist = go.Figure()
-fig_ppd_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd"],   mode="markers", name="PPD (median/bin)", opacity=0.8))
+fig_ppd_dist.add_vrect(x0=-0.5, x1=0.5, fillcolor="lightgrey",
+                       opacity=0.25, line_width=0, annotation_text="ATM-zone", annotation_position="top left")
+
+if not np.isnan(underlying_now):
+    cur_dist = abs(float(series_strike) - underlying_now) / underlying_now * 100.0
+    fig_ppd_dist.add_vline(x=cur_dist, line=dict(dash="dot"),
+                           annotation_text=f"gekozen strike ≈ {cur_dist:.2f}%", annotation_position="top right")
+
+fig_ppd_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd"],   mode="markers", name="PPD (median/bin)", opacity=0.85))
 fig_ppd_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd_s"], mode="lines",   name="Smoothed"))
+
+if best_idx is not None:
+    x_b, y_b = float(g.loc[best_idx,"bin_mid"]), float(g.loc[best_idx,"ppd"])
+    fig_ppd_dist.add_annotation(x=x_b, y=y_b, text=f"max ≈ {y_b:.2f} @ {x_b:.2f}%", showarrow=True, arrowhead=2)
+
 fig_ppd_dist.update_layout(
     title=f"PPD vs Afstand tot Strike — {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}",
     xaxis_title="Afstand tot strike (|K − S| / S, %)",
     yaxis_title=ppd_y_label(),
-    height=420
+    height=420, dragmode="zoom"
 )
-st.plotly_chart(fig_ppd_dist, use_container_width=True)
-st.caption("**Interpretatie:** PPD neemt typisch toe verder van ATM (meer extrinsic risk). Een daling aan de randen kan op dunne quotes/low-liquidity wijzen.")
+st.plotly_chart(fig_ppd_dist, use_container_width=True, config=PLOTLY_CONFIG)
+st.caption(
+    "🔎 **Hoe te gebruiken:** 0% = ATM (grijs). De curve toont mediane PPD per afstand. "
+    "Een lokale piek markeert vaak een ‘sweet spot’ voor short-premium. "
+    "De gestreepte lijn toont je huidige seriekeuze. Combineer met OI/volume om dunne quotes te vermijden."
+)
 
 # ── C) Ontwikkeling Prijs per Expiratiedatum (laatste snapshot) ───────────────
 st.subheader("Ontwikkeling Prijs per Expiratiedatum (laatste snapshot)")
@@ -443,8 +485,8 @@ exp_curve_raw = (df_last_strike
                  .agg(price=(series_price_col, "median"), ppd=("ppd_u", "median"))
                  .sort_values("expiration"))
 exp_curve = exp_curve_raw.copy()
-exp_curve["price_f"] = apply_outlier(exp_curve["price"], outlier_mode, pct_clip)
-exp_curve["ppd_f"]   = apply_outlier(exp_curve["ppd"],  outlier_mode, pct_clip)
+exp_curve["price_f"] = apply_outlier(exp_curve["price"], outlier_mode, pct_clip, z_thr)
+exp_curve["ppd_f"]   = apply_outlier(exp_curve["ppd"],  outlier_mode, pct_clip, z_thr)
 
 fig_exp = make_subplots(specs=[[{"secondary_y": True}]])
 fig_exp.add_trace(go.Scatter(x=exp_curve["expiration"], y=exp_curve["price_f"],
@@ -455,17 +497,17 @@ fig_exp.add_trace(go.Scatter(x=exp_curve["expiration"], y=exp_curve["ppd_f"],
                   secondary_y=True)
 fig_exp.update_layout(
     title=f"{sel_type.upper()} — Strike {series_strike} — peildatum {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}",
-    height=420, hovermode="x unified"
+    height=420, hovermode="x unified", dragmode="zoom"
 )
 fig_exp.update_xaxes(title_text="Expiratiedatum")
 fig_exp.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
 fig_exp.update_yaxes(title_text=ppd_y_label(), secondary_y=True)
-st.plotly_chart(fig_exp, use_container_width=True)
+st.plotly_chart(fig_exp, use_container_width=True, config=PLOTLY_CONFIG)
 st.caption("**Interpretatie:** stijgende PPD naar langere DTE = meer ‘time value per dag’; afwijkingen per datum duiden vaak op events (CPI/Fed/earnings) of smile-effects.")
 
-# ── D) PPD vs DTE ─────────────────────────────────────────────────
+# ── D) PPD vs DTE — robust scaling/log ───────────────────────────
 st.subheader("PPD vs DTE — opbouw van premium per dag")
-mode_col, atm_col, win_col, base_col = st.columns([1.2, 1, 1, 1])
+mode_col, atm_col, win_col, base_col, scale_col, log_col = st.columns([1.1, 1, 1, 1, 1, 0.8])
 with mode_col:
     ppd_mode = st.radio("Bereik", ["ATM-band (moneyness)", "Rond gekozen strike"], horizontal=False, index=0)
 with atm_col:
@@ -474,6 +516,11 @@ with win_col:
     strike_window = st.slider("Strike-venster rond gekozen strike (punten)", 10, 200, 50, step=10)
 with base_col:
     use_last_snap = st.checkbox("Gebruik alleen laatste snapshot", value=True)
+with scale_col:
+    robust_scale = st.checkbox("Robust scale (95e pct)", value=True,
+                               help="Clip y naar 95e percentiel om extreme spikes te dempen.")
+with log_col:
+    use_log_y = st.checkbox("log-y", value=False)
 
 base_df = df_last if use_last_snap else df
 if ppd_mode.startswith("ATM"):
@@ -492,10 +539,17 @@ else:
                         .sort_values("days_to_exp"))
     ppd_curve["ppd_s"] = smooth_series(ppd_curve["ppd"], window=3)
 
+    y_range = None
+    if robust_scale and ppd_curve["ppd"].notna().any():
+        hi = float(np.nanpercentile(ppd_curve["ppd"], 95))
+        lo = float(np.nanpercentile(ppd_curve["ppd"], 5))
+        pad = (hi - lo) * 0.10
+        y_range = [max(lo - pad, 0.0), hi + pad]
+
     fig_ppd_dte = go.Figure()
     fig_ppd_dte.add_trace(go.Scatter(
         x=ppd_curve["days_to_exp"], y=ppd_curve["ppd"],
-        mode="markers", name="PPD (median)", opacity=0.8
+        mode="markers", name="PPD (median)", opacity=0.85
     ))
     fig_ppd_dte.add_trace(go.Scatter(
         x=ppd_curve["days_to_exp"], y=ppd_curve["ppd_s"],
@@ -505,10 +559,16 @@ else:
         title="PPD vs Days To Expiration",
         xaxis_title="Days to Expiration",
         yaxis_title=ppd_y_label(),
-        height=420
+        height=420, dragmode="zoom"
     )
-    st.plotly_chart(fig_ppd_dte, use_container_width=True)
-    st.caption("**Interpretatie:** bij korte DTE domineert theta ⇒ hogere PPD; vlak verloop kan wijzen op lage IV of strakke quotes.")
+    if y_range: fig_ppd_dte.update_yaxes(range=y_range)
+    if use_log_y: fig_ppd_dte.update_yaxes(type="log", dtick=1)
+
+    st.plotly_chart(fig_ppd_dte, use_container_width=True, config=PLOTLY_CONFIG)
+    st.caption(
+        "🔎 **Hoe te gebruiken:** korte DTE ⇒ hoger **theta** ⇒ vaak hogere PPD; langere DTE ⇒ lagere PPD/dag maar meer totale credit. "
+        "Kies DTE waar PPD, event-risico en rol-flexibiliteit in balans zijn (bijv. 25–45 DTE voor strangles)."
+    )
 
 st.markdown("---")
 
@@ -544,7 +604,7 @@ else:
     pivot = pivot.sort_index(ascending=False).round(3)
 
     arr_raw = pivot.values.astype(float)
-    arr_clip = apply_outlier(pd.Series(arr_raw.flatten()), outlier_mode, pct_clip).values.reshape(arr_raw.shape)
+    arr_clip = apply_outlier(pd.Series(arr_raw.flatten()), outlier_mode, pct_clip, z_thr).values.reshape(arr_raw.shape)
 
     tab_hm, tab_tbl = st.tabs(["Heatmap", "Tabel (met kleur)"])
 
@@ -559,8 +619,8 @@ else:
         title_mx = f"Heatmap — {sel_type.upper()} exp {matrix_exp} — {value_col}"
         if center_on_best and not np.isnan(underlying_now):
             title_mx += f" (center rond {best_for_mx:.0f} ± {strike_window_mx})"
-        fig_mx.update_layout(title=title_mx, xaxis_title="Strike", yaxis_title="Meetmoment", height=520)
-        st.plotly_chart(fig_mx, use_container_width=True)
+        fig_mx.update_layout(title=title_mx, xaxis_title="Strike", yaxis_title="Meetmoment", height=520, dragmode="zoom")
+        st.plotly_chart(fig_mx, use_container_width=True, config=PLOTLY_CONFIG)
 
     with tab_tbl:
         scale = "Blues" if value_col in ("last_price", "mid_price") else "Oranges"
@@ -589,17 +649,17 @@ else:
         if center_on_best and not np.isnan(underlying_now):
             title_tbl += f" (center rond {best_for_mx:.0f} ± {strike_window_mx})"
         fig_tbl.update_layout(title=title_tbl, height=520)
-        st.plotly_chart(fig_tbl, use_container_width=True)
+        st.plotly_chart(fig_tbl, use_container_width=True, config=PLOTLY_CONFIG)
 
 st.markdown("---")
 
-# ── F) Extra: IV Term structure / IV Smile / PCR ──────────────────
+# ── F) Extra: IV Term structure / IV Smile ────────────────────────
 term = df.groupby("days_to_exp", as_index=False)["implied_volatility"].median().sort_values("days_to_exp")
 fig_term = go.Figure(go.Scatter(x=term["days_to_exp"], y=term["implied_volatility"],
                                 mode="lines+markers", name=f"IV {sel_type.upper()}"))
 fig_term.update_layout(title="Term Structure — Gemiddelde IV (median)", xaxis_title="DTE",
-                       yaxis_title="Implied Volatility", height=380)
-st.plotly_chart(fig_term, use_container_width=True)
+                       yaxis_title="Implied Volatility", height=380, dragmode="zoom")
+st.plotly_chart(fig_term, use_container_width=True, config=PLOTLY_CONFIG)
 
 st.subheader("IV Smile (laatste snapshot)")
 exp_for_smile = st.selectbox("Expiratie voor IV Smile", options=exps_all or [None], index=0)
@@ -610,15 +670,13 @@ else:
     sm = sm.groupby("strike", as_index=False)["implied_volatility"].median().sort_values("strike")
     fig_sm = go.Figure(go.Scatter(x=sm["strike"], y=sm["implied_volatility"], mode="lines+markers", name="IV"))
     fig_sm.update_layout(title=f"IV Smile — {sel_type.upper()} exp {exp_for_smile}",
-                         xaxis_title="Strike", yaxis_title="Implied Volatility", height=380)
-    st.plotly_chart(fig_sm, use_container_width=True)
+                         xaxis_title="Strike", yaxis_title="Implied Volatility", height=380, dragmode="zoom")
+    st.plotly_chart(fig_sm, use_container_width=True, config=PLOTLY_CONFIG)
 
 # ── G) Put/Call-ratio per expiratie (KeyError-safe) ───────────────
 st.subheader("Put/Call-ratio per expiratie")
-
 p = (df.groupby(["expiration","type"], as_index=False)
        .agg(vol=("volume","sum"), oi=("open_interest","sum")))
-
 if p.empty:
     st.info("Geen data voor PCR.")
 else:
@@ -642,13 +700,12 @@ else:
                                 subplot_titles=("PCR op Volume", "PCR op Open Interest"))
         fig_pcr.add_trace(go.Bar(x=pv.index, y=pv["PCR_vol"], name="PCR (Vol)"), row=1, col=1)
         fig_pcr.add_trace(go.Bar(x=pv.index, y=pv["PCR_oi"],  name="PCR (OI)"),  row=2, col=1)
-        fig_pcr.update_layout(height=520, title_text="Put/Call-ratio per Expiratie")
-        st.plotly_chart(fig_pcr, use_container_width=True)
+        fig_pcr.update_layout(height=520, title_text="Put/Call-ratio per Expiratie", dragmode="zoom")
+        st.plotly_chart(fig_pcr, use_container_width=True, config=PLOTLY_CONFIG)
         st.caption("**Interpretatie:** PCR↑ kan defensieve positioning (puts) signaleren; PCR↓ juist meer call-speculatie. Let op lage volumes per expiratie (ruis).")
 
 # ── H) VOL & RISK: ATM-IV, HV20, VRP, IV-Rank, Expected-Move ──────
 st.markdown("### 📊 Vol & Risk (ATM-IV, HV, VRP, IV-Rank, Expected-Move)")
-
 u_daily = (df.assign(dte=df["snapshot_date"].dt.date)
              .sort_values(["dte","snapshot_date"])
              .groupby("dte", as_index=False)
@@ -665,16 +722,9 @@ iv_hist = (df.assign(day=df["snapshot_date"].dt.date)
              .groupby("day", as_index=False)["implied_volatility"].median()
              .rename(columns={"implied_volatility":"iv"}))
 iv_1y = iv_hist.tail(252)["iv"] if not iv_hist.empty else pd.Series(dtype=float)
-if not iv_1y.empty:
-    last_iv = iv_1y.iloc[-1]
-    iv_rank = float((iv_1y <= last_iv).mean())
-else:
-    iv_rank = np.nan
+iv_rank = float((iv_1y <= iv_1y.iloc[-1]).mean()) if not iv_1y.empty else np.nan
 
-if 'series_exp' in locals() and series_exp:
-    dte_selected = int(pd.to_numeric(df_last[df_last["expiration"]==series_exp]["days_to_exp"], errors="coerce").median()) if not df_last.empty else 30
-else:
-    dte_selected = 30
+dte_selected = int(pd.to_numeric(df_last[df_last["expiration"]==series_exp]["days_to_exp"], errors="coerce").median()) if not df_last.empty else 30
 em_sigma = (underlying_now * iv_atm * math.sqrt(max(dte_selected,1)/365.0)) if not np.isnan(underlying_now) and not np.isnan(iv_atm) else np.nan
 
 colv1, colv2, colv3, colv4, colv5 = st.columns(5)
@@ -687,9 +737,8 @@ with colv5:
     st.metric("Expected Move (σ)", em_txt)
 st.caption("**VRP**>0: impliciete vol boven gerealiseerde → gunstiger voor netto **short vol**. **IV-Rank** hoog: premie dikker; check event-kalender.")
 
-# ── I) STRANGLE HELPER — σ- of Δ-doel / strikes & metrics ─────────
+# ── I) 🧠 Strangle Helper (σ/Δ) + Auto-pick ───────────────────────
 st.markdown("### 🧠 Strangle Helper (σ- of Δ-doel / quick pick)")
-
 col_mode, col_sigma, col_delta, col_price = st.columns([1.2, 1, 1, 1])
 with col_mode:
     str_sel_mode = st.radio("Selectiemodus", ["σ-doel", "Δ-doel"], index=0, horizontal=False)
@@ -702,14 +751,26 @@ with col_price:
 
 col_exp, col_smile, col_table = st.columns([1.2, 1, 1])
 with col_exp:
-    exp_list = exps_all if exps_all else ([series_exp] if 'series_exp' in locals() and series_exp else [])
-    default_exp_idx = exp_list.index(series_exp) if exp_list and ('series_exp' in locals()) and (series_exp in exp_list) else 0
+    exp_list = exps_all if exps_all else []
+    default_exp_idx = exp_list.index(series_exp) if exp_list and (series_exp in exp_list) else 0
     exp_for_str = st.selectbox("Expiratie voor strangle", options=exp_list, index=default_exp_idx if exp_list else 0)
 with col_smile:
     use_smile_iv = st.checkbox("Gebruik strike-IV (smile) voor Δ", value=False,
                                help="Zonder smile: Δ gebruikt ATM-IV voor alle strikes.")
 with col_table:
     show_table = st.checkbox("Toon details tabel", value=False)
+
+# Quick auto-pick knoppen & uitleg
+auto_cols = st.columns([1, 1, 2])
+with auto_cols[0]:
+    if st.button("🔮 Auto-pick (σ-doel)"):
+        str_sel_mode = "σ-doel"
+with auto_cols[1]:
+    if st.button("🎯 Auto-pick (Δ-doel)"):
+        str_sel_mode = "Δ-doel"
+with auto_cols[2]:
+    st.caption("Tip: kies eerst **Expiratie**, klik dan op een **Auto-pick** om strikes te laten invullen. "
+               "Heb je niets in beeld? Probeer een andere expiratie of check of er ticks zijn voor dit snapshot.")
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_strangle_slice(expiration, snap_min):
@@ -822,10 +883,10 @@ if show_table and not df_str.empty:
     st.dataframe(df_str.sort_values(["type","strike"])[show_cols], use_container_width=True)
 
 verdict = []
-if 'iv_rank' in locals() and not np.isnan(iv_rank):
+if not np.isnan(iv_rank):
     if iv_rank >= 0.7: verdict.append("IV-Rank **hoog** → premie-verkopen aantrekkelijker (events checken).")
     elif iv_rank <= 0.3: verdict.append("IV-Rank **laag** → premie lager; overweeg smaller of kalender.")
-if 'hv_percent' in locals() and 'iv_atm' in locals() and not np.isnan(hv_percent) and not np.isnan(iv_atm):
+if (not np.isnan(hv_percent)) and (not np.isnan(iv_atm)):
     if (iv_atm - hv_percent) > 0.03: verdict.append("**VRP** positief → kans op mean-reversion van vol (goed voor short premium).")
     elif (iv_atm - hv_percent) < -0.01: verdict.append("**VRP** negatief → voorzichtig met netto short-vol.")
 if not np.isnan(p_both_touch_approx):
@@ -834,10 +895,14 @@ if not np.isnan(p_both_touch_approx):
 if verdict:
     st.markdown("- " + "\n- ".join(verdict))
 
-# ── K) 💳 Margin & Sizing — risk-budget → # contracts, credit/risk ────────────
+# ── J) 💳 Margin & Sizing ─────────────────────────────────────────
+ready_for_sizing = (not any(np.isnan(x) for x in [underlying_now])) and \
+                   ('target_put' in locals()) and ('target_call' in locals()) and \
+                   (not np.isnan(target_put)) and (not np.isnan(target_call))
+
 st.markdown("### 💳 Margin & Sizing")
-if any(np.isnan(x) for x in [underlying_now]) or 'target_put' not in locals() or 'target_call' not in locals() or np.isnan(target_put) or np.isnan(target_call):
-    st.info("⚠️ Kies eerst strikes in de Strangle Helper (σ of Δ), dan verschijnt sizing & payoff hier.")
+if not ready_for_sizing:
+    st.info("Kies eerst **strikes** in de *Strangle Helper* (σ of Δ). Gebruik desnoods de **Auto-pick** knoppen.")
 else:
     colm1, colm2, colm3, colm4 = st.columns([1.1, 1, 1, 1])
     with colm1:
@@ -871,7 +936,7 @@ else:
 
     tot_credit_cash = (float(total_credit) if not np.isnan(total_credit) else 0.0) * multiplier
     credit_per_margin = (tot_credit_cash / est_margin) if est_margin > 0 else np.nan
-    ppd_total = (float(total_credit) / max(dte_exp,1)) if ('dte_exp' in locals() and not np.isnan(dte_exp) and not np.isnan(total_credit)) else np.nan
+    ppd_total = (float(total_credit) / max(dte_exp,1)) if (not np.isnan(dte_exp) and not np.isnan(total_credit)) else np.nan
     ppd_per_margin = ((ppd_total * multiplier) / est_margin) if (est_margin > 0 and not np.isnan(ppd_total)) else np.nan
 
     cmet1, cmet2, cmet3, cmet4 = st.columns(4)
@@ -899,13 +964,13 @@ else:
         fig_pay.add_vline(x=be_high, line=dict(dash="dot"), annotation_text=f"BE high ≈ {be_high:.0f}")
         fig_pay.update_layout(title=f"Payoff @ Expiry (P {target_put:.0f} / C {target_call:.0f} | credit {total_credit:.2f} pts)",
                               xaxis_title="S (onderliggende)", yaxis_title=f"PNL (1x, multiplier {multiplier})",
-                              height=420)
-        st.plotly_chart(fig_pay, use_container_width=True)
+                              height=420, dragmode="zoom")
+        st.plotly_chart(fig_pay, use_container_width=True, config=PLOTLY_CONFIG)
 
-# ── L) 🔄 Roll-simulator — out / wider / later ────────────────────────────────
+# ── K) 🔄 Roll-simulator ──────────────────────────────────────────
 st.markdown("### 🔄 Roll-simulator (uitrollen / herpositioneren)")
-if any(np.isnan(x) for x in [underlying_now]) or 'target_put' not in locals() or 'target_call' not in locals() or np.isnan(target_put) or np.isnan(target_call) or df_str.empty:
-    st.info("⚠️ Kies eerst een strangle in de Strangle Helper; dan kun je rollen simuleren.")
+if not ready_for_sizing or df_str.empty:
+    st.info("Selecteer eerst een strangle in de *Strangle Helper*. Daarna kun je rollen simuleren.")
 else:
     colr1, colr2, colr3 = st.columns([1.2, 1.0, 1.0])
     with colr1:
@@ -1016,15 +1081,35 @@ else:
                 concl.append("σ-afstand **verbetert** op ≥1 zijde (meer buffer).")
             st.markdown("- " + "\n- ".join(concl) if concl else "_Geen duidelijke conclusie; pas targets aan._")
 
-# ── J) VIX vs IV (gem.) ───────────────────────────────────────────
+# ── L) VIX vs IV (grotere y-range + smooth) ───────────────────────
 vix_vs_iv = (df.assign(snap_date=df["snapshot_date"].dt.date)
                .groupby("snap_date", as_index=False)
                .agg(vix=("vix","median"), iv=("implied_volatility","median"))
                .rename(columns={"snap_date":"date"}))
 if not vix_vs_iv.empty:
+    smooth_vix = st.checkbox("Smooth (7d)", value=False, help="Eenvoudige rollende mediane smoothing.")
+    if smooth_vix and len(vix_vs_iv) >= 3:
+        vix_vs_iv["vix_s"] = vix_vs_iv["vix"].rolling(7, min_periods=1, center=True).median()
+        vix_vs_iv["iv_s"]  = vix_vs_iv["iv"].rolling(7, min_periods=1, center=True).median()
+        vix_plot_vix = vix_vs_iv["vix_s"]
+        vix_plot_iv  = vix_vs_iv["iv_s"]
+    else:
+        vix_plot_vix = vix_vs_iv["vix"]
+        vix_plot_iv  = vix_vs_iv["iv"]
+
+    y_min = float(min(vix_plot_vix.min(), vix_plot_iv.min()))
+    y_max = float(max(vix_plot_vix.max(), vix_plot_iv.max()))
+    pad = (y_max - y_min) * 0.15 if y_max > y_min else 0.05
+
     fig_vix = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
                             subplot_titles=("VIX", "Gemiddelde IV"))
-    fig_vix.add_trace(go.Scatter(x=vix_vs_iv["date"], y=vix_vs_iv["vix"], mode="lines", name="VIX"), row=1, col=1)
-    fig_vix.add_trace(go.Scatter(x=vix_vs_iv["date"], y=vix_vs_iv["iv"], mode="lines", name="IV"), row=2, col=1)
-    fig_vix.update_layout(height=520, title_text=f"VIX vs IV ({sel_type.upper()})")
-    st.plotly_chart(fig_vix, use_container_width=True)
+    fig_vix.add_trace(go.Scatter(x=vix_vs_iv["date"], y=vix_plot_vix, mode="lines+markers", name="VIX"), row=1, col=1)
+    fig_vix.add_trace(go.Scatter(x=vix_vs_iv["date"], y=vix_plot_iv,  mode="lines+markers", name="IV"),  row=2, col=1)
+    fig_vix.update_yaxes(range=[y_min - pad, y_max + pad], row=1, col=1)
+    fig_vix.update_yaxes(range=[y_min - pad, y_max + pad], row=2, col=1)
+    fig_vix.update_layout(height=560, title_text=f"VIX vs IV ({sel_type.upper()})", dragmode="zoom")
+    st.plotly_chart(fig_vix, use_container_width=True, config=PLOTLY_CONFIG)
+
+# ── Tip: algemene zoom-uitleg ─────────────────────────────────────
+st.caption("🔍 **Navigatie-tip:** je kunt overal in- en uitzoomen met de muis/trackpad (scroll of pinch). "
+           "Dubbelklik in een grafiek om automatisch te rescalen.")
