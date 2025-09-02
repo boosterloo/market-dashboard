@@ -4,10 +4,10 @@ import numpy as np
 import pandas as pd
 import math
 import re
+from math import floor, ceil
+from typing import Optional
 from datetime import date, datetime, timedelta
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from typing import Optional
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -44,11 +44,8 @@ def greeks(S, K, T, r, q, sigma, is_call=True):
     d1, d2 = d1_d2(S, K, T, r, q, sigma)
     if np.isnan(d1):
         return {k: np.nan for k in ["delta","gamma","vega","theta","rho","vanna","vomma","speed","zomma","charm","color"]}
-    phi = norm_pdf(d1)
-    Nd1 = norm_cdf(d1)
-    Nd2 = norm_cdf(d2)
-    disc_q = math.exp(-q * T)
-    disc_r = math.exp(-r * T)
+    phi = norm_pdf(d1); Nd1 = norm_cdf(d1); Nd2 = norm_cdf(d2)
+    disc_q = math.exp(-q * T); disc_r = math.exp(-r * T)
 
     if is_call:
         delta = disc_q * Nd1
@@ -58,24 +55,29 @@ def greeks(S, K, T, r, q, sigma, is_call=True):
         rho   = -T * disc_r * norm_cdf(-d2)
 
     gamma = disc_q * phi / (S * sigma * math.sqrt(T))
-    vega  = S * disc_q * phi * math.sqrt(T)
-
+    vega  = S * disc_q * phi * math.sqrt(T)  # absolute per 1.00 volpunt
     term1 = -(S * disc_q * phi * sigma) / (2.0 * math.sqrt(T))
-    if is_call:
-        theta = term1 - r * (K * disc_r) * norm_cdf(d2) + q * (S * disc_q) * norm_cdf(d1)
-    else:
-        theta = term1 + r * (K * disc_r) * norm_cdf(-d2) - q * (S * disc_q) * norm_cdf(-d1)
+    theta = term1 - r*(K*disc_r)*norm_cdf(d2) + q*(S*disc_q)*norm_cdf(d1) if is_call \
+            else term1 + r*(K*disc_r)*norm_cdf(-d2) - q*(S*disc_q)*norm_cdf(-d1)
 
-    vanna = disc_q * phi * math.sqrt(T) * (1.0 - d1 / (sigma * math.sqrt(T)))
-    vomma = vega * d1 * d2 / sigma  # aka volga
-    speed = -gamma / S * (1 + d1 / (sigma * math.sqrt(T)))
-    zomma = gamma * (d1 * d2 - 1) / sigma
+    vanna = disc_q * phi * math.sqrt(T) * (1.0 - d1/(sigma*math.sqrt(T)))
+    vomma = vega * d1 * d2 / sigma
+    speed = -gamma / S * (1 + d1/(sigma*math.sqrt(T)))
+    zomma = gamma * (d1*d2 - 1) / sigma
     charm = disc_q * (phi * (2*(r - q)*T - d2*sigma*math.sqrt(T)) / (2*T*sigma*math.sqrt(T))) \
             - (q * disc_q * (Nd1 if is_call else (Nd1 - 1)))
     color = -disc_q * (phi / (2*S*T*sigma*math.sqrt(T))) * (1 + (2*(r - q)*T - d1*sigma*math.sqrt(T)) * d1)
 
     return dict(delta=delta, gamma=gamma, vega=vega, theta=theta, rho=rho,
                 vanna=vanna, vomma=vomma, speed=speed, zomma=zomma, charm=charm, color=color)
+
+def bs_price(S, K, T, r, q, sigma, is_call=True):
+    d1, d2 = d1_d2(S, K, T, r, q, sigma)
+    if np.isnan(d1): return np.nan
+    disc_q = math.exp(-q*T); disc_r = math.exp(-r*T)
+    if is_call:
+        return S*disc_q*norm_cdf(d1) - K*disc_r*norm_cdf(d2)
+    return K*disc_r*norm_cdf(-d2) - S*disc_q*norm_cdf(-d1)
 
 def best_px(row):
     for col in ("mid_price","last_price","bid","ask"):
@@ -167,10 +169,8 @@ if df.empty:
     st.stop()
 
 snapshots = sorted(df["snap_m"].unique())
-if snap_pick_mode == "Kies exact":
-    sel_snapshot = st.selectbox("Kies snapshot (min-resolution)", options=snapshots, index=len(snapshots)-1, format_func=lambda x: pd.to_datetime(x).strftime("%Y-%m-%d %H:%M"))
-else:
-    sel_snapshot = snapshots[-1]
+sel_snapshot = st.selectbox("Kies snapshot (min-resolution)", options=snapshots, index=len(snapshots)-1,
+                            format_func=lambda x: pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")) if snap_pick_mode=="Kies exact" else snapshots[-1]
 
 df_s = df[df["snap_m"] == sel_snapshot].copy()
 if df_s.empty:
@@ -182,7 +182,8 @@ exps = sorted(df_s["expiration"].unique().tolist())
 
 colE1, colE2 = st.columns([1,1])
 with colE1:
-    exp_choice = st.selectbox("Expiratie", options=exps, index=min(range(len(exps)), key=lambda i: abs(int(df_s[df_s["expiration"]==exps[i]]["days_to_exp"].median()) - dte_pick)) if exps else 0)
+    exp_choice = st.selectbox("Expiratie", options=exps,
+        index=min(range(len(exps)), key=lambda i: abs(int(df_s[df_s["expiration"]==exps[i]]["days_to_exp"].median()) - dte_pick)) if exps else 0)
 with colE2:
     liq_min_oi = st.slider("Min OI (filter)", 0, 50, 1, step=1)
 
@@ -207,8 +208,6 @@ def _first_elem(x):
     arr = np.atleast_1d(x)
     return float(arr[0]) if len(arr) else np.nan
 
-# ---- directe fallback op YIELD_VIEW als helper faalt ----
-
 def _parse_tenor_years(col_name: str) -> Optional[float]:
     """
     Verwacht kolomnamen als 'y_3m', 'y_6m', 'y_1y', 'y_2y', 'y_10y', 'y_30y'.
@@ -216,19 +215,13 @@ def _parse_tenor_years(col_name: str) -> Optional[float]:
     """
     m = re.fullmatch(r"y_(\d+)(m|y)", col_name)
     if not m:
-        # tolerant voor 'y_3mo', 'y_1yr'
         m = re.fullmatch(r"y_(\d+)(mo|yr|y)", col_name)
         if not m:
             return None
-        unit = m.group(2)
-        n = float(m.group(1))
-        if unit in ("mo", "m"):
-            return n / 12.0
-        return n
-    n = float(m.group(1))
-    unit = m.group(2)
-    return n / 12.0 if unit == "m" else n
-
+        unit = m.group(2); n = float(m.group(1))
+        return n/12.0 if unit in ("mo","m") else n
+    n = float(m.group(1)); unit = m.group(2)
+    return n/12.0 if unit == "m" else n
 
 def _get_latest_yield_row(view: str, snap_dt: datetime) -> Optional[pd.Series]:
     d = pd.to_datetime(snap_dt).date()
@@ -254,7 +247,6 @@ def _get_latest_yield_row(view: str, snap_dt: datetime) -> Optional[pd.Series]:
         pass
     return None
 
-
 def _interpolate_simple_rate_from_row(row: pd.Series, T_years: float) -> float:
     """
     Retourneert een float (kan NaN zijn via float('nan')).
@@ -263,7 +255,7 @@ def _interpolate_simple_rate_from_row(row: pd.Series, T_years: float) -> float:
     for col in row.index:
         if isinstance(col, str) and col.startswith("y_"):
             yrs = _parse_tenor_years(col)
-            if yrs is None:
+            if yrs is None: 
                 continue
             try:
                 r = float(row[col])
@@ -271,61 +263,41 @@ def _interpolate_simple_rate_from_row(row: pd.Series, T_years: float) -> float:
                     tenors.append((yrs, r))
             except Exception:
                 continue
-
     if not tenors:
         return float("nan")
-
     tenors.sort(key=lambda x: x[0])
-    xs = np.array([t for t, _ in tenors], dtype=float)
-    ys = np.array([r for _, r in tenors], dtype=float)
-
-    # clamp of lineaire interpolatie
-    if T_years <= xs[0]:
-        return float(ys[0])
-    if T_years >= xs[-1]:
-        return float(ys[-1])
+    xs = np.array([t for t,_ in tenors], dtype=float)
+    ys = np.array([r for _,r in tenors], dtype=float)
+    if T_years <= xs[0]: return float(ys[0])
+    if T_years >= xs[-1]: return float(ys[-1])
     i = int(np.searchsorted(xs, T_years))
-    x0, x1 = xs[i - 1], xs[i]
-    y0, y1 = ys[i - 1], ys[i]
-    w = (T_years - x0) / (x1 - x0) if x1 != x0 else 0.0
-    return float(y0 + w * (y1 - y0))
+    x0,x1 = xs[i-1], xs[i]; y0,y1 = ys[i-1], ys[i]
+    w = (T_years - x0)/(x1 - x0) if x1!=x0 else 0.0
+    return float(y0 + w*(y1 - y0))
 
 def fetch_r_simple_from_curve(sel_snapshot, T_years, view) -> float:
     """
-    1) Probeer utils.rates.get_r_curve_for_snapshot (vier signatures).
-    2) Bij eender welke Exception (incl. BadRequest): query rechtstreeks de YIELD_VIEW
-       en interpoleer lineair tussen aanwezige y_* kolommen.
-    Retourneert r (simple, p.j.) of np.nan.
+    1) Probeer utils.rates.get_r_curve_for_snapshot (diverse signatures).
+    2) Bij Exception (incl. BadRequest): query rechtstreeks de YIELD_VIEW en interpoleer lineair.
+    Retourneert r (simple p.j.) als float (kan NaN zijn).
     """
-    dt = pd.to_datetime(sel_snapshot)
-    Tarr = np.array([T_years], dtype=float)
-
-    # Stap 1: helper proberen (vang alles af, niet alleen TypeError)
-    try:
-        r = get_r_curve_for_snapshot(dt, Tarr, view, "simple")
-        return _first_elem(r)
-    except Exception:
-        pass
-    try:
-        r = get_r_curve_for_snapshot(snapshot_date=dt, T_years=Tarr, view=view, compounding="simple")
-        return _first_elem(r)
-    except Exception:
-        pass
-    try:
-        r = get_r_curve_for_snapshot(dt, Tarr, view)
-        return _first_elem(r)
-    except Exception:
-        pass
-    try:
-        r = get_r_curve_for_snapshot(snapshot_date=dt, T_years=Tarr, view=view, compounding_in="simple")
-        return _first_elem(r)
-    except Exception:
-        pass
-
-    # Stap 2: direct uit view
+    dt = pd.to_datetime(sel_snapshot); Tarr = np.array([T_years], dtype=float)
+    # helper varianten
+    for kwargs in [
+        dict(args=(dt, Tarr, view, "simple"), kw=None),
+        dict(args=(), kw=dict(snapshot_date=dt, T_years=Tarr, view=view, compounding="simple")),
+        dict(args=(dt, Tarr, view), kw=None),
+        dict(args=(), kw=dict(snapshot_date=dt, T_years=Tarr, view=view, compounding_in="simple")),
+    ]:
+        try:
+            r = get_r_curve_for_snapshot(*kwargs["args"]) if kwargs["kw"] is None else get_r_curve_for_snapshot(**kwargs["kw"])
+            return _first_elem(r)
+        except Exception:
+            pass
+    # fallback direct uit view
     row = _get_latest_yield_row(view, dt)
     if row is None:
-        return np.nan
+        return float("nan")
     return _interpolate_simple_rate_from_row(row, float(T_years))
 
 # r(T)
@@ -413,12 +385,12 @@ if iv_source == "Term+Smile (bivariaat)":
     if len(term) >= 2:
         dte_arr = term["days_to_exp"].values.astype(float)
         ivt_arr = term["implied_volatility"].values.astype(float)
-        def iv_term(dte):
-            if dte <= dte_arr[0]: return float(ivt_arr[0])
-            if dte >= dte_arr[-1]: return float(ivt_arr[-1])
-            j = np.searchsorted(dte_arr, dte)
+        def iv_term(d):
+            if d <= dte_arr[0]: return float(ivt_arr[0])
+            if d >= dte_arr[-1]: return float(ivt_arr[-1])
+            j = np.searchsorted(dte_arr, d)
             x0,x1 = dte_arr[j-1], dte_arr[j]; y0,y1 = ivt_arr[j-1], ivt_arr[j]
-            u = (dte - x0)/(x1 - x0) if x1!=x0 else 0.0
+            u = (d - x0)/(x1 - x0) if x1!=x0 else 0.0
             return float(y0 + u*(y1 - y0))
         iv_T = iv_term(dte)
     else:
@@ -431,7 +403,7 @@ def iv_func(K):
         return iv_atm
     elif iv_source == "Smile (strike-interp)":
         return iv_from_smile(K)
-    else:  # Term+Smile
+    else:  # Term+Smile tilt
         base_k = iv_from_smile(K)
         return float(base_k + (iv_T - iv_atm))
 
@@ -473,7 +445,6 @@ st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
 # ─────────────────────────── 2D slices ————————————————
 st.markdown("### 2D Slices")
-from math import floor, ceil
 S_min_i, S_max_i = int(floor(S_min)), int(ceil(S_max))
 K_min_i, K_max_i = int(floor(K_grid.min())), int(ceil(K_grid.max()))
 
@@ -521,5 +492,94 @@ with c2: st.metric("DTE", f"{dte}")
 with c3: st.metric("ATM-IV", f"{iv_atm:.2%}")
 with c4: st.metric("q (cont.)", f"{q_cont:.2%}")
 
-st.caption("Tip: kies **Term+Smile** om te zien hoe Δ/Γ/Vega-velden verschuiven wanneer de term structure steiler/vlakker is. "
-           "Gebruik de r/q-toggels om carry-effecten (discount/dividend) te testen.")
+# ─────────────────────────── Actie-kaarten (advies & trade hints) —————————
+st.markdown("### 📌 Interpretatie & Advies")
+
+def find_strike_for_delta(target_abs_delta: float, is_call_leg: bool) -> float:
+    """
+    Zoek K in K_grid waar |delta| ~ target_abs_delta bij S=spot.
+    """
+    Ks = np.linspace(K_grid.min(), K_grid.max(), 301)
+    deltas = []
+    for K in Ks:
+        sig = float(max(1e-6, iv_func(K)))
+        g = greeks(underlying_now, float(K), T, r_cont, q_cont, sig, is_call=is_call_leg)
+        deltas.append(g["delta"])
+    deltas = np.array(deltas, dtype=float)
+    if is_call_leg:
+        mask = deltas >= 0  # calls hebben positieve delta
+        candidates = np.where(mask)[0]
+    else:
+        mask = deltas <= 0  # puts negatieve delta
+        candidates = np.where(mask)[0]
+    if candidates.size == 0:
+        return float(Ks[np.argmin(np.abs(np.abs(deltas) - target_abs_delta))])
+    # beste index (min |abs(delta)-target|)
+    idx = np.argmin(np.abs(np.abs(deltas[candidates]) - target_abs_delta))
+    return float(Ks[candidates[idx]])
+
+# Suggestie: Δ ≈ 0.15 per been
+target_delta = 0.15
+K_call = find_strike_for_delta(target_delta, is_call_leg=True)
+K_put  = find_strike_for_delta(target_delta, is_call_leg=False)
+
+# Greeks & prijzen op de voorgestelde strikes (bij S=spot)
+def leg_summary(K: float, is_call_leg: bool) -> dict:
+    sig = float(max(1e-6, iv_func(K)))
+    g = greeks(underlying_now, K, T, r_cont, q_cont, sig, is_call=is_call_leg)
+    price = bs_price(underlying_now, K, T, r_cont, q_cont, sig, is_call=is_call_leg)
+    side = "Call" if is_call_leg else "Put"
+    return dict(side=side, K=int(round(K)), sigma=sig, price=price,
+                delta=g["delta"], gamma=g["gamma"], vega=g["vega"], theta=g["theta"],
+                vomma=g["vomma"], charm=g["charm"], color=g["color"])
+
+call_leg = leg_summary(K_call, True)
+put_leg  = leg_summary(K_put,  False)
+
+# Quick interpretation
+st.info(f"""
+**Advies bij deze setup (exp {exp_choice}, DTE≈{dte}):**
+- **Spot**: {underlying_now:.0f} — **ATM-IV**: {iv_atm:.1%} — **IV-bron**: {iv_source}
+- **Gamma-landschap**: kies strikes in de vlakkere zones rond ±{strike_band} punten; dat geeft rustiger P&L.
+- **Voorstel short strangle**: **P {put_leg['K']}** & **C {call_leg['K']}** (Δ≈0.15 per been).
+- **Vega (per been @ entry)**: call ~{call_leg['vega']:.0f}, put ~{put_leg['vega']:.0f}. 
+- **Charm**: {'positief' if (call_leg['charm']+put_leg['charm'])/2 > 0 else 'negatief'} → delta neigt {'neutraler' if (call_leg['charm']+put_leg['charm'])/2 > 0 else 'sneller weg te lopen'} in de tijd.
+""")
+
+# Trade hints
+vega_hint_lvl = abs(call_leg["vega"]) + abs(put_leg["vega"])
+vomma_hint_lvl = abs(call_leg["vomma"]) + abs(put_leg["vomma"])
+color_hint_lvl = abs(call_leg["color"]) + abs(put_leg["color"])
+gamma_spot_risk = (abs(call_leg["gamma"]) + abs(put_leg["gamma"])) * underlying_now
+
+st.subheader("💡 Trade Hints")
+st.markdown(f"""
+- **Strikes**: Put **{put_leg['K']}** / Call **{call_leg['K']}**  (Δ≈0.15).  
+- **Roll-trigger**: als Δ van 1 been > **0.30** of **Γ·S** > **0.25%** van notional per 1% S-move → rol ±200p van spot en herbalanceer.  
+- **Profit-taking**: sluit bij ~**50% premie-erosie** of na duidelijke **vol-crush**.  
+- **Event-check**: bij **IV-tilt** (iv_T – ATM-IV) > ~3–5 volpunten → **reduceer size** of **hedge Vega** (bijv. VIX-calls).
+""")
+
+# Signalen / warnings
+if iv_atm > 0.25:
+    st.warning("⚠️ Hoge ATM-IV (>25%). Short premium extra gevoelig — overweeg kleinere size of spreads (iron condor).")
+
+if (iv_T - iv_atm) > 0.05:
+    st.warning(f"⚠️ Steile term structure: iv_T − ATM ≈ {(iv_T - iv_atm):.1%}. Vega-risico neemt toe rond events.")
+
+if gamma_spot_risk > 0.0025:
+    st.warning(f"⚠️ Γ·S @ spot ≈ {gamma_spot_risk:.4f} (>0.25%). Overweeg strikes verder of kleinere size.")
+
+if vomma_hint_lvl > 2 * vega_hint_lvl:
+    st.caption("ℹ️ Hoge **Vomma** t.o.v. Vega → je Vega verandert sterk bij IV-schok. Let op post-event gedrag.")
+
+# Trade ticket tabel
+st.markdown("#### 🧾 Trade Ticket (indicatief, Black-Scholes, cont.r/q)")
+tt = pd.DataFrame([
+    {"Been": put_leg["side"],  "Strike": put_leg["K"],  "Δ": round(put_leg["delta"],3), "Γ": f"{put_leg['gamma']:.2e}",
+     "Vega": round(put_leg["vega"],1), "Θ": round(put_leg["theta"],2), "IV": f"{put_leg['sigma']:.2%}", "Modelprijs": round(put_leg["price"],2)},
+    {"Been": call_leg["side"], "Strike": call_leg["K"], "Δ": round(call_leg["delta"],3), "Γ": f"{call_leg['gamma']:.2e}",
+     "Vega": round(call_leg["vega"],1), "Θ": round(call_leg["theta"],2), "IV": f"{call_leg['sigma']:.2%}", "Modelprijs": round(call_leg["price"],2)},
+])
+st.dataframe(tt, use_container_width=True)
+st.caption("Indicatief; gebruik je ketting-prijzen voor werkelijke mid/bid/ask. Roll-/risk-triggers zijn heuristieken; tune ze op jouw stijl.")
