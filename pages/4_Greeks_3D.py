@@ -7,6 +7,7 @@ import re
 from datetime import date, datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from typing import Optional
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -207,26 +208,29 @@ def _first_elem(x):
     return float(arr[0]) if len(arr) else np.nan
 
 # ---- directe fallback op YIELD_VIEW als helper faalt ----
-def _parse_tenor_years(col_name: str) -> float | None:
+
+def _parse_tenor_years(col_name: str) -> Optional[float]:
     """
     Verwacht kolomnamen als 'y_3m', 'y_6m', 'y_1y', 'y_2y', 'y_10y', 'y_30y'.
     Geeft tenor in jaren terug (0.25, 0.5, 1, 2, 10, 30, ...).
     """
     m = re.fullmatch(r"y_(\d+)(m|y)", col_name)
-    if not m: 
-        # probeer bijv. 'y_3mo' of 'y_1yr' tolerant
+    if not m:
+        # tolerant voor 'y_3mo', 'y_1yr'
         m = re.fullmatch(r"y_(\d+)(mo|yr|y)", col_name)
         if not m:
             return None
         unit = m.group(2)
         n = float(m.group(1))
-        if unit in ("mo","m"):
-            return n/12.0
+        if unit in ("mo", "m"):
+            return n / 12.0
         return n
-    n = float(m.group(1)); unit = m.group(2)
-    return n/12.0 if unit == "m" else n
+    n = float(m.group(1))
+    unit = m.group(2)
+    return n / 12.0 if unit == "m" else n
 
-def _get_latest_yield_row(view: str, snap_dt: datetime) -> pd.Series | None:
+
+def _get_latest_yield_row(view: str, snap_dt: datetime) -> Optional[pd.Series]:
     d = pd.to_datetime(snap_dt).date()
     # Probeer kolom 'date'
     try:
@@ -250,26 +254,30 @@ def _get_latest_yield_row(view: str, snap_dt: datetime) -> pd.Series | None:
         pass
     return None
 
-def _interpolate_simple_rate_from_row(row: pd.Series, T_years: float) -> float | np.nan:
-    # pak alle y_* kolommen
+
+def _interpolate_simple_rate_from_row(row: pd.Series, T_years: float) -> float:
+    """
+    Retourneert een float (kan NaN zijn via float('nan')).
+    """
     tenors = []
     for col in row.index:
         if isinstance(col, str) and col.startswith("y_"):
             yrs = _parse_tenor_years(col)
-            if yrs is None: 
+            if yrs is None:
                 continue
-            val = row[col]
             try:
-                r = float(val)
+                r = float(row[col])
                 if not np.isnan(r):
                     tenors.append((yrs, r))
             except Exception:
                 continue
+
     if not tenors:
-        return np.nan
+        return float("nan")
+
     tenors.sort(key=lambda x: x[0])
-    xs = np.array([t for t,_ in tenors], dtype=float)
-    ys = np.array([r for _,r in tenors], dtype=float)
+    xs = np.array([t for t, _ in tenors], dtype=float)
+    ys = np.array([r for _, r in tenors], dtype=float)
 
     # clamp of lineaire interpolatie
     if T_years <= xs[0]:
@@ -277,12 +285,12 @@ def _interpolate_simple_rate_from_row(row: pd.Series, T_years: float) -> float |
     if T_years >= xs[-1]:
         return float(ys[-1])
     i = int(np.searchsorted(xs, T_years))
-    x0, x1 = xs[i-1], xs[i]
-    y0, y1 = ys[i-1], ys[i]
+    x0, x1 = xs[i - 1], xs[i]
+    y0, y1 = ys[i - 1], ys[i]
     w = (T_years - x0) / (x1 - x0) if x1 != x0 else 0.0
-    return float(y0 + w*(y1 - y0))
+    return float(y0 + w * (y1 - y0))
 
-def fetch_r_simple_from_curve(sel_snapshot, T_years, view):
+def fetch_r_simple_from_curve(sel_snapshot, T_years, view) -> float:
     """
     1) Probeer utils.rates.get_r_curve_for_snapshot (vier signatures).
     2) Bij eender welke Exception (incl. BadRequest): query rechtstreeks de YIELD_VIEW
