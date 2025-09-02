@@ -614,17 +614,51 @@ def nearest_strike(side: str, target_price: float) -> float:
     return pick_closest_value(s_list, target_price, fallback=(s_list[len(s_list)//2] if s_list else 6000.0))
 
 # ——— r(T) bepalen (yield-curve of handmatig) ———
-_T = np.array([T if not np.isnan(T) else 30/365.0], dtype=float)  # veilige fallback
+# --- r/q selectie (nieuw, crash-proof & continuous) ---
+from utils.rates import get_r_curve_for_snapshot, get_q_curve_const
+import math
+import numpy as np
+from datetime import date
+
+tw1, tw2, tw3 = st.columns([1.2, 1, 1])
+with tw1:
+    use_yield_r = st.toggle("Gebruik r uit yield-curve", value=True)
+with tw2:
+    r_manual_simple = st.number_input("r (p.j., simple) — handmatig", min_value=-0.02, max_value=0.10, value=0.02, step=0.001, format="%.3f", disabled=use_yield_r)
+with tw3:
+    q_mode = st.radio("q-bron", ["Constante q","Implied via C−P (pariteit)"], index=0, horizontal=True)
+
+# DTE → T
+T = max(dte_exp,1)/365.0 if not np.isnan(dte_exp) else 30/365.0
+_T = np.array([T], dtype=float)
+
+# r(T) — continuous
 if use_yield_r:
-    r_T = get_r_curve_for_snapshot(
-        snapshot_date=pd.to_datetime(sel_snapshot) if 'sel_snapshot' in locals() else pd.Timestamp(date.today()),
-        T_years=_T,
-        view="nth-pier-468314-p7.marketdata.yield_curve_analysis_wide",
-        compounding_in="simple",
-        extrapolate=True
-    )[0]
+    try:
+        r_cont = get_r_curve_for_snapshot(
+            snapshot_date=pd.to_datetime(sel_snapshot) if 'sel_snapshot' in locals() else pd.Timestamp(date.today()),
+            T_years=_T,
+            view="nth-pier-468314-p7.marketdata.yield_curve_analysis_wide",  # check je viewnaam
+            date_col="date",   # pas aan indien kolom anders heet
+            output="continuous",
+            extrapolate=True
+        )[0]
+    except Exception as e:
+        st.warning(f"Kon r uit yield-view niet lezen ({e}). Val terug op handmatige r.")
+        r_cont = math.log1p(float(r_manual_simple))
 else:
-    r_T = math.log1p(float(r_manual_simple))  # simple -> continuous
+    r_cont = math.log1p(float(r_manual_simple))
+
+# q(T) — continuous
+if q_mode == "Implied via C−P (pariteit)":
+    q_cont = implied_q_from_parity(df_str, underlying_now, _T[0], r_cont)
+    if np.isnan(q_cont):
+        st.warning("q via C−P pariteit onbetrouwbaar — val terug op constante q.")
+        q_cont = get_q_curve_const(_T, q_const=0.016, to_continuous=True)[0]
+else:
+    q_const_simple = st.number_input("Dividendrendement q (p.j., simple)", min_value=0.0, max_value=0.10, value=0.016, step=0.001, format="%.3f")
+    q_cont = get_q_curve_const(_T, q_const=q_const_simple, to_continuous=True)[0]
+
 
 # ——— q(T) bepalen: constante of implied via pariteit ———
 q_const_simple = st.number_input("Dividendrendement q (p.j., simple)", min_value=0.0, max_value=0.10, value=0.016, step=0.001, format="%.3f",

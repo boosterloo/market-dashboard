@@ -1,260 +1,166 @@
 # utils/rates.py
-from __future__ import annotations
-
+import re
+import math
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional, Literal
+from typing import Iterable, Tuple, List, Optional
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
-# ---- Config ----
-DEFAULT_YIELD_VIEW = "nth-pier-468314-p7.marketdata.yield_curve_analysis_wide"
-
-# Mapping van kolomnamen naar looptijd in jaren
-TENOR_MAP_YEARS: Dict[str, float] = {
-    "y_1w":  7/365.0,
-    "y_2w": 14/365.0,
-    "y_3w": 21/365.0,
-    "y_1m":  1/12.0,
-    "y_2m":  2/12.0,
-    "y_3m":  3/12.0,
-    "y_6m":  6/12.0,
-    "y_9m":  9/12.0,
-    "y_1y":  1.0,
-    "y_2y":  2.0,
-    "y_3y":  3.0,
-    "y_5y":  5.0,
-    "y_7y":  7.0,
-    "y_10y": 10.0,
-    "y_20y": 20.0,
-    "y_30y": 30.0,
-}
-
-# ---- BigQuery helpers: probeer eerst jullie utils/bq, anders fallback ----
-try:
-    from utils.bq import run_query, bq_ping  # type: ignore
-    _HAS_UTILS_BQ = True
-except Exception:
-    _HAS_UTILS_BQ = False
+# --------- BigQuery client helper (zoals elders) ----------
+def _bq_client_from_st():
     import streamlit as st
-    import google.cloud.bigquery as bq
-    from google.oauth2 import service_account
+    sa_info = st.secrets["gcp_service_account"]
+    creds = service_account.Credentials.from_service_account_info(sa_info)
+    project_id = st.secrets.get("PROJECT_ID", sa_info.get("project_id"))
+    return bigquery.Client(project=project_id, credentials=creds)
 
-    @st.cache_resource(show_spinner=False)
-    def _bq_client_from_secrets():
-        creds = st.secrets["gcp_service_account"]
-        credentials = service_account.Credentials.from_service_account_info(creds)
-        return bq.Client(credentials=credentials, project=creds["project_id"])
+# --------- Kolom-detectie: r_<tenor>  ----------
+# Herkent o.a.: r_1d r_7d r_1w r_1m r_3m r_6m r_9m r_1y r_2y r_5y r_10y r_30y
+# en varianten als usd_1m, rate_2y, y_10y, etc.
+_TENOR_RE = re.compile(
+    r"(?P<prefix>.*?)(?P<num>\d+)\s*(?P<unit>d|day|days|w|week|weeks|m|mon|month|months|y|yr|year|years)\b",
+    flags=re.IGNORECASE
+)
 
-    def bq_ping() -> bool:
-        try:
-            _bq_client_from_secrets().query("SELECT 1").result(timeout=10)
-            return True
-        except Exception:
-            return False
+def _tenor_to_years(num: int, unit: str) -> float:
+    u = unit.lower()
+    if u in ("d","day","days"):   return num / 365.0
+    if u in ("w","week","weeks"): return num * 7 / 365.0
+    if u in ("m","mon","month","months"): return num / 12.0
+    if u in ("y","yr","year","years"):    return float(num)
+    return float("nan")
 
-    def run_query(sql: str) -> pd.DataFrame:
-        client = _bq_client_from_secrets()
-        job = client.query(sql)
-        return job.result().to_dataframe(create_bqstorage_client=False)
-
-
-# ---------- Intern: data uit view halen ----------
-def _load_yield_row_for_snapshot(
-    snapshot_date: pd.Timestamp,
-    view: str = DEFAULT_YIELD_VIEW,
-) -> pd.Series:
+def _detect_tenor_columns(cols: Iterable[str]) -> List[Tuple[str,float]]:
     """
-    Haalt de dichtstbijzijnde (<= snapshot_date) rij op uit de yield-view.
-    Valt terug op exact- of laatst-beschikbare datum ≤ snapshot.
+    Return [(colname, T_years), ...] gesorteerd op T_years
+    We accepteren alles wat _TENOR_RE matched en kolomtype ‘rate’ lijkt te zijn.
     """
-    snap = pd.to_datetime(snapshot_date).tz_localize(None)
+    out = []
+    for c in cols:
+        m = _TENOR_RE.search(str(c))
+        if not m:
+            continue
+        num = int(m.group("num"))
+        unit = m.group("unit")
+        T = _tenor_to_years(num, unit)
+        if T and T > 0:
+            out.append((c, T))
+    out = sorted(out, key=lambda x: x[1])
+    return out
 
-    sql = f"""
-    WITH src AS (
-      SELECT *
-      FROM `{view}`
-      WHERE date <= DATE('{snap.date()}')
-    )
-    SELECT *
-    FROM src
-    WHERE date = (SELECT MAX(date) FROM src)
-    LIMIT 1
-    """
-    df = run_query(sql)
-    if df.empty:
-        # Probeer eventueel >= snapshot (toekomst) als niets <= snapshot is
-        sql2 = f"""
-        WITH src AS (
-          SELECT *
-          FROM `{view}`
-          WHERE date >= DATE('{snap.date()}')
-        )
-        SELECT *
-        FROM src
-        WHERE date = (SELECT MIN(date) FROM src)
-        LIMIT 1
-        """
-        df = run_query(sql2)
+def _interp_rate(T_query: np.ndarray, T_nodes: np.ndarray, r_nodes: np.ndarray, extrapolate: bool) -> np.ndarray:
+    if len(T_nodes) == 0:
+        return np.full_like(T_query, np.nan, dtype=float)
+    if len(T_nodes) == 1:
+        return np.full_like(T_query, float(r_nodes[0]), dtype=float)
+    # lineaire interp (simple)
+    def _one(t):
+        if t <= T_nodes[0]:
+            return r_nodes[0] if extrapolate else np.nan
+        if t >= T_nodes[-1]:
+            return r_nodes[-1] if extrapolate else np.nan
+        i = np.searchsorted(T_nodes, t)
+        x0, x1 = T_nodes[i-1], T_nodes[i]
+        y0, y1 = r_nodes[i-1], r_nodes[i]
+        w = (t - x0) / (x1 - x0) if x1 != x0 else 0.0
+        return float(y0 + w*(y1 - y0))
+    return np.array([_one(float(t)) for t in T_query], dtype=float)
 
-    if df.empty:
-        raise ValueError(f"Geen yield data gevonden in view {view} rond {snap.date()}")
+def _to_continuous(r_simple: np.ndarray) -> np.ndarray:
+    # simple (apr) -> continuous
+    return np.array([math.log1p(float(x)) for x in r_simple], dtype=float)
 
-    row = df.iloc[0]
-    return row
-
-
-def _detect_tenors_in_row(row: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Leest beschikbare tenor-kolommen en geeft (tenor_years, rates) arrays terug.
-    Rates worden als float (decimaal) verwacht.
-    """
-    tenors: List[float] = []
-    rates: List[float] = []
-
-    for col, yrs in TENOR_MAP_YEARS.items():
-        if col in row.index and pd.notna(row[col]):
-            tenors.append(yrs)
-            rates.append(float(row[col]))
-
-    if not tenors:
-        raise ValueError("Geen tenor-kolommen gevonden in yield-rij. Controleer kolomnamen in je view.")
-
-    tenors_arr = np.array(tenors, dtype=float)
-    rates_arr = np.array(rates, dtype=float)
-
-    # Sorteer op looptijd
-    order = np.argsort(tenors_arr)
-    return tenors_arr[order], rates_arr[order]
-
-
-# ---------- Rente conversies ----------
-def _to_continuous_rate(y: np.ndarray, compounding: Literal["cont", "simple", "act365"] = "cont") -> np.ndarray:
-    """
-    Zet ingevoerde jaarrentes om naar continue samengestelde r.
-    - 'cont'   : veronderstelt dat y reeds continue is -> retourneer y ongewijzigd
-    - 'simple' : y_simple -> r_cont = ln(1 + y)
-    - 'act365' : zelfde als 'simple' voor jaarrente; dagbasis speelt bij looptijd, niet hier
-    """
-    if compounding == "cont":
-        return y
-    elif compounding in ("simple", "act365"):
-        return np.log1p(y)
-    else:
-        raise ValueError(f"Onbekende compounding: {compounding}")
-
-
-# ---------- Publieke API ----------
 def get_r_curve_for_snapshot(
-    snapshot_date: pd.Timestamp,
+    snapshot_date,
     T_years: np.ndarray,
-    *,
-    view: str = DEFAULT_YIELD_VIEW,
-    compounding_in: Literal["cont", "simple", "act365"] = "simple",
+    view: str,
+    date_col: str = "date",
+    output: str = "continuous",   # "continuous" | "simple"
     extrapolate: bool = True,
 ) -> np.ndarray:
     """
-    Haal de yield-curve op voor snapshot_date en interpoleer naar de opgegeven looptijden (in jaren).
-    Retourneert continue samengestelde r(T) als numpy-array (zelfde shape als T_years).
+    Leest ÉÉN rij uit je yield-view (dichtst bij snapshot_date) en detecteert automatisch tenor-kolommen.
+    De kolomnamen mogen variëren zolang ze een <num><unit> bevatten (b.v. 'r_3m', 'usd_10y', 'rate_2y').
+
+    Parameters:
+      - snapshot_date: pd.Timestamp / str / datetime
+      - T_years: array van looptijden in jaren (bv. [0.08, 0.5, 1, 2, 5])
+      - view: fully-qualified tabel/view naam in BigQuery
+      - date_col: kolom in de view die de datum/timestamp bevat (default 'date')
+      - output: "continuous" (default) of "simple"
+      - extrapolate: True = buiten bereik vlak door trekken; False = NaN buiten bereik
+
+    Returns: np.ndarray met r(T) in 'output' compounding.
     """
-    row = _load_yield_row_for_snapshot(snapshot_date, view=view)
-    tenors, rates_in = _detect_tenors_in_row(row)
+    if not isinstance(T_years, np.ndarray):
+        T_years = np.array(T_years, dtype=float)
 
-    # Zet naar continue samengestelde r
-    r_cont = _to_continuous_rate(rates_in, compounding=compounding_in)
+    client = _bq_client_from_st()
+    # Pak de dichtstbijzijnde dag t.o.v. snapshot_date (dagresolutie is meestal genoeg)
+    snap = pd.to_datetime(snapshot_date).date()
 
-    T_years = np.asarray(T_years, dtype=float)
-    if T_years.ndim != 1:
-        T_flat = T_years.reshape(-1)
-    else:
-        T_flat = T_years
-
-    # Interpolatie (lineair). Extrapolatie indien gevraagd, anders clip
-    x = tenors
-    y = r_cont
-
-    if extrapolate:
-        # np.interp extrapoleert niet, dus doen we het handmatig met endpoints
-        r_interp = np.interp(T_flat, x, y)
-        below = T_flat < x[0]
-        above = T_flat > x[-1]
-        if below.any():
-            # lineair richting origin met eerste segment (of constant)
-            # Hier: constant extrapolatie met kortste tenor is meestal prima voor DTE<1m
-            r_interp[below] = y[0]
-        if above.any():
-            # constant extrapolatie met langste tenor
-            r_interp[above] = y[-1]
-    else:
-        # Clip naar bereik en interpoleer
-        Tc = np.clip(T_flat, x[0], x[-1])
-        r_interp = np.interp(Tc, x, y)
-
-    return r_interp.reshape(T_years.shape)
-
-
-def get_r_grid_for_surface(
-    snapshot_date: pd.Timestamp,
-    T_vals: np.ndarray,
-    K_vals: np.ndarray,
-    *,
-    view: str = DEFAULT_YIELD_VIEW,
-    compounding_in: Literal["cont", "simple", "act365"] = "simple",
-) -> np.ndarray:
-    """
-    Maakt een 2D-grid R(T,K) door r(T) over de strike-as te broadcasten.
-    - T_vals: 1D array (bijv. unieke T in jaren uit je surface grid)
-    - K_vals: 1D array (strikes)
-    """
-    r_T = get_r_curve_for_snapshot(
-        snapshot_date=snapshot_date,
-        T_years=T_vals,
-        view=view,
-        compounding_in=compounding_in,
-        extrapolate=True,
+    sql = f"""
+    WITH base AS (
+      SELECT * FROM `{view}`
     )
-    RR = np.tile(r_T.reshape(-1, 1), (1, len(K_vals)))
-    return RR
-
-
-def get_q_curve_const(
-    T_years: np.ndarray,
-    q_const: float = 0.0,
-    *,
-    to_continuous: bool = True,
-) -> np.ndarray:
+    SELECT * FROM base
+    WHERE DATE({date_col}) <= @snap
+    ORDER BY DATE({date_col}) DESC
+    LIMIT 1
     """
-    Eenvoudige dividend-curve: constante q per jaar.
-    - Als to_continuous=True, zet y_simple -> ln(1+y) om naar continue q.
-    """
+    params = [bigquery.ScalarQueryParameter("snap","DATE",str(snap))]
+    df = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
+
+    if df.empty:
+        # als er niets <= snap is, probeer >= snap
+        sql2 = f"""
+        WITH base AS (
+          SELECT * FROM `{view}`
+        )
+        SELECT * FROM base
+        WHERE DATE({date_col}) >= @snap
+        ORDER BY DATE({date_col}) ASC
+        LIMIT 1
+        """
+        df = client.query(sql2, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
+
+    if df.empty:
+        raise ValueError("Geen r-row gevonden in yield-view rond de gevraagde datum.")
+
+    row = df.iloc[0]
+    cols = list(df.columns)
+    cand = _detect_tenor_columns(cols)
+    if not cand:
+        raise ValueError("Geen tenor-kolommen gevonden in yield-rij. Controleer kolomnamen in je view.")
+
+    # Lees rates uit de gedetecteerde kolommen
+    T_nodes, r_nodes = [], []
+    for col, T in cand:
+        try:
+            v = float(row[col])
+        except Exception:
+            continue
+        if not (v is None or np.isnan(v)):
+            T_nodes.append(float(T))
+            r_nodes.append(float(v))
+    if not T_nodes:
+        raise ValueError("Tenor-kolommen gedetecteerd, maar geen numerieke r-waarden in de geselecteerde rij.")
+
+    T_nodes = np.array(T_nodes, dtype=float)
+    r_nodes = np.array(r_nodes, dtype=float)
+
+    # Interpoleer (in simple apr)
+    r_simple = _interp_rate(T_years, T_nodes, r_nodes, extrapolate=extrapolate)
+
+    if output == "simple":
+        return r_simple
+    # default: continuous
+    return _to_continuous(r_simple)
+
+def get_q_curve_const(T_years: np.ndarray, q_const: float = 0.015, to_continuous: bool = True) -> np.ndarray:
+    if not isinstance(T_years, np.ndarray):
+        T_years = np.array(T_years, dtype=float)
     if to_continuous:
-        q_cont = np.log1p(q_const)
-    else:
-        q_cont = q_const
-    T_years = np.asarray(T_years, dtype=float)
-    q_T = np.full_like(T_years, q_cont, dtype=float)
-    return q_T
-
-
-def get_rq_grids_for_surface(
-    snapshot_date: pd.Timestamp,
-    T_vals_years: np.ndarray,
-    K_vals: np.ndarray,
-    *,
-    view: str = DEFAULT_YIELD_VIEW,
-    r_compounding_in: Literal["cont", "simple", "act365"] = "simple",
-    q_const: float = 0.0,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Handige combi: geeft (RR, QQ) terug voor je Greeks-surface.
-    - RR: r(T) gebroadcast naar (len(T_vals) x len(K_vals))
-    - QQ: q(T) idem (hier constant)
-    """
-    RR = get_r_grid_for_surface(
-        snapshot_date=snapshot_date,
-        T_vals=T_vals_years,
-        K_vals=K_vals,
-        view=view,
-        compounding_in=r_compounding_in,
-    )
-    q_T = get_q_curve_const(T_vals_years, q_const=q_const, to_continuous=True)
-    QQ = np.tile(q_T.reshape(-1, 1), (1, len(K_vals)))
-    return RR, QQ
+        return np.array([math.log1p(q_const)]*len(T_years), dtype=float)
+    return np.array([q_const]*len(T_years), dtype=float)
