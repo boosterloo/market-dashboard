@@ -574,96 +574,116 @@ with cv5:
 
 # ─────────────────────────── I) Strangle Helper ───────────────────
 st.markdown("### 🧠 Strangle Helper (σ- of Δ-doel / quick pick)")
-cm1, cm2, cm3, cm4 = st.columns([1.2, 1, 1, 1])
-with cm1:  str_sel_mode = st.radio("Selectiemodus", ["σ-doel","Δ-doel"], index=0)
-with cm2:  sigma_target = st.slider("σ-doel per zijde", 0.5, 2.5, 1.0, step=0.1)
-with cm3:  delta_target = st.slider("Δ-doel (absoluut)", 0.05, 0.30, 0.15, step=0.01)
-with cm4:  price_source = st.radio("Prijsbron", ["mid_price","last_price"], index=0, horizontal=True)
 
-# —— r/q toggle widgets (let op: q_const_simple is ALTIJD gedefinieerd) —— #
+# Keuzes voor selectie & pricing
+cm1, cm2, cm3, cm4 = st.columns([1.2, 1, 1, 1])
+with cm1:
+    str_sel_mode = st.radio("Selectiemodus", ["σ-doel", "Δ-doel"], index=0, key="str_mode")
+with cm2:
+    sigma_target = st.slider("σ-doel per zijde", 0.5, 2.5, 1.0, step=0.1, key="sigma_tgt")
+with cm3:
+    delta_target = st.slider("Δ-doel (absoluut)", 0.05, 0.30, 0.15, step=0.01, key="delta_tgt")
+with cm4:
+    price_source = st.radio("Prijsbron", ["mid_price", "last_price"], index=0, horizontal=True, key="px_src")
+
+# r/q widgets — éénmaal gedefinieerd (voorkomt DuplicateElementId)
 tw1, tw2, tw3 = st.columns([1.2, 1, 1])
 with tw1:
-    use_yield_r = st.toggle("Gebruik r uit yield-curve", value=True, help="Uit jouw yield view, term-structure aware.")
+    use_yield_r = st.toggle("Gebruik r uit yield-curve", value=True, key="use_r_toggle",
+                            help="Haal r(T) uit je yield-view; anders handmatig.")
 with tw2:
-    r_manual_simple = st.number_input(
-        "r (p.j., simple) — handmatig",
-        min_value=-0.02, max_value=0.10, value=0.02, step=0.001, format="%.3f",
-        disabled=use_yield_r
-    )
+    r_manual_simple = st.number_input("r (p.j., simple) — handmatig", min_value=-0.02, max_value=0.10,
+                                      value=0.02, step=0.001, format="%.3f", disabled=use_yield_r, key="r_manual")
 with tw3:
-    q_mode = st.radio("q-bron", ["Constante q","Implied via C−P (pariteit)"], index=0, horizontal=True,
-                      help="Implied q gebruikt put–call-pariteit op near-ATM strike.")
+    q_mode = st.radio("q-bron", ["Constante q", "Implied via C−P (pariteit)"], index=0, horizontal=True, key="q_mode",
+                      help="Implied q via near-ATM put–call pariteit; valt terug op constante q bij twijfel.")
 
-# q-constante ALTJD als widget (disabled indien niet actief) → voorkomt NameError later
-q_const_simple = st.number_input(
-    "Dividendrendement q (p.j., simple)",
-    min_value=0.0, max_value=0.10, value=0.016, step=0.001, format="%.3f",
-    disabled=(q_mode != "Constante q")
-)
+# q-constante ALTIJD aanwezig (disabled indien niet actief) → later veilig te gebruiken
+q_const_simple = st.number_input("Dividendrendement q (p.j., simple)", min_value=0.0, max_value=0.10,
+                                 value=0.016, step=0.001, format="%.3f",
+                                 disabled=(q_mode != "Constante q"), key="q_const_input")
 
+# Data slice voor gekozen expiratie + snapshot
 ce1, ce2, ce3 = st.columns([1.2, 1, 1])
 with ce1:
-    default_exp_idx = exps_all.index(default_series_exp) if exps_all and (default_series_exp in exps_all) else 0
-    exp_for_str = st.selectbox("Expiratie voor strangle", options=exps_all or [], index=default_exp_idx if exps_all else 0)
+    default_exp_idx = exps.index(pick_first_on_or_after(exps, date.today() + timedelta(days=14))) if exps else 0
+    exp_for_str = st.selectbox("Expiratie voor strangle", options=exps or [], index=default_exp_idx if exps else 0, key="exp_for_str")
 with ce2:
-    use_smile_iv = st.checkbox("Gebruik strike-IV (smile) voor Δ", value=False)
+    use_smile_iv = st.checkbox("Gebruik strike-IV (smile) voor Δ", value=False, key="use_smile")
 with ce3:
-    show_table = st.checkbox("Toon details tabel", value=False)
+    show_table = st.checkbox("Toon details tabel", value=False, key="show_table")
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_strangle_slice(expiration, snap_min):
+def load_strangle_slice(view: str, expiration, snap_min) -> pd.DataFrame:
     if expiration is None or snap_min is None:
         return pd.DataFrame()
     sql = f"""
       SELECT TIMESTAMP_TRUNC(snapshot_date, MINUTE) AS snap_m, snapshot_date, type, expiration,
              days_to_exp, strike, underlying_price, implied_volatility, open_interest,
              volume, last_price, mid_price, bid, ask
-      FROM `{VIEW}`
+      FROM `{view}`
       WHERE expiration = @exp AND DATE(snapshot_date) = DATE(@snap)
     """
     all_rows = run_query(sql, {"exp": expiration, "snap": pd.to_datetime(snap_min)})
-    if all_rows.empty: return all_rows
+    if all_rows.empty:
+        return all_rows
     all_rows["snap_m"] = pd.to_datetime(all_rows["snap_m"])
     target = pd.to_datetime(snap_min)
-    best_minute = all_rows.loc[(all_rows["snap_m"]-target).abs().idxmin(), "snap_m"]
+    best_minute = all_rows.loc[(all_rows["snap_m"] - target).abs().idxmin(), "snap_m"]
     return all_rows[all_rows["snap_m"] == best_minute].copy()
 
-df_str = load_strangle_slice(exp_for_str if 'exp_for_str' in locals() else None,
+df_str = load_strangle_slice(VIEW, exp_for_str if 'exp_for_str' in locals() else None,
                              sel_snapshot if 'sel_snapshot' in locals() else None)
+
 if not df_str.empty:
     df_str["type"] = df_str["type"].str.lower()
-    df_str["mny"] = df_str["strike"]/df_str["underlying_price"] - 1.0
-    df_str = df_str[((df_str["open_interest"]>=min_oi) | (df_str["volume"]>=min_vol))]
+    df_str["mny"]  = df_str["strike"]/df_str["underlying_price"] - 1.0
+    df_str = df_str[((df_str["open_interest"] >= min_oi) | (df_str["volume"] >= min_vol))]
 
-iv_atm_exp = float(df_str.loc[(df_str["days_to_exp"].between(20,60)) & (df_str["mny"].abs()<=0.01),"implied_volatility"].median()) if not df_str.empty else np.nan
+# ATM IV & T
+iv_atm_exp = float(df_str.loc[(df_str["days_to_exp"].between(20, 60)) & (df_str["mny"].abs() <= 0.01), "implied_volatility"].median()) if not df_str.empty else np.nan
 dte_exp    = int(pd.to_numeric(df_str["days_to_exp"], errors="coerce").median()) if not df_str.empty else np.nan
-T          = max(dte_exp,1)/365.0 if not np.isnan(dte_exp) else 30/365.0
+T          = max(dte_exp, 1) / 365.0 if not np.isnan(dte_exp) else 30/365.0
+_T         = np.array([T], dtype=float)
 
-sigma_pts = underlying_now * iv_atm_exp * math.sqrt(T) if (not np.isnan(underlying_now) and not np.isnan(iv_atm_exp) and not np.isnan(T)) else np.nan
+# Implied q via pariteit (gefixte typehint; retourneert float met np.nan als onbetrouwbaar)
+def implied_q_from_parity(df_slice: pd.DataFrame, S: float, T: float, r_cont: float) -> float:
+    """Leid q (continuous) af via C−P pariteit op near-ATM; np.nan indien onbetrouwbaar."""
+    if df_slice.empty or np.isnan(S) or T <= 0:
+        return np.nan
+    # kies per rij: mid → last → (max(bid, ask))
+    def _row_px(row) -> float:
+        for col in ("mid_price", "last_price", "bid", "ask"):
+            v = row.get(col, np.nan)
+            if pd.notna(v) and float(v) > 0:
+                return float(v)
+        return np.nan
+    tmp = df_slice.copy()
+    tmp["px"] = tmp.apply(_row_px, axis=1)
+    tmp = tmp.dropna(subset=["px"])
+    piv = tmp.pivot_table(index="strike", columns="type", values="px", aggfunc="median")
+    if ("call" not in piv.columns) or ("put" not in piv.columns) or piv.empty:
+        return np.nan
+    piv = piv.dropna(subset=["call", "put"])
+    if piv.empty:
+        return np.nan
+    piv["atm_abs"] = (piv.index - underlying_now).abs()
+    piv = piv.sort_values("atm_abs")
+    K = float(piv.index[0]); C = float(piv.iloc[0]["call"]); P = float(piv.iloc[0]["put"])
+    val = (C - P + K * math.exp(-r_cont * T)) / float(underlying_now)
+    if val <= 0:
+        return np.nan
+    q_c = -math.log(val) / T
+    return q_c if (-0.10 <= q_c <= 0.10) else np.nan
 
-# Strike->IV map voor Δ
-strike_iv_map = {}
-if not df_str.empty:
-    strike_iv_map = (df_str.groupby(["type","strike"], as_index=False)["implied_volatility"].median()
-                          .set_index(["type","strike"])["implied_volatility"].to_dict())
-
-def get_iv_for(side: str, K: float) -> float:
-    v = strike_iv_map.get((side, K), np.nan) if use_smile_iv else np.nan
-    return float(v) if not np.isnan(v) else float(iv_atm_exp)
-
-def nearest_strike(side: str, target_price: float) -> float:
-    s_list = sorted(df_str[df_str["type"]==side]["strike"].unique().tolist()) if not df_str.empty else []
-    return pick_closest_value(s_list, target_price, fallback=(s_list[len(s_list)//2] if s_list else 6000.0))
-
-# r(T) — continuous
-_T = np.array([T], dtype=float)
+# r(T) (continuous)
 if use_yield_r:
     try:
         r_cont = get_r_curve_for_snapshot(
             snapshot_date=pd.to_datetime(sel_snapshot) if 'sel_snapshot' in locals() else pd.Timestamp(date.today()),
             T_years=_T,
             view="nth-pier-468314-p7.marketdata.yield_curve_analysis_wide",  # pas aan naar jouw view
-            date_col="date",    # pas aan indien kolom anders heet
+            date_col="date",
             output="continuous",
             extrapolate=True
         )[0]
@@ -673,46 +693,45 @@ if use_yield_r:
 else:
     r_cont = math.log1p(float(r_manual_simple))
 
-# q(T) — continuous
-def implied_q_from_parity(df_slice: pd.DataFrame, S: float, T: float, r_cont: float) -> float | np.nan:
-    if df_slice.empty or np.isnan(S) or T <= 0: return np.nan
-    piv = (df_slice.assign(px=lambda x: x.apply(
-                lambda r: (r.get("mid_price") if pd.notna(r.get("mid_price", np.nan)) and r["mid_price"]>0 else
-                           (r.get("last_price") if pd.notna(r.get("last_price", np.nan)) and r["last_price"]>0 else
-                            (max(r.get("bid", np.nan), r.get("ask", np.nan))
-                             if pd.notna(r.get("bid", np.nan)) and pd.notna(r.get("ask", np.nan)) and max(r["bid"], r["ask"])>0
-                             else np.nan))), axis=1))
-           .dropna(subset=["px"]))
-    piv = piv.pivot_table(index="strike", columns="type", values="px", aggfunc="median").dropna(subset=["call","put"], how="any")
-    if piv.empty: return np.nan
-    piv["atm_abs"] = (piv.index - S).abs()
-    piv = piv.sort_values("atm_abs")
-    K = float(piv.index[0]); C = float(piv.iloc[0]["call"]); P = float(piv.iloc[0]["put"])
-    val = (C - P + K * math.exp(-r_cont * T)) / S
-    if val <= 0: return np.nan
-    q_c = -math.log(val) / T
-    return q_c if (-0.10 <= q_c <= 0.10) else np.nan
-
+# q(T) (continuous)
 if q_mode == "Implied via C−P (pariteit)":
-    q_cont = implied_q_from_parity(df_str, underlying_now, _T[0], r_cont)
+    q_cont = implied_q_from_parity(df_str, underlying_now, T, r_cont)
     if np.isnan(q_cont):
         st.warning("q via C−P pariteit onbetrouwbaar — val terug op constante q.")
         q_cont = get_q_curve_const(_T, q_const=q_const_simple, to_continuous=True)[0]
 else:
     q_cont = get_q_curve_const(_T, q_const=q_const_simple, to_continuous=True)[0]
 
+# IV per strike (smile) optioneel
+strike_iv_map = {}
+if not df_str.empty:
+    strike_iv_map = (df_str.groupby(["type", "strike"], as_index=False)["implied_volatility"].median()
+                          .set_index(["type", "strike"])["implied_volatility"].to_dict())
+
+def get_iv_for(side: str, K: float) -> float:
+    v = strike_iv_map.get((side, K), np.nan) if use_smile_iv else np.nan
+    return float(v) if not np.isnan(v) else float(iv_atm_exp)
+
+def nearest_strike(side: str, target_price: float) -> float:
+    s_list = sorted(df_str[df_str["type"] == side]["strike"].unique().tolist()) if not df_str.empty else []
+    return pick_closest_value(s_list, target_price, fallback=(s_list[len(s_list)//2] if s_list else 6000.0))
+
+# σ-doel of Δ-doel selectie
+sigma_pts = underlying_now * iv_atm_exp * math.sqrt(T) if (not np.isnan(underlying_now) and not np.isnan(iv_atm_exp)) else np.nan
+
 def pick_by_sigma():
     if np.isnan(sigma_pts): return np.nan, np.nan
-    return nearest_strike("put",  underlying_now - sigma_target*sigma_pts), \
-           nearest_strike("call", underlying_now + sigma_target*sigma_pts)
+    return nearest_strike("put",  underlying_now - sigma_target * sigma_pts), \
+           nearest_strike("call", underlying_now + sigma_target * sigma_pts)
 
 def pick_by_delta():
-    if any(np.isnan(x) for x in [underlying_now, T]) or df_str.empty: return np.nan, np.nan
-    puts  = df_str[df_str["type"]=="put"]["strike"].unique().tolist()
-    calls = df_str[df_str["type"]=="call"]["strike"].unique().tolist()
+    if any(np.isnan(x) for x in [underlying_now, T]) or df_str.empty:
+        return np.nan, np.nan
+    puts  = df_str[df_str["type"] == "put"]["strike"].unique().tolist()
+    calls = df_str[df_str["type"] == "call"]["strike"].unique().tolist()
     best_p, best_c, err_p, err_c = np.nan, np.nan, 1e9, 1e9
     for K in puts:
-        d = bs_delta(underlying_now, K, get_iv_for("put", K), T, r_cont, q_cont, is_call=False)
+        d = bs_delta(underlying_now, K, get_iv_for("put", K),  T, r_cont, q_cont, is_call=False)
         e = abs(abs(d) - delta_target)
         if not np.isnan(d) and e < err_p: best_p, err_p = K, e
     for K in calls:
@@ -721,13 +740,52 @@ def pick_by_delta():
         if not np.isnan(d) and e < err_c: best_c, err_c = K, e
     return float(best_p), float(best_c)
 
+# Actieknoppen (muteren alleen de mode)
 ac1, ac2 = st.columns([1, 1])
 with ac1:
-    if st.button("🔮 Auto-pick (σ-doel)"): str_sel_mode = "σ-doel"
+    if st.button("🔮 Auto-pick (σ-doel)", key="auto_sigma"):
+        str_sel_mode = "σ-doel"
 with ac2:
-    if st.button("🎯 Auto-pick (Δ-doel)"): str_sel_mode = "Δ-doel"
+    if st.button("🎯 Auto-pick (Δ-doel)", key="auto_delta"):
+        str_sel_mode = "Δ-doel"
 
 target_put, target_call = (pick_by_sigma() if str_sel_mode.startswith("σ") else pick_by_delta())
+
+# Prijzen + KPI’s
+def _val(row_df, col) -> float:
+    return float(pd.to_numeric(row_df[col], errors="coerce").median()) if (not row_df.empty and col in row_df) else np.nan
+
+put_row  = df_str[(df_str["type"] == "put")  & (df_str["strike"] == target_put)].copy()   if not (np.isnan(target_put)  or df_str.empty) else pd.DataFrame()
+call_row = df_str[(df_str["type"] == "call") & (df_str["strike"] == target_call)].copy() if not (np.isnan(target_call) or df_str.empty) else pd.DataFrame()
+put_px, call_px = _val(put_row, price_source), _val(call_row, price_source)
+total_credit = (put_px + call_px) if (not np.isnan(put_px) and not np.isnan(call_px)) else np.nan
+
+def sigma_distance(K: float) -> float:
+    return abs(K - underlying_now) / sigma_pts if not np.isnan(sigma_pts) else np.nan
+
+sd_put, sd_call = sigma_distance(target_put), sigma_distance(target_call)
+
+def p_itm_at_exp(sd: float) -> float:
+    return (1.0 - norm_cdf(sd)) if not np.isnan(sd) else np.nan
+
+p_touch_put  = min(1.0, 2.0 * p_itm_at_exp(sd_put))  if not np.isnan(sd_put)  else np.nan
+p_touch_call = min(1.0, 2.0 * p_itm_at_exp(sd_call)) if not np.isnan(sd_call) else np.nan
+p_both_touch_approx = min(1.0, (p_touch_put if not np.isnan(p_touch_put) else 0.0) +
+                               (p_touch_call if not np.isnan(p_touch_call) else 0.0))
+ppd_total_pts = float(total_credit / max(dte_exp, 1)) if not np.isnan(total_credit) and not np.isnan(dte_exp) else np.nan
+
+km1, km2, km3, km4, km5, km6 = st.columns(6)
+with km1: st.metric("Expiratie", str(exp_for_str) if 'exp_for_str' in locals() else "—")
+with km2: st.metric("DTE", f"{dte_exp:.0f}" if not np.isnan(dte_exp) else "—")
+with km3: st.metric("Strikes", (f"P {target_put:.0f} / C {target_call:.0f}") if not (np.isnan(target_put) or np.isnan(target_call)) else "—")
+with km4: st.metric("Credit", f"{total_credit:,.2f}" if not np.isnan(total_credit) else "—")
+with km5: st.metric("PPD (tot.)", f"{ppd_total_pts:,.2f}" if not np.isnan(ppd_total_pts) else "—")
+with km6: st.metric("~P(touch) max", f"{p_both_touch_approx*100:.0f}%" if not np.isnan(p_both_touch_approx) else "—")
+
+if show_table and not df_str.empty:
+    st.dataframe(df_str.sort_values(["type", "strike"])[["type","strike","implied_volatility","open_interest","volume","last_price","mid_price","bid","ask"]],
+                 use_container_width=True)
+
 
 
 # J) Margin & Sizing
@@ -788,57 +846,58 @@ else:
                               height=420, dragmode="zoom")
         st.plotly_chart(fig_pay, use_container_width=True, config=PLOTLY_CONFIG)
 
-# ─────────────────────────── K) Roll-simulator ────────────────────
+# ─────────────────────────── K) Roll-simulator (uitrollen / herpositioneren) ───────────────────
 st.markdown("### 🔄 Roll-simulator (uitrollen / herpositioneren)")
+
 ready_for_sizing = (not any(np.isnan(x) for x in [underlying_now])) and (not np.isnan(target_put)) and (not np.isnan(target_call))
 if not ready_for_sizing or df_str.empty:
     st.info("Selecteer eerst een strangle in de *Strangle Helper*. Daarna kun je rollen simuleren.")
 else:
     rr1, rr2, rr3 = st.columns([1.2, 1.0, 1.0])
-    with rr1: roll_mode = st.radio("Rol-methode", ["σ-doel","Δ-doel"], index=0, horizontal=True)
-    with rr2: sigma_target_roll = st.slider("σ-doel (roll)", 0.5, 2.5, 1.2, step=0.1)
-    with rr3: delta_target_roll = st.slider("Δ-doel (roll, abs)", 0.05, 0.30, 0.15, step=0.01)
+    with rr1: roll_mode = st.radio("Rol-methode", ["σ-doel", "Δ-doel"], index=0, horizontal=True, key="roll_mode")
+    with rr2: sigma_target_roll = st.slider("σ-doel (roll)", 0.5, 2.5, 1.2, step=0.1, key="sigma_roll")
+    with rr3: delta_target_roll = st.slider("Δ-doel (roll, abs)", 0.05, 0.30, 0.15, step=0.01, key="delta_roll")
 
-    future_exps = [e for e in exps_all if e > exp_for_str] if 'exp_for_str' in locals() else []
+    future_exps = [e for e in exps if e > exp_for_str] if 'exp_for_str' in locals() else []
     if not future_exps:
         st.info("Geen latere expiraties beschikbaar binnen de filters om naar uit te rollen.")
     else:
-        new_exp = st.selectbox("Naar welke expiratie rollen?", options=future_exps, index=0)
+        new_exp = st.selectbox("Naar welke expiratie rollen?", options=future_exps, index=0, key="roll_exp")
 
         @st.cache_data(ttl=300, show_spinner=False)
-        def load_slice_for_exp(expiration, snap_min):
+        def load_slice_for_exp(view: str, expiration, snap_min):
             if expiration is None or snap_min is None: return pd.DataFrame()
             sql = f"""
               SELECT TIMESTAMP_TRUNC(snapshot_date, MINUTE) AS snap_m, snapshot_date, type, expiration,
                      days_to_exp, strike, underlying_price, implied_volatility, open_interest,
                      volume, last_price, mid_price, bid, ask
-              FROM `{VIEW}`
+              FROM `{view}`
               WHERE expiration = @exp AND DATE(snapshot_date) = DATE(@snap)
             """
             all_rows = run_query(sql, {"exp": expiration, "snap": pd.to_datetime(snap_min)})
             if all_rows.empty: return all_rows
             all_rows["snap_m"] = pd.to_datetime(all_rows["snap_m"])
             target = pd.to_datetime(snap_min)
-            best_minute = all_rows.loc[(all_rows["snap_m"]-target).abs().idxmin(), "snap_m"]
-            return all_rows[all_rows["snap_m"]==best_minute].copy()
+            best_minute = all_rows.loc[(all_rows["snap_m"] - target).abs().idxmin(), "snap_m"]
+            return all_rows[all_rows["snap_m"] == best_minute].copy()
 
-        df_new = load_slice_for_exp(new_exp, sel_snapshot)
+        df_new = load_slice_for_exp(VIEW, new_exp, sel_snapshot)
         if df_new.empty:
             st.info("Geen data voor de gekozen nieuwe expiratie op dit snapshot.")
         else:
             df_new["type"] = df_new["type"].str.lower()
             df_new["mny"]  = df_new["strike"]/df_new["underlying_price"] - 1.0
-            df_new = df_new[((df_new["open_interest"]>=min_oi) | (df_new["volume"]>=min_vol))]
+            df_new = df_new[((df_new["open_interest"] >= min_oi) | (df_new["volume"] >= min_vol))]
 
-            dte_new     = int(pd.to_numeric(df_new["days_to_exp"], errors="coerce").median())
-            T_new       = max(dte_new,1)/365.0 if not np.isnan(dte_new) else T  # fallback op huidige T
-            iv_atm_new  = float(df_new.loc[(df_new["days_to_exp"].between(20,60)) & (df_new["mny"].abs()<=0.01),"implied_volatility"].median())
+            dte_new = int(pd.to_numeric(df_new["days_to_exp"], errors="coerce").median())
+            T_new   = max(dte_new, 1) / 365.0 if not np.isnan(dte_new) else T
+            iv_atm_new = float(df_new.loc[(df_new["days_to_exp"].between(20, 60)) & (df_new["mny"].abs() <= 0.01), "implied_volatility"].median())
             sigma_pts_new = underlying_now * iv_atm_new * math.sqrt(T_new) if (not np.isnan(underlying_now) and not np.isnan(iv_atm_new)) else np.nan
 
-            smile_map_new = (df_new.groupby(["type","strike"], as_index=False)["implied_volatility"].median()
-                                   .set_index(["type","strike"])["implied_volatility"].to_dict())
+            smile_map_new = (df_new.groupby(["type", "strike"], as_index=False)["implied_volatility"].median()
+                                   .set_index(["type", "strike"])["implied_volatility"].to_dict())
 
-            # r(T_new) — continuous (zelfde toggle als boven)
+            # r(T_new) — zelfde toggle als Strangle Helper
             if use_yield_r:
                 r_T_new = get_r_curve_for_snapshot(
                     snapshot_date=pd.to_datetime(sel_snapshot) if 'sel_snapshot' in locals() else pd.Timestamp(date.today()),
@@ -851,8 +910,8 @@ else:
             else:
                 r_T_new = math.log1p(float(r_manual_simple))
 
-            # q(T_new) — continuous (zelfde bronkeuze)
-            def implied_q_from_parity_new(df_slice, S, T_in, r_cont_in):
+            # q(T_new) — zelfde bronkeuze
+            def implied_q_from_parity_new(df_slice, S, T_in, r_cont_in) -> float:
                 return implied_q_from_parity(df_slice, S, T_in, r_cont_in)
 
             if q_mode == "Implied via C−P (pariteit)":
@@ -867,21 +926,21 @@ else:
                 return float(v) if not np.isnan(v) else float(iv_atm_new)
 
             def nearest_strike_new(side: str, target_price: float) -> float:
-                arr = sorted(df_new[df_new["type"]==side]["strike"].unique().tolist())
+                arr = sorted(df_new[df_new["type"] == side]["strike"].unique().tolist())
                 return pick_closest_value(arr, target_price, fallback=(arr[len(arr)//2] if arr else 6000.0))
 
-            # — selectie nieuwe strikes —
+            # Nieuwe strikes kiezen
             if roll_mode.startswith("σ"):
                 new_put  = nearest_strike_new("put",  underlying_now - sigma_target_roll * sigma_pts_new)
                 new_call = nearest_strike_new("call", underlying_now + sigma_target_roll * sigma_pts_new)
             else:
-                puts  = sorted(df_new[df_new["type"]=="put"]["strike"].unique().tolist())
-                # ✅ FIXED SyntaxError: correcte indexing van de calls:
-                calls = sorted(df_new[df_new["type"]=="call"]["strike"].unique().tolist())
+                puts  = sorted(df_new[df_new["type"] == "put"]["strike"].unique().tolist())
+                # ✅ FIXED: correcte indexing van calls
+                calls = sorted(df_new[df_new["type"] == "call"]["strike"].unique().tolist())
 
                 best_p, best_c, err_p, err_c = np.nan, np.nan, 1e9, 1e9
                 for K in puts:
-                    d = bs_delta(underlying_now, K, get_iv_new("put", K), T_new, r_T_new, q_T_new, is_call=False)
+                    d = bs_delta(underlying_now, K, get_iv_new("put", K),  T_new, r_T_new, q_T_new, is_call=False)
                     e = abs(abs(d) - delta_target_roll)
                     if not np.isnan(d) and e < err_p: best_p, err_p = K, e
                 for K in calls:
@@ -890,22 +949,21 @@ else:
                     if not np.isnan(d) and e < err_c: best_c, err_c = K, e
                 new_put, new_call = float(best_p), float(best_c)
 
-            # prijzen (robuste fallback mid→last→bid/ask)
-            def _p(df_leg, typ, K):
-                row = df_leg[(df_leg["type"]==typ) & (df_leg["strike"]==K)]
-                for col in ["mid_price","last_price","bid","ask"]:
+            # Prijs-fallback mid→last→bid/ask
+            def _p(df_leg, typ, K) -> float:
+                row = df_leg[(df_leg["type"] == typ) & (df_leg["strike"] == K)]
+                for col in ["mid_price", "last_price", "bid", "ask"]:
                     if col in row and not row[col].isna().all():
                         v = float(pd.to_numeric(row[col], errors="coerce").median())
-                        if v>0: return v
+                        if v > 0: return v
                 return np.nan
 
-            new_put_px, new_call_px = _p(df_new,"put",new_put), _p(df_new,"call",new_call)
+            new_put_px, new_call_px = _p(df_new, "put", new_put), _p(df_new, "call", new_call)
             new_credit = (new_put_px + new_call_px) if (not np.isnan(new_put_px) and not np.isnan(new_call_px)) else np.nan
-
             close_cost = (float(put_px) if not np.isnan(put_px) else 0.0) + (float(call_px) if not np.isnan(call_px) else 0.0)
             net_roll_credit = (new_credit - close_cost) if (not np.isnan(new_credit)) else np.nan
 
-            def sigma_dist(K, sp): return abs(K - underlying_now) / sp if (sp and sp>0 and not np.isnan(sp)) else np.nan
+            def sigma_dist(K, sp): return abs(K - underlying_now) / sp if (sp and sp > 0 and not np.isnan(sp)) else np.nan
             old_sd_put, old_sd_call = sigma_dist(float(target_put), sigma_pts_new), sigma_dist(float(target_call), sigma_pts_new)
             new_sd_put, new_sd_call = sigma_dist(float(new_put),  sigma_pts_new), sigma_dist(float(new_call),  sigma_pts_new)
 
@@ -915,8 +973,9 @@ else:
             with r3: st.metric("Extra credit (roll)", f"{net_roll_credit:,.2f}" if not np.isnan(net_roll_credit) else "—")
             with r4: st.metric("DTE (nieuw)", f"{dte_new:.0f}")
             r5, r6 = st.columns(2)
-            with r5: st.metric("σ-afstand PUT (oud → nieuw)", f"{old_sd_put:.2f}σ → {new_sd_put:.2f}σ" if not (np.isnan(old_sd_put) or np.isnan(new_sd_put)) else "—")
+            with r5: st.metric("σ-afstand PUT (oud → nieuw)",  f"{old_sd_put:.2f}σ → {new_sd_put:.2f}σ"  if not (np.isnan(old_sd_put)  or np.isnan(new_sd_put))  else "—")
             with r6: st.metric("σ-afstand CALL (oud → nieuw)", f"{old_sd_call:.2f}σ → {new_sd_call:.2f}σ" if not (np.isnan(old_sd_call) or np.isnan(new_sd_call)) else "—")
+
 
 # L) VIX vs IV
 vix_vs_iv = (df.assign(snap_date=df["snapshot_date"].dt.date)
