@@ -6,10 +6,29 @@ from datetime import datetime, timedelta, date
 import math
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from plotly import colors as pc
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
+
+# —— NIEUW: r/q helpers uit yield-view ——
+from utils.rates import get_r_curve_for_snapshot, get_q_curve_const
+
+# --- Sidebar navigatie ---
+from utils.nav import sidebar_nav
+
+NAV_ENTRIES = [
+    {"label": "Home",          "page": "Home",                         "icon": "🏠"},
+    {"label": "SPX Options",   "page": "pages/3_SPX_Options.py",       "icon": "🧩"},
+    {"label": "3D Greeks",     "page": "pages/4_Greeks_3D.py",         "icon": "🧮"},
+    # Voeg hier jouw andere pagina’s toe (pas paden/namen aan):
+    # {"label": "Yield Curve",   "page": "pages/2_Yield_Curve.py",       "icon": "📈"},
+    # {"label": "Macro",         "page": "pages/5_Macro_Dashboard.py",   "icon": "🌍"},
+]
+
+# Zet current_slug naar (een deel van) de zichtbare label-naam van deze pagina
+sidebar_nav(NAV_ENTRIES, section_title="📚 Trading Dashboard", current_slug="SPX Options")  # op de SPX-pagina
+# sidebar_nav(NAV_ENTRIES, section_title="📚 Trading Dashboard", current_slug="3D Greeks")  # op de Greeks-pagina
+
 
 # ─────────────────────────── Convenience ───────────────────────────
 def norm_cdf(z: float) -> float:
@@ -36,12 +55,16 @@ def annualize_std(s: pd.Series, periods_per_year: int = 252) -> float:
     if len(s) < 2: return np.nan
     return float(s.std(ddof=0) * math.sqrt(periods_per_year))
 
-def bs_delta(S: float, K: float, iv: float, T_years: float, is_call: bool) -> float:
+# —— Black–Scholes Δ met continue r en q ——
+def bs_delta(S: float, K: float, iv: float, T_years: float, r_cont: float, q_cont: float, is_call: bool) -> float:
     if any(x is None or np.isnan(x) or x <= 0 for x in [S, K]) or np.isnan(iv) or T_years <= 0:
         return np.nan
-    d1 = (math.log(S / K) + 0.5 * iv * iv * T_years) / (iv * math.sqrt(T_years))
+    sqrtT = math.sqrt(T_years)
+    denom = iv * sqrtT if iv > 0 else float("inf")
+    d1 = (math.log(S / K) + (r_cont - q_cont + 0.5 * iv * iv) * T_years) / denom
     Nd1 = norm_cdf(d1)
-    return Nd1 if is_call else (Nd1 - 1.0)
+    disc_q = math.exp(-q_cont * T_years)
+    return (disc_q * Nd1) if is_call else (disc_q * (Nd1 - 1.0))
 
 def strangle_payoff_at_expiry(S, Kp, Kc, credit_pts, multiplier=100) -> float:
     return (credit_pts - max(Kp - S, 0.0) - max(S - Kc, 0.0)) * multiplier
@@ -72,12 +95,13 @@ def get_bq_client():
 _bq_client = get_bq_client()
 
 def _bq_param(name, value):
+    from datetime import date as _date
     if isinstance(value, (list, tuple)):
         if len(value) == 0: return bigquery.ArrayQueryParameter(name, "STRING", [])
         e = value[0]
         if isinstance(e, int):   return bigquery.ArrayQueryParameter(name, "INT64", list(value))
         if isinstance(e, float): return bigquery.ArrayQueryParameter(name, "FLOAT64", list(value))
-        if isinstance(e, (date, pd.Timestamp, datetime)):
+        if isinstance(e, (_date, pd.Timestamp, datetime)):
             return bigquery.ArrayQueryParameter(name, "DATE", [str(pd.to_datetime(v).date()) for v in value])
         return bigquery.ArrayQueryParameter(name, "STRING", [str(v) for v in value])
     if isinstance(value, bool):                 return bigquery.ScalarQueryParameter(name, "BOOL", value)
@@ -98,25 +122,15 @@ st.set_page_config(page_title="SPX Options Dashboard", layout="wide")
 st.title("🧩 SPX Options Dashboard")
 VIEW = "marketdata.spx_options_enriched_v"
 
-# Plotly UI
-PLOTLY_CONFIG = {
-    "scrollZoom": True,
-    "doubleClick": "reset",
-    "displaylogo": False,
-    "modeBarButtonsToRemove": ["lasso2d", "select2d"]
-}
+PLOTLY_CONFIG = {"scrollZoom": True, "doubleClick": "reset", "displaylogo": False, "modeBarButtonsToRemove": ["lasso2d","select2d"]}
 
 with st.expander("📌 Workflow (kort): van data → strangle-keuze", expanded=False):
-    st.markdown(
-        """
-1) Kies **periode, type, DTE & moneyness**.  
+    st.markdown("""1) Kies **periode, type, DTE & moneyness**.  
 2) Bekijk **Serie-selectie** om gevoel te krijgen voor prijs/PPD en liquiditeit.  
-3) Gebruik **PPD vs Afstand** & **PPD vs DTE** om een sweet spot in %-afstand en looptijd te vinden.  
-4) Check **Vol & Risk** (IV-Rank/VRP/Expected Move).  
-5) In **Strangle Helper** kies je σ/Δ-doelen of gebruik **Auto-pick**.  
-6) Valideer met **Margin & Payoff** en test een **Roll**.
-        """
-    )
+3) Gebruik **PPD vs Afstand** & **PPD vs DTE**.  
+4) Check **Vol & Risk**.  
+5) **Strangle Helper** (σ/Δ) + **Auto-pick**.  
+6) **Margin & Payoff** en **Roll**.""")
 
 # ─────────────────────────── Filters ──────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
@@ -129,8 +143,8 @@ default_start = max(min_date, max_date - timedelta(days=365))
 
 colA, colB, colC, colD, colE = st.columns([1.3, 0.8, 1, 1, 1.2])
 with colA:
-    start_date, end_date = st.date_input("Periode (snapshot_date)",
-        value=(default_start, max_date), min_value=min_date, max_value=max_date, format="YYYY-MM-DD")
+    start_date, end_date = st.date_input("Periode (snapshot_date)", value=(default_start, max_date),
+        min_value=min_date, max_value=max_date, format="YYYY-MM-DD")
 with colB:
     sel_type = st.radio("Type", ["call", "put"], index=1, horizontal=True)
 with colC:
@@ -142,12 +156,9 @@ with colE:
 
 # Liquidity guardrails
 colL1, colL2, colL3 = st.columns([1, 1, 1])
-with colL1:
-    min_oi = st.slider("Min Open Interest (filter)", 0, 50, 1, step=1)
-with colL2:
-    min_vol = st.slider("Min Volume (filter)", 0, 50, 1, step=1)
-with colL3:
-    min_per_bin = st.slider("Min punten per bin (aggr)", 1, 10, 3, step=1, help="Voor PPD-aggregaties per afstand/DTE.")
+with colL1: min_oi = st.slider("Min Open Interest (filter)", 0, 50, 1, step=1)
+with colL2: min_vol = st.slider("Min Volume (filter)", 0, 50, 1, step=1)
+with colL3: min_per_bin = st.slider("Min punten per bin (aggr)", 1, 10, 3, step=1, help="Voor PPD-aggregaties per afstand/DTE.")
 
 # expirations
 @st.cache_data(ttl=600, show_spinner=False)
@@ -205,7 +216,6 @@ if df.empty:
     st.warning("Geen data voor de huidige filters.")
     st.stop()
 
-# Liquidity mask (gebruik: overal waar we aggregeren/tekenen)
 liq_mask = ((df["open_interest"].fillna(0) >= min_oi) | (df["volume"].fillna(0) >= min_vol))
 
 # KPIs
@@ -219,19 +229,16 @@ st.markdown("---")
 # ─────────────────────────── Outliers & PPD-unit ──────────────────
 st.caption("Outliers kunnen de schaal verstoren. Kies een methode.")
 co1, co2, co3 = st.columns([1.1, 1, 1])
-with co1:
-    outlier_mode = st.radio("Outlier", ["Geen", "Percentiel clip", "IQR filter", "Z-score filter"], horizontal=True, index=1)
-with co2:
-    pct_clip = st.slider("Percentiel clip (links/rechts)", 0, 10, 5, step=1, disabled=(outlier_mode != "Percentiel clip"))
-with co3:
-    z_thr = st.slider("Z-score drempel", 2.0, 5.0, 3.0, step=0.1, disabled=(outlier_mode != "Z-score filter"))
+with co1: outlier_mode = st.radio("Outlier", ["Geen","Percentiel clip","IQR filter","Z-score filter"], horizontal=True, index=1)
+with co2: pct_clip = st.slider("Percentiel clip (links/rechts)", 0, 10, 5, step=1, disabled=(outlier_mode!="Percentiel clip"))
+with co3: z_thr = st.slider("Z-score drempel", 2.0, 5.0, 3.0, step=0.1, disabled=(outlier_mode!="Z-score filter"))
 
 def apply_outlier(series: pd.Series, mode: str, pct: int, zthr: float = 3.0) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").astype(float)
     if mode == "Geen": return s
     if mode == "Percentiel clip":
         if s.notna().any():
-            lo, hi = np.nanpercentile(s, [pct, 100 - pct]); return s.clip(lower=lo, upper=hi)
+            lo, hi = np.nanpercentile(s, [pct, 100-pct]); return s.clip(lower=lo, upper=hi)
         return s
     if mode == "IQR filter":
         if s.notna().any():
@@ -327,7 +334,6 @@ else:
         fig_price.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
         fig_price.update_yaxes(title_text="SP500", secondary_y=True)
         st.plotly_chart(fig_price, use_container_width=True, config=PLOTLY_CONFIG)
-        st.caption("**Interpretatie:** stabiel verloop met smalle bid-ask en voldoende volume/oi wijst op een ‘werkbare’ serie.")
     with a2:
         fig_ppd = make_subplots(specs=[[{"secondary_y": True}]])
         fig_ppd.add_trace(go.Scatter(x=serie["snapshot_date"],
@@ -342,7 +348,6 @@ else:
         fig_ppd.update_yaxes(title_text=ppd_y_label(), secondary_y=False, rangemode="tozero")
         fig_ppd.update_yaxes(title_text="SP500", secondary_y=True)
         st.plotly_chart(fig_ppd, use_container_width=True, config=PLOTLY_CONFIG)
-        st.caption("**Gebruik:** stijgende PPD bij gelijkblijvende DTE → oplopende IV of vraag naar bescherming; daling → omgekeerd.")
 
 # ─────────────────────────── B) PPD vs Afstand ────────────────────
 st.subheader("PPD & Afstand tot Uitoefenprijs (ATM→OTM/ITM)")
@@ -382,11 +387,6 @@ else:
                                height=420, dragmode="zoom")
     st.plotly_chart(fig_ppd_dist, use_container_width=True, config=PLOTLY_CONFIG)
 
-    # mini-advies
-    if best_idx is not None and pd.notna(g.loc[best_idx,"ppd_s"]):
-        st.info(f"**Advies (afstand):** over dit snapshot ligt de **sweet spot** rond **{g.loc[best_idx,'bin_mid']:.1f}%** van ATM "
-                f"met **PPD ≈ {g.loc[best_idx,'ppd_s']:.2f}**. Combineer met DTE-inzicht hieronder.")
-
 # ─────────────────────────── C) Price/PPD vs Exp Date ─────────────
 st.subheader("Ontwikkeling Prijs per Expiratiedatum (laatste snapshot)")
 df_last_strike = df_last[df_last["strike"] == series_strike].copy()
@@ -410,28 +410,21 @@ else:
     fig_exp.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
     fig_exp.update_yaxes(title_text=ppd_y_label(), secondary_y=True)
     st.plotly_chart(fig_exp, use_container_width=True, config=PLOTLY_CONFIG)
-    st.caption("**Interpretatie:** hogere PPD bij langere DTE = meer time value/dag; spikes per datum zijn vaak events (CPI/Fed) of smile-effecten.")
 
 # ─────────────────────────── D) PPD vs DTE ────────────────────────
 st.subheader("PPD vs DTE — opbouw van premium per dag")
 m1, m2, m3, m4, m5 = st.columns([1.2, 1, 1, 1, 1])
-with m1:
-    ppd_mode = st.radio("Bereik", ["ATM-band (moneyness)", "Rond gekozen strike"], index=0)
-with m2:
-    atm_band = st.slider("ATM-band (± moneyness %)", 0.01, 0.10, 0.02, step=0.01)
-with m3:
-    strike_window = st.slider("Strike-venster rond gekozen strike (punten)", 10, 200, 50, step=10)
-with m4:
-    use_last_snap = st.checkbox("Alleen laatste snapshot", value=True)
-with m5:
-    robust_scale = st.checkbox("Robust scale (95e pct)", value=True)
+with m1: ppd_mode = st.radio("Bereik", ["ATM-band (moneyness)", "Rond gekozen strike"], index=0)
+with m2: atm_band = st.slider("ATM-band (± moneyness %)", 0.01, 0.10, 0.02, step=0.01)
+with m3: strike_window = st.slider("Strike-venster rond gekozen strike (punten)", 10, 200, 50, step=10)
+with m4: use_last_snap = st.checkbox("Alleen laatste snapshot", value=True)
+with m5: robust_scale = st.checkbox("Robust scale (95e pct)", value=True)
 
 base_df = df_last if use_last_snap else df
-base_df = base_df[liq_mask]  # respecteer liquiditeit
-if ppd_mode.startswith("ATM"):
-    df_ppd = base_df[np.abs(base_df["moneyness"]) <= atm_band].copy()
-else:
-    df_ppd = base_df[(base_df["strike"] >= series_strike - strike_window) & (base_df["strike"] <= series_strike + strike_window)].copy()
+base_df = base_df[liq_mask]
+df_ppd = (base_df[np.abs(base_df["moneyness"]) <= atm_band].copy()
+          if ppd_mode.startswith("ATM") else
+          base_df[(base_df["strike"] >= series_strike - strike_window) & (base_df["strike"] <= series_strike + strike_window)].copy())
 
 if df_ppd.empty:
     st.info("Geen data voor PPD vs DTE met deze instellingen.")
@@ -456,44 +449,28 @@ else:
     if y_range: fig_ppd_dte.update_yaxes(range=y_range)
     st.plotly_chart(fig_ppd_dte, use_container_width=True, config=PLOTLY_CONFIG)
 
-    # mini-advies (DTE sweet spot)
-    sweet_row = ppd_curve.loc[ppd_curve["ppd_s"].idxmax()] if not ppd_curve.empty else None
-    if sweet_row is not None and pd.notna(sweet_row["ppd_s"]):
-        st.info(f"**Advies (DTE):** de PPD-sweet spot ligt rond **{int(sweet_row['days_to_exp'])} dagen** "
-                f"met **PPD ≈ {sweet_row['ppd_s']:.2f}**. Combineer dit met de afstand-sweet spot hierboven.")
-
 st.markdown("---")
 
 # ─────────────────────────── E) Matrix ────────────────────────────
 st.subheader("Matrix — meetmoment × strike")
 cM1, cM2, cM3 = st.columns([1, 1, 1])
-with cM1:
-    matrix_exp = st.selectbox("Expiratie (matrix)", options=sorted(df["expiration"].unique().tolist()), index=0, key="mx_exp")
-with cM2:
-    matrix_metric = st.radio("Waarde", ["last_price", "mid_price", "ppd"], horizontal=True, index=0, key="mx_metric")
-with cM3:
-    max_rows = st.slider("Max. meetmomenten (recentste)", 50, 500, 200, step=50, key="mx_rows")
+with cM1: matrix_exp = st.selectbox("Expiratie (matrix)", options=sorted(df["expiration"].unique().tolist()), index=0, key="mx_exp")
+with cM2: matrix_metric = st.radio("Waarde", ["last_price","mid_price","ppd"], horizontal=True, index=0, key="mx_metric")
+with cM3: max_rows = st.slider("Max. meetmomenten (recentste)", 50, 500, 200, step=50, key="mx_rows")
 
 mx = df[(df["expiration"]==matrix_exp) & liq_mask].copy().sort_values("snapshot_date").tail(max_rows)
 if mx.empty:
     st.info("Geen matrix-data voor de gekozen expiratie.")
 else:
-    if matrix_metric == "ppd":
-        mx = mx.assign(ppd_u=ppd_series(mx)); value_col = "ppd_u"
-    else:
-        value_col = matrix_metric
+    value_col = "ppd_u" if matrix_metric=="ppd" else matrix_metric
+    if matrix_metric=="ppd": mx = mx.assign(ppd_u=ppd_series(mx))
     mx["snap_s"] = mx["snapshot_date"].dt.strftime("%Y-%m-%d %H:%M")
     pivot = mx.pivot_table(index="snap_s", columns="strike", values=value_col, aggfunc="median").sort_index(ascending=False).round(3)
-    arr = pivot.values.astype(float)
-    tab_hm, tab_tbl = st.tabs(["Heatmap", "Tabel"])
-    with tab_hm:
-        fig_mx = go.Figure(data=go.Heatmap(z=arr, x=pivot.columns.astype(float), y=pivot.index.tolist(),
-                                           colorbar_title=value_col))
-        fig_mx.update_layout(title=f"Heatmap — {sel_type.upper()} exp {matrix_exp} — {value_col}",
-                             xaxis_title="Strike", yaxis_title="Meetmoment", height=520, dragmode="zoom")
-        st.plotly_chart(fig_mx, use_container_width=True, config=PLOTLY_CONFIG)
-    with tab_tbl:
-        st.dataframe(pivot, use_container_width=True)
+    fig_mx = go.Figure(data=go.Heatmap(z=pivot.values.astype(float), x=pivot.columns.astype(float), y=pivot.index.tolist(), colorbar_title=value_col))
+    fig_mx.update_layout(title=f"Heatmap — {sel_type.upper()} exp {matrix_exp} — {value_col}",
+                         xaxis_title="Strike", yaxis_title="Meetmoment", height=520, dragmode="zoom")
+    st.plotly_chart(fig_mx, use_container_width=True, config=PLOTLY_CONFIG)
+    st.tabs(["Tabel"])[0].dataframe(pivot, use_container_width=True)
 
 st.markdown("---")
 
@@ -502,7 +479,6 @@ term = df[liq_mask].groupby("days_to_exp", as_index=False)["implied_volatility"]
 fig_term = go.Figure(go.Scatter(x=term["days_to_exp"], y=term["implied_volatility"], mode="lines+markers", name=f"IV {sel_type.upper()}"))
 fig_term.update_layout(title="Term Structure — mediane IV", xaxis_title="DTE", yaxis_title="Implied Volatility", height=380, dragmode="zoom")
 st.plotly_chart(fig_term, use_container_width=True, config=PLOTLY_CONFIG)
-st.caption("**Interpretatie:** stijgende term structure → hogere vol voor langere looptijd; dalend → omgekeerd.")
 
 st.subheader("IV Smile (laatste snapshot)")
 exp_for_smile = st.selectbox("Expiratie voor IV Smile", options=exps_all or [None], index=0)
@@ -511,7 +487,6 @@ if sm.empty:
     st.info("Geen (liquide) data voor IV Smile.")
 else:
     sm = sm.groupby("strike", as_index=False)["implied_volatility"].median().sort_values("strike")
-    # zachte clipping tegen spikes
     if len(sm) >= 5:
         lo, hi = sm["implied_volatility"].quantile([0.02, 0.98])
         sm["implied_volatility"] = sm["implied_volatility"].clip(lower=lo, upper=hi)
@@ -519,20 +494,15 @@ else:
     fig_sm.update_layout(title=f"IV Smile — {sel_type.upper()} exp {exp_for_smile}",
                          xaxis_title="Strike", yaxis_title="Implied Volatility", height=420, dragmode="zoom")
     st.plotly_chart(fig_sm, use_container_width=True, config=PLOTLY_CONFIG)
-    st.caption("**Gebruik:** kies strangles in een **glad** stuk van de smile (weinig spikes) → betere liquiditeit & eerlijkere mid-prices.")
 
 # ─────────────────────────── G) Put/Call-ratio ────────────────────
 st.subheader("Put/Call-ratio per expiratie")
-p = (df[liq_mask].groupby(["expiration","type"], as_index=False)
-       .agg(vol=("volume","sum"), oi=("open_interest","sum")))
+p = (df[liq_mask].groupby(["expiration","type"], as_index=False).agg(vol=("volume","sum"), oi=("open_interest","sum")))
 if p.empty:
     st.info("Geen data voor PCR.")
 else:
-    pv = (p.pivot_table(index="expiration", columns="type", values=["vol","oi"], aggfunc="sum")
-            .sort_index().sort_index(axis=1)).fillna(0.0)
-    # columns flatten
+    pv = (p.pivot_table(index="expiration", columns="type", values=["vol","oi"], aggfunc="sum").sort_index().sort_index(axis=1)).fillna(0.0)
     pv.columns = [f"{a}_{b}" for a,b in pv.columns.to_flat_index()]
-    # ensure columns exist
     for col in ["vol_put","vol_call","oi_put","oi_call"]:
         if col not in pv.columns: pv[col] = 0.0
     pv["PCR_vol"] = pv["vol_put"] / pv["vol_call"].replace(0, np.nan)
@@ -547,7 +517,6 @@ else:
         fig_pcr.add_trace(go.Bar(x=pv.index, y=pv["PCR_oi"],  name="PCR (OI)"),  row=2, col=1)
         fig_pcr.update_layout(height=520, title_text="Put/Call-ratio per Expiratie", dragmode="zoom")
         st.plotly_chart(fig_pcr, use_container_width=True, config=PLOTLY_CONFIG)
-        st.caption("**Interpretatie:** PCR↑ → defensiever; PCR↓ → meer call-speculatie. Gebruik dit om je strangle-afstand/DTE conservatiever of agressiever te kiezen.")
 
 # ─────────────────────────── H) Vol & Risk ────────────────────────
 st.markdown("### 📊 Vol & Risk (ATM-IV, HV, VRP, IV-Rank, Expected-Move)")
@@ -573,15 +542,24 @@ with cv4: st.metric("IV-Rank (1y)", f"{iv_rank*100:.0f}%" if not np.isnan(iv_ran
 with cv5:
     em_txt = f"±{em_sigma:,.0f} pts ({em_sigma/underlying_now:.2%})" if (not np.isnan(em_sigma) and not np.isnan(underlying_now)) else "—"
     st.metric("Expected Move (σ)", em_txt)
-st.caption("**VRP**>0: IV boven gerealiseerde → gunstiger voor **short vol**. **IV-Rank** hoog → premie dikker (events checken).")
 
 # ─────────────────────────── I) Strangle Helper ───────────────────
 st.markdown("### 🧠 Strangle Helper (σ- of Δ-doel / quick pick)")
 cm1, cm2, cm3, cm4 = st.columns([1.2, 1, 1, 1])
-with cm1:  str_sel_mode = st.radio("Selectiemodus", ["σ-doel", "Δ-doel"], index=0)
+with cm1:  str_sel_mode = st.radio("Selectiemodus", ["σ-doel","Δ-doel"], index=0)
 with cm2:  sigma_target = st.slider("σ-doel per zijde", 0.5, 2.5, 1.0, step=0.1)
 with cm3:  delta_target = st.slider("Δ-doel (absoluut)", 0.05, 0.30, 0.15, step=0.01)
 with cm4:  price_source = st.radio("Prijsbron", ["mid_price","last_price"], index=0, horizontal=True)
+
+# —— NIEUW: r-toggle en q-bron —— #
+tw1, tw2, tw3 = st.columns([1.2, 1, 1])
+with tw1:
+    use_yield_r = st.toggle("Gebruik r uit yield-curve", value=True, help="Uit jouw yield view, term-structure aware.")
+with tw2:
+    r_manual_simple = st.number_input("r (p.j., simple) — handmatig", min_value=-0.02, max_value=0.10, value=0.02, step=0.001, format="%.3f", disabled=use_yield_r)
+with tw3:
+    q_mode = st.radio("q-bron", ["Constante q","Implied via C−P (pariteit)"], index=0, horizontal=True,
+                      help="Implied q gebruikt put–call-pariteit op near-ATM strike.")
 
 ce1, ce2, ce3 = st.columns([1.2, 1, 1])
 with ce1:
@@ -599,7 +577,7 @@ def load_strangle_slice(expiration, snap_min):
     sql = f"""
       SELECT TIMESTAMP_TRUNC(snapshot_date, MINUTE) AS snap_m, snapshot_date, type, expiration,
              days_to_exp, strike, underlying_price, implied_volatility, open_interest,
-             volume, last_price, mid_price
+             volume, last_price, mid_price, bid, ask
       FROM `{VIEW}`
       WHERE expiration = @exp AND DATE(snapshot_date) = DATE(@snap)
     """
@@ -620,6 +598,8 @@ iv_atm_exp = float(df_str.loc[(df_str["days_to_exp"].between(20,60)) & (df_str["
 dte_exp = int(pd.to_numeric(df_str["days_to_exp"], errors="coerce").median()) if not df_str.empty else np.nan
 T = max(dte_exp,1)/365.0 if not np.isnan(dte_exp) else np.nan
 sigma_pts = underlying_now * iv_atm_exp * math.sqrt(T) if (not np.isnan(underlying_now) and not np.isnan(iv_atm_exp) and not np.isnan(T)) else np.nan
+
+# Strike->IV map voor Δ
 strike_iv_map = {}
 if not df_str.empty:
     strike_iv_map = (df_str.groupby(["type","strike"], as_index=False)["implied_volatility"].median()
@@ -633,9 +613,71 @@ def nearest_strike(side: str, target_price: float) -> float:
     s_list = sorted(df_str[df_str["type"]==side]["strike"].unique().tolist()) if not df_str.empty else []
     return pick_closest_value(s_list, target_price, fallback=(s_list[len(s_list)//2] if s_list else 6000.0))
 
+# ——— r(T) bepalen (yield-curve of handmatig) ———
+_T = np.array([T if not np.isnan(T) else 30/365.0], dtype=float)  # veilige fallback
+if use_yield_r:
+    r_T = get_r_curve_for_snapshot(
+        snapshot_date=pd.to_datetime(sel_snapshot) if 'sel_snapshot' in locals() else pd.Timestamp(date.today()),
+        T_years=_T,
+        view="nth-pier-468314-p7.marketdata.yield_curve_analysis_wide",
+        compounding_in="simple",
+        extrapolate=True
+    )[0]
+else:
+    r_T = math.log1p(float(r_manual_simple))  # simple -> continuous
+
+# ——— q(T) bepalen: constante of implied via pariteit ———
+q_const_simple = st.number_input("Dividendrendement q (p.j., simple)", min_value=0.0, max_value=0.10, value=0.016, step=0.001, format="%.3f",
+                                 disabled=(q_mode != "Constante q"))
+
+def implied_q_from_parity(df_slice: pd.DataFrame, S: float, T: float, r_cont: float) -> float | np.nan:
+    # Kies near-ATM strike met beide legs beschikbaar; gebruik mid_price indien mogelijk, anders last/bid/ask fallback
+    if df_slice.empty or np.isnan(S) or T <= 0: return np.nan
+    # near-ATM
+    cand = df_slice.copy()
+    cand["atm_abs"] = (cand["strike"] - S).abs()
+    # call & put prijs per strike (mid prefer)
+    def _best_px(g):
+        def px(row):
+            for col in ["mid_price","last_price","bid","ask"]:
+                if col in row and not pd.isna(row[col]) and float(row[col])>0: return float(row[col])
+            return np.nan
+        return g.apply(px, axis=1)
+    # pivot
+    piv = (cand.assign(px=lambda x: x.apply(lambda r: r["mid_price"] if pd.notna(r.get("mid_price", np.nan)) and r["mid_price"]>0 else
+                                                     (r["last_price"] if pd.notna(r.get("last_price", np.nan)) and r["last_price"]>0 else
+                                                      (max(r.get("bid", np.nan), r.get("ask", np.nan)) if (pd.notna(r.get("bid", np.nan)) and pd.notna(r.get("ask", np.nan)) and max(r["bid"], r["ask"])>0) else np.nan)), axis=1))
+               .dropna(subset=["px"]))
+    piv = piv.pivot_table(index="strike", columns="type", values="px", aggfunc="median")
+    if ("call" not in piv.columns) or ("put" not in piv.columns) or piv.empty:
+        return np.nan
+    piv["atm_abs"] = (piv.index - S).abs()
+    piv = piv.dropna(subset=["call","put"]).sort_values("atm_abs")
+    if piv.empty: return np.nan
+    # pak beste near-ATM strike
+    K = float(piv.index[0]); C = float(piv.iloc[0]["call"]); P = float(piv.iloc[0]["put"])
+    try:
+        # q = -(1/T) * ln( (C - P + K*e^{-rT}) / S )
+        val = (C - P + K * math.exp(-r_cont * T)) / S
+        if val <= 0: return np.nan
+        q_cont = -math.log(val) / T
+        # sanity: -10% < q < 10% per jaar (continuous). Anders onbetrouwbaar → NaN
+        if not (-0.10 <= q_cont <= 0.10): return np.nan
+        return q_cont
+    except Exception:
+        return np.nan
+
+if q_mode == "Implied via C−P (pariteit)":
+    q_T = implied_q_from_parity(df_str, underlying_now, _T[0], r_T)
+    if np.isnan(q_T):
+        st.warning("Kon q niet betrouwbaar afleiden uit C−P pariteit (near-ATM). Val terug op constante q.")
+        q_T = get_q_curve_const(_T, q_const=q_const_simple, to_continuous=True)[0]
+else:
+    q_T = get_q_curve_const(_T, q_const=q_const_simple, to_continuous=True)[0]
+
 def pick_by_sigma():
     if np.isnan(sigma_pts): return np.nan, np.nan
-    return nearest_strike("put", underlying_now - sigma_target*sigma_pts), \
+    return nearest_strike("put",  underlying_now - sigma_target*sigma_pts), \
            nearest_strike("call", underlying_now + sigma_target*sigma_pts)
 
 def pick_by_delta():
@@ -644,10 +686,12 @@ def pick_by_delta():
     calls = df_str[df_str["type"]=="call"]["strike"].unique().tolist()
     best_p, best_c, err_p, err_c = np.nan, np.nan, 1e9, 1e9
     for K in puts:
-        d = bs_delta(underlying_now, K, get_iv_for("put", K), T, is_call=False); e = abs(abs(d) - delta_target)
+        d = bs_delta(underlying_now, K, get_iv_for("put", K), T, r_T, q_T, is_call=False)
+        e = abs(abs(d) - delta_target)
         if not np.isnan(d) and e < err_p: best_p, err_p = K, e
     for K in calls:
-        d = bs_delta(underlying_now, K, get_iv_for("call", K), T, is_call=True); e = abs(d - delta_target)
+        d = bs_delta(underlying_now, K, get_iv_for("call", K), T, r_T, q_T, is_call=True)
+        e = abs(d - delta_target)
         if not np.isnan(d) and e < err_c: best_c, err_c = K, e
     return float(best_p), float(best_c)
 
@@ -681,37 +725,24 @@ with km4: st.metric("Credit", f"{total_credit:,.2f}" if not np.isnan(total_credi
 with km5: st.metric("PPD (tot.)", f"{ppd_total_pts:,.2f}" if not np.isnan(ppd_total_pts) else "—")
 with km6: st.metric("~P(touch) max", f"{p_both_touch_approx*100:.0f}%" if not np.isnan(p_both_touch_approx) else "—")
 if show_table and not df_str.empty:
-    st.dataframe(df_str.sort_values(["type","strike"])[["type","strike","implied_volatility","open_interest","volume","last_price","mid_price"]],
+    st.dataframe(df_str.sort_values(["type","strike"])[["type","strike","implied_volatility","open_interest","volume","last_price","mid_price","bid","ask"]],
                  use_container_width=True)
 
-# mini-conclusies
-verdict = []
-if not np.isnan(iv_rank):
-    verdict.append("IV-Rank **hoog** → premie-verkopen aantrekkelijker; events checken." if iv_rank >= 0.7
-                   else "IV-Rank **laag** → premie dunner; overweeg smaller/kalendar.")
-if not any(np.isnan(x) for x in [iv_atm, hv20]) and (iv_atm - hv20) > 0.0:
-    verdict.append("**VRP** positief → kans op mean-reversion van vol (goed voor short premium).")
-if not np.isnan(p_both_touch_approx):
-    verdict.append("~**P(touch)** beide zijden ≲40% → comfortabele band." if p_both_touch_approx <= 0.40
-                   else "~**P(touch)** hoog → kies grotere σ-afstand / langere DTE.")
-if verdict: st.markdown("- " + "\n- ".join(verdict))
-
 # ─────────────────────────── J) Sizing & Payoff ───────────────────
-ready_for_sizing = (not any(np.isnan(x) for x in [underlying_now])) and \
-                   (not np.isnan(target_put)) and (not np.isnan(target_call))
+ready_for_sizing = (not any(np.isnan(x) for x in [underlying_now])) and (not np.isnan(target_put)) and (not np.isnan(target_call))
 st.markdown("### 💳 Margin & Sizing")
 if not ready_for_sizing:
     st.info("Kies eerst **strikes** in de *Strangle Helper* (σ of Δ).")
 else:
     sm1, sm2, sm3, sm4 = st.columns([1.1, 1, 1, 1])
-    with sm1: margin_model = st.radio("Margin model", ["SPAN-like stress", "Reg-T approx"], index=0)
+    with sm1: margin_model = st.radio("Margin model", ["SPAN-like stress","Reg-T approx"], index=0)
     with sm2: down_shock = st.slider("Down shock (%)", 5, 30, 15, step=1)
     with sm3: up_shock   = st.slider("Up shock (%)", 5, 30, 10, step=1)
     with sm4: multiplier = st.number_input("Contract multiplier", min_value=10, max_value=250, value=100, step=10)
 
     sb1, sb2, sb3 = st.columns([1, 1, 1])
     with sb1: risk_budget = st.number_input("Max risico budget €/$", min_value=1000.0, value=10000.0, step=1000.0, format="%.0f")
-    with sb2: show_payoff = st.checkbox("Toon payoff (1x)", value=True)
+    with sb2: show_payoff = st.checkbox("Toon payoff (1x)", value=True); 
     with sb3: pass
 
     if margin_model.startswith("SPAN"):
@@ -755,13 +786,13 @@ else:
                               height=420, dragmode="zoom")
         st.plotly_chart(fig_pay, use_container_width=True, config=PLOTLY_CONFIG)
 
-# ─────────────────────────── K) Roll-sim ──────────────────────────
+# ─────────────────────────── K) Roll-simulator ────────────────────
 st.markdown("### 🔄 Roll-simulator (uitrollen / herpositioneren)")
 if not ready_for_sizing or df_str.empty:
     st.info("Selecteer eerst een strangle in de *Strangle Helper*. Daarna kun je rollen simuleren.")
 else:
     rr1, rr2, rr3 = st.columns([1.2, 1.0, 1.0])
-    with rr1: roll_mode = st.radio("Rol-methode", ["σ-doel", "Δ-doel"], index=0, horizontal=True)
+    with rr1: roll_mode = st.radio("Rol-methode", ["σ-doel","Δ-doel"], index=0, horizontal=True)
     with rr2: sigma_target_roll = st.slider("σ-doel (roll)", 0.5, 2.5, 1.2, step=0.1)
     with rr3: delta_target_roll = st.slider("Δ-doel (roll, abs)", 0.05, 0.30, 0.15, step=0.01)
     future_exps = [e for e in exps_all if e > exp_for_str] if 'exp_for_str' in locals() else []
@@ -769,13 +800,14 @@ else:
         st.info("Geen latere expiraties beschikbaar binnen de filters om naar uit te rollen.")
     else:
         new_exp = st.selectbox("Naar welke expiratie rollen?", options=future_exps, index=0)
+
         @st.cache_data(ttl=300, show_spinner=False)
         def load_slice_for_exp(expiration, snap_min):
             if expiration is None or snap_min is None: return pd.DataFrame()
             sql = f"""
               SELECT TIMESTAMP_TRUNC(snapshot_date, MINUTE) AS snap_m, snapshot_date, type, expiration,
                      days_to_exp, strike, underlying_price, implied_volatility, open_interest,
-                     volume, last_price, mid_price
+                     volume, last_price, mid_price, bid, ask
               FROM `{VIEW}`
               WHERE expiration = @exp AND DATE(snapshot_date) = DATE(@snap)
             """
@@ -785,6 +817,7 @@ else:
             target = pd.to_datetime(snap_min)
             best_minute = all_rows.loc[(all_rows["snap_m"]-target).abs().idxmin(), "snap_m"]
             return all_rows[all_rows["snap_m"]==best_minute].copy()
+
         df_new = load_slice_for_exp(new_exp, sel_snapshot)
         if df_new.empty:
             st.info("Geen data voor de gekozen nieuwe expiratie op dit snapshot.")
@@ -798,11 +831,33 @@ else:
             sigma_pts_new = underlying_now * iv_atm_new * math.sqrt(T_new) if (not np.isnan(underlying_now) and not np.isnan(iv_atm_new) and not np.isnan(T_new)) else np.nan
             smile_map_new = (df_new.groupby(["type","strike"], as_index=False)["implied_volatility"].median()
                                    .set_index(["type","strike"])["implied_volatility"].to_dict())
+
+            # ——— r(T_new): zelfde toggle als boven ———
+            if use_yield_r:
+                r_T_new = get_r_curve_for_snapshot(
+                    snapshot_date=pd.to_datetime(sel_snapshot) if 'sel_snapshot' in locals() else pd.Timestamp(date.today()),
+                    T_years=np.array([_T[0] if np.isnan(T_new) else T_new]),
+                    view="nth-pier-468314-p7.marketdata.yield_curve_analysis_wide",
+                    compounding_in="simple",
+                    extrapolate=True
+                )[0]
+            else:
+                r_T_new = math.log1p(float(r_manual_simple))
+
+            # ——— q(T_new): zelfde bronkeuze ———
+            if q_mode == "Implied via C−P (pariteit)":
+                q_T_new = implied_q_from_parity(df_new, underlying_now, (T_new if not np.isnan(T_new) else _T[0]), r_T_new)
+                if np.isnan(q_T_new):
+                    q_T_new = get_q_curve_const(np.array([T_new if not np.isnan(T_new) else _T[0]]), q_const=q_const_simple, to_continuous=True)[0]
+            else:
+                q_T_new = get_q_curve_const(np.array([T_new if not np.isnan(T_new) else _T[0]]), q_const=q_const_simple, to_continuous=True)[0]
+
             def get_iv_new(side: str, K: float) -> float:
                 v = smile_map_new.get((side, K), np.nan); return float(v) if not np.isnan(v) else float(iv_atm_new)
             def nearest_strike_new(side: str, target_price: float) -> float:
                 arr = sorted(df_new[df_new["type"]==side]["strike"].unique().tolist())
                 return pick_closest_value(arr, target_price, fallback=(arr[len(arr)//2] if arr else 6000.0))
+
             if roll_mode.startswith("σ"):
                 new_put  = nearest_strike_new("put",  underlying_now - sigma_target_roll * sigma_pts_new)
                 new_call = nearest_strike_new("call", underlying_now + sigma_target_roll * sigma_pts_new)
@@ -811,22 +866,32 @@ else:
                 calls = sorted(df_new[df_new["type"]=="call"]["strike"].unique().tolist())
                 best_p, best_c, err_p, err_c = np.nan, np.nan, 1e9, 1e9
                 for K in puts:
-                    d = bs_delta(underlying_now, K, get_iv_new("put", K), T_new, is_call=False); e = abs(abs(d) - delta_target_roll)
+                    d = bs_delta(underlying_now, K, get_iv_new("put", K), T_new, r_T_new, q_T_new, is_call=False)
+                    e = abs(abs(d) - delta_target_roll)
                     if not np.isnan(d) and e < err_p: best_p, err_p = K, e
                 for K in calls:
-                    d = bs_delta(underlying_now, K, get_iv_new("call", K), T_new, is_call=True); e = abs(d - delta_target_roll)
+                    d = bs_delta(underlying_now, K, get_iv_new("call", K), T_new, r_T_new, q_T_new, is_call=True)
+                    e = abs(d - delta_target_roll)
                     if not np.isnan(d) and e < err_c: best_c, err_c = K, e
                 new_put, new_call = float(best_p), float(best_c)
+
             def _p(df_leg, typ, K):
                 row = df_leg[(df_leg["type"]==typ) & (df_leg["strike"]==K)]
-                return float(pd.to_numeric(row[price_source], errors="coerce").median()) if not row.empty else np.nan
+                for col in ["mid_price","last_price","bid","ask"]:
+                    if col in row and not row[col].isna().all():
+                        v = float(pd.to_numeric(row[col], errors="coerce").median())
+                        if v>0: return v
+                return np.nan
+
             new_put_px, new_call_px = _p(df_new,"put",new_put), _p(df_new,"call",new_call)
             new_credit = (new_put_px + new_call_px) if (not np.isnan(new_put_px) and not np.isnan(new_call_px)) else np.nan
             close_cost = (float(put_px) if not np.isnan(put_px) else 0.0) + (float(call_px) if not np.isnan(call_px) else 0.0)
             net_roll_credit = (new_credit - close_cost) if (not np.isnan(new_credit)) else np.nan
+
             def sigma_dist(K, sp): return abs(K - underlying_now) / sp if (sp and sp>0 and not np.isnan(sp)) else np.nan
             old_sd_put, old_sd_call = sigma_dist(float(target_put), sigma_pts_new), sigma_dist(float(target_call), sigma_pts_new)
             new_sd_put, new_sd_call = sigma_dist(float(new_put),  sigma_pts_new), sigma_dist(float(new_call),  sigma_pts_new)
+
             r1, r2, r3, r4 = st.columns(4)
             with r1: st.metric("Nieuwe exp.", str(new_exp))
             with r2: st.metric("Nieuwe strikes", f"P {new_put:.0f} / C {new_call:.0f}")
@@ -873,4 +938,9 @@ if not vix_vs_iv.empty:
     st.plotly_chart(fig_vix, use_container_width=True, config=PLOTLY_CONFIG)
 
 # ─────────────────────────── Footer ───────────────────────────────
-st.caption("🔍 Navigatie: zoom met scroll/pinch, **double-click** om automatisch te rescalen. Filters voor **OI/Volume** helpen spikes te verwijderen en geven realistischer curves.")
+st.caption("🔍 Navigatie: zoom met scroll/pinch, **double-click** om te rescalen. "
+           "Gebruik de toggles voor r en q om jouw aannames te testen (yield-curve vs handmatig; constante q vs implied q).")
+
+st.markdown("---")
+if st.button("➡️ Ga naar 3D Greeks & Surfaces"):
+    st.switch_page("pages/4_Greeks_3D.py")
