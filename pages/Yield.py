@@ -336,10 +336,12 @@ if sel:
     if show_1d_delta:
         for i, col in enumerate(sel, start=2):
             dser = get_1d_delta_bp(df_range, col)
+            colors = [("#16a34a" if (pd.notna(v) and v >= 0) else "#dc2626") for v in dser]
             fig.add_trace(
                 go.Bar(
                     x=df_range["date"], y=dser,
                     name=f"{col.upper()} Δ1D (bp)",
+                    marker_color=colors,
                     showlegend=False
                 ),
                 row=i, col=1
@@ -369,13 +371,16 @@ if sel:
 # 4) Heatmap
 st.subheader("Heatmap van rentes")
 avail_yields_hm = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
-hm = df_range[["date"] + avail_yields_hm].set_index("date")
-hfig = go.Figure(data=go.Heatmap(
-    z=hm[avail_yields_hm].T.values, x=hm.index.astype(str),
-    y=[c.replace("y_","").upper() for c in avail_yields_hm], coloraxis="coloraxis"
-))
-hfig.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="Viridis")
-st.plotly_chart(hfig, use_container_width=True)
+if avail_yields_hm:
+    hm = df_range[["date"] + avail_yields_hm].set_index("date")
+    hfig = go.Figure(data=go.Heatmap(
+        z=hm[avail_yields_hm].T.values, x=hm.index.astype(str),
+        y=[c.replace("y_","").upper() for c in avail_yields_hm], coloraxis="coloraxis"
+    ))
+    hfig.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="Viridis")
+    st.plotly_chart(hfig, use_container_width=True)
+else:
+    st.info("Geen yields beschikbaar voor de heatmap binnen de gekozen periode.")
 
 # ================== DELTA-SECTIE ==================
 st.header("Δ Deltas (basispunten)")
@@ -434,26 +439,55 @@ if available_horizons:
                           yaxis_title="Δ (bp)", xaxis_title="")
         target_cols[idx % 2].plotly_chart(fig, use_container_width=True)
 
-# 4c) Delta tijdreeks
+# 4c) Delta tijdreeks — bars groen/rood + modus: Overlay of Gestapeld
 st.subheader("Delta tijdreeks")
 hoptions = [h for h, _ in available_horizons] or []
 if hoptions:
     hsel = st.selectbox("Horizon", hoptions, index=0)
     suffix_sel = dict(available_horizons)[hsel]
+
+    chart_mode = st.radio(
+        "Weergave",
+        options=["Overlay", "Gestapeld"],
+        horizontal=True,
+        index=0,
+        help="Overlay: reeksen over elkaar (transparant). Gestapeld: reeksen opgeteld."
+    )
+
     candidates, labels_map = [], {}
     for base, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
                         ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]:
         col = f"{base}{suffix_sel}"
         if col in df_range.columns:
             candidates.append(col); labels_map[col] = f"{label} ({hsel})"
+
     default_pick = [c for c in candidates if c.startswith("y_10y")] or candidates[:1]
     choose = st.multiselect("Kies metrics", candidates, default=default_pick,
                             format_func=lambda c: labels_map.get(c, c))
+
     if choose:
         figd = go.Figure()
         for c in choose:
-            figd.add_trace(go.Scatter(x=df_range["date"], y=df_range[c], name=labels_map.get(c, c)))
-        figd.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Δ (bp)", xaxis_title="Date")
+            yvals = pd.to_numeric(df_range[c], errors="coerce")
+            colors = [("#16a34a" if (pd.notna(v) and v >= 0) else "#dc2626") for v in yvals]
+            figd.add_trace(go.Bar(
+                x=df_range["date"],
+                y=yvals,
+                name=labels_map.get(c, c),
+                marker_color=colors,
+                opacity=(0.75 if chart_mode == "Overlay" and len(choose) > 1 else 1.0)
+            ))
+
+        figd.add_hline(y=0, line_width=1, line_color="gray", opacity=0.5)
+
+        figd.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            barmode=("overlay" if chart_mode == "Overlay" else "relative"),
+            yaxis_title="Δ (bp)",
+            xaxis_title="Date",
+            legend_title_text="Reeks"
+        )
+
         st.plotly_chart(figd, use_container_width=True)
         st.caption("Positief = stijging over de gekozen horizon; negatief = daling.")
 else:
