@@ -269,9 +269,86 @@ st.plotly_chart(ts_fig, use_container_width=True)
 st.markdown(
     """
 **Wat je ziet:** de rentecurve (3M–30Y) op de gekozen datum.  
-**Interpretatie:** normaal = groei/inflatie; vlak = einde cyclus; invers = recessierisico.
+**Interpretatie (algemeen):** normaal = groei/inflatiepremie; vlak = late cyclus/overgang; invers = recessierisico/verwachte renteverlagingen.
 """
 )
+
+# --- Analyse & interpretatie van de term structure (snapshot) ---
+st.subheader("Analyse: Term Structure (snapshot)")
+if not snap.empty:
+    row = snap.iloc[0]
+
+    def getv(c): 
+        return float(row[c]) if (c in snap.columns and pd.notna(row[c])) else None
+
+    y3m, y2y, y5y, y10y, y30y = (getv("y_3m"), getv("y_2y"), getv("y_5y"), getv("y_10y"), getv("y_30y"))
+    # Spreads (pp)
+    s2_3m  = (y2y - y3m) if (y2y is not None and y3m is not None) else None
+    s10_2  = (y10y - y2y) if (y10y is not None and y2y is not None) else None
+    s30_10 = (y30y - y10y) if (y30y is not None and y10y is not None) else None
+    # Curvature (butterfly 10Y vs 2Y/30Y): 2*10Y - (2Y+30Y)
+    butterfly = (2*y10y - (y2y + y30y)) if (y10y is not None and y2y is not None and y30y is not None) else None
+
+    thr_flat = 0.05  # 5 bp als 'vlak'-drempel
+
+    # Classificatie
+    label = "Onvoldoende data"
+    notes = []
+    if s10_2 is not None and s2_3m is not None and s30_10 is not None:
+        if s10_2 < -thr_flat:
+            label = "🔻 Invers (10Y < 2Y)"
+            notes.append("Markt prijst afkoeling/latere renteverlagingen in.")
+        elif abs(s2_3m) < thr_flat and abs(s10_2) < thr_flat and abs(s30_10) < thr_flat:
+            label = "⏸️ Vlak"
+            notes.append("Overgangsfase; weinig richting in cyclusverwachting.")
+        elif s2_3m > thr_flat and s10_2 > thr_flat and s30_10 >= -thr_flat:
+            label = "⤴️ Opwaarts hellend"
+            notes.append("Normaal profiel: groei/inflatiepremie; lager recessierisico.")
+        else:
+            # Curvature check
+            if butterfly is not None and butterfly > thr_flat:
+                label = "↭ Hump rond 10Y"
+                notes.append("Middensegment hoger: vraag/aanbod of duration-premie in mid maturities.")
+            elif butterfly is not None and butterfly < -thr_flat:
+                label = "∪ U-vorm"
+                notes.append("Korte & lange rente relatief hoog t.o.v. midden; defensievere premies.")
+            else:
+                label = "ℹ️ Gemengd profiel"
+                notes.append("Segmenten bewegen verschillend; let op rotatie/steepening of flattening.")
+
+    # Metrics weergave
+    m1, m2, m3, m4, m5 = st.columns(5)
+    for val, name, box in [
+        (y3m, "3M", m1), (y2y, "2Y", m2), (y5y, "5Y", m3), (y10y, "10Y", m4), (y30y, "30Y", m5)
+    ]:
+        box.metric(name, "—" if val is None else f"{round(val, round_dp)}%")
+
+    sA, sB, sC, sD = st.columns(4)
+    sA.metric("2Y–3M", "—" if s2_3m is None else f"{round(s2_3m, 2)} pp")
+    sB.metric("10Y–2Y", "—" if s10_2 is None else f"{round(s10_2, 2)} pp")
+    sC.metric("30Y–10Y", "—" if s30_10 is None else f"{round(s30_10, 2)} pp")
+    sD.metric("Curvature (10Y vs 2/30)", "—" if butterfly is None else f"{round(butterfly, 2)} pp")
+
+    # Conclusie/duiding
+    if label.startswith("🔻"): st.error(label)
+    elif label.startswith("⤴️"): st.success(label)
+    elif label.startswith("⏸️"): st.info(label)
+    elif label.startswith("↭") or label.startswith("∪"): st.warning(label)
+    else: st.info(label)
+
+    if notes:
+        st.caption(" • ".join(notes))
+
+    st.markdown(
+        """
+**Handvatten**  
+- Let op verschuivingen in **10Y–2Y** (steepening/flattening) en **30Y–10Y** (lange-staart premie/aanbod).  
+- Combineer met de **Signals**-sectie (5d/21d Δ’s) om regimewijzigingen tijdig te vangen.  
+- ‘Hump’-profielen wijzen vaak op **middellange duration-vraag** of **technische factoren**; U-vorm vaker op **risico-aversie** aan korte én lange kant.
+        """
+    )
+else:
+    st.info("Geen snapshot-data voor analyse.")
 
 # 2) Spreads (met recessies)
 st.subheader("Spreads")
@@ -314,10 +391,7 @@ if sel:
     total_rows   = 1 + n_delta_rows
 
     # Verhouding: 55% voor de hoofdgrafiek, 45% verdeeld over alle delta-rijen
-    if n_delta_rows > 0:
-        row_heights = [0.55] + [0.45 / n_delta_rows] * n_delta_rows
-    else:
-        row_heights = [1.0]
+    row_heights = [1.0] if n_delta_rows == 0 else [0.55] + [0.45 / n_delta_rows] * n_delta_rows
 
     fig = make_subplots(
         rows=total_rows, cols=1, shared_xaxes=True,
@@ -490,8 +564,6 @@ if hoptions:
 
         st.plotly_chart(figd, use_container_width=True)
         st.caption("Positief = stijging over de gekozen horizon; negatief = daling.")
-else:
-    st.info("Geen delta-kolommen gevonden in de view (verwacht *_delta_bp, *_delta_5d_bp, *_delta_21d_bp).")
 
 # ---------- Tabel + download ----------
 if show_table:
@@ -501,6 +573,3 @@ if show_table:
 csv = df_range.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Download CSV (gefilterd op periode)", data=csv,
                    file_name="yield_curve_filtered.csv", mime="text/csv")
-
-with st.expander("Debug: kolommen in view"):
-    st.write(sorted(list(cols)))
