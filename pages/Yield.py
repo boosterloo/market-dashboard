@@ -11,6 +11,7 @@ st.title("🧯 Yield Curve Dashboard")
 
 PROJECT_ID = st.secrets["gcp_service_account"]["project_id"]
 TABLES     = st.secrets.get("tables", {})
+# Tip: zet in secrets [tables].yield_view = "<project>.marketdata.yield_curve_dashboard_v"
 YIELD_VIEW = TABLES.get("yield_view", f"{PROJECT_ID}.marketdata.yield_curve_dashboard_v")
 
 # ---------- NBER recessieperioden ----------
@@ -151,8 +152,97 @@ for col, box in zip(["y_3m","y_2y","y_5y","y_10y","y_30y"], [k1,k2,k3,k4,k5]):
     box.metric(col.upper().replace("_",""), val)
 
 # ---------- SIGNAL LIGHTS / ALERTS ----------
-# (ongewijzigd – jouw logica voor regime/alerts hier)
-# ...
+st.subheader("Signals")
+sigL, sigR = st.columns([1.3, 1])
+
+# Kies regime-horizon
+with sigR:
+    regime_horizon = st.radio("Regime-horizon", ["5d", "21d"], horizontal=True, index=1)
+    suffix = "_delta_5d_bp" if regime_horizon == "5d" else "_delta_21d_bp"
+
+    # Drempels per horizon (iets strakker voor 5d)
+    default_steepen = 8 if regime_horizon == "5d" else 10
+    default_bigmove = 10 if regime_horizon == "5d" else 15
+
+    st.caption(f"Drempels ({regime_horizon} Δ in basispunten)")
+    thr_steepen = st.slider("Steil/plat drempel |Δ(10Y–2Y)|", 5, 50, default_steepen, step=1)
+    thr_bigmove  = st.slider("Grote move per looptijd/spread", 5, 50, default_bigmove, step=1)
+
+def last_val(col: str):
+    if col not in df_range.columns: return None
+    s = df_range[col].dropna()
+    return None if s.empty else float(s.iloc[-1])
+
+# Δ(10Y–2Y) op gekozen horizon
+d_spread = None
+spread_col = f"spread_10_2{suffix}"
+if spread_col in df_range.columns:
+    d_spread = last_val(spread_col)
+elif {f"y_10y{suffix}", f"y_2y{suffix}"}.issubset(df_range.columns):
+    d10 = last_val(f"y_10y{suffix}") or 0.0
+    d2  = last_val(f"y_2y{suffix}")  or 0.0
+    d_spread = d10 - d2
+
+# Δ’s per looptijd
+d_2y  = last_val(f"y_2y{suffix}")
+d_10y = last_val(f"y_10y{suffix}")
+
+# Huidige spreadniveau (pp)
+if "spread_10_2" in df_f.columns:
+    latest_spread = float(df_f.dropna(subset=["spread_10_2"]).iloc[-1]["spread_10_2"])
+elif {"y_10y","y_2y"}.issubset(df_f.columns):
+    tmp = df_f.dropna(subset=["y_10y","y_2y"])
+    latest_spread = float(tmp.iloc[-1]["y_10y"] - tmp.iloc[-1]["y_2y"])
+else:
+    latest_spread = None
+
+# Regime-detectie
+regime = "—"; explanation = []
+if (d_spread is not None) and (d_2y is not None) and (d_10y is not None):
+    if d_spread >= thr_steepen:
+        if d_2y <= 0 and d_10y >= 0:
+            regime = "✅ Bull steepening"; explanation.append("Kort ↓ en Lang ↑ (easing/risico-on).")
+        elif d_2y > 0 and d_10y > 0:
+            regime = "⚠️ Bear steepening"; explanation.append("Beide ↑, lang harder (inflatiepremie).")
+        else:
+            regime = "ℹ️ Mixed steepening"
+    elif d_spread <= -thr_steepen:
+        if d_2y >= 0 and d_10y <= 0:
+            regime = "❌ Bear flattening"; explanation.append("Kort ↑ en Lang ↓ (tightening/groei-stress).")
+        elif d_2y < 0 and d_10y < 0:
+            regime = "🟦 Bull flattening"; explanation.append("Beide ↓, lang harder (flight-to-quality).")
+        else:
+            regime = "ℹ️ Mixed flattening"
+    else:
+        regime = "⏸️ Neutraal"
+
+with sigL:
+    label = f"{regime} — Δ{regime_horizon}(10Y–2Y): {round(d_spread or 0.0,1)} bp"
+    if regime.startswith("✅"): st.success(label, icon="✅")
+    elif regime.startswith("❌"): st.error(label, icon="❌")
+    elif regime.startswith("⚠️"): st.warning(label, icon="⚠️")
+    elif regime.startswith("🟦"): st.info(label, icon="ℹ️")
+    else: st.info(label, icon="⏸️")
+    if explanation: st.caption(" • ".join(explanation))
+
+# Inversie-alert
+if latest_spread is not None and latest_spread < 0:
+    st.warning(f"🔻 Inversie actief: 10Y–2Y = {round(latest_spread,2)} pp (negatief).", icon="🔻")
+else:
+    st.caption(f"10Y–2Y = { '—' if latest_spread is None else str(round(latest_spread,2)) + ' pp' }")
+
+# Grote bewegingen (gekozen horizon)
+big_moves = []
+for base, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
+                    ("spread_10_2","10Y–2Y"), ("spread_30_10","30Y–10Y")]:
+    col = f"{base}{suffix}"
+    if col in df_range.columns:
+        v = last_val(col)
+        if v is not None and abs(v) >= thr_bigmove:
+            big_moves.append(f"{label}: {round(v,1)} bp")
+
+if big_moves:
+    st.info(f"📣 Grote bewegingen laatste {regime_horizon}: " + " | ".join(big_moves))
 
 # ---------- Helper recessie overlay ----------
 def add_recession_shapes(fig: go.Figure, show: bool, x_start: pd.Timestamp, x_end: pd.Timestamp):
@@ -164,22 +254,52 @@ def add_recession_shapes(fig: go.Figure, show: bool, x_start: pd.Timestamp, x_en
                           fillcolor="LightGray", opacity=0.25, layer="below", line_width=0)
     return fig
 
-# ---------- Grafieken ----------
+# ---------- Grafieken (onder elkaar) ----------
 # 1) Term Structure (snapshot)
-# (ongewijzigd – jouw bestaande code)
+st.subheader(f"Term Structure • {sel_date}")
+maturities, values = [], []
+for col, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y")]:
+    if col in snap.columns:
+        maturities.append(label)
+        values.append(snap[col].values[0] if not snap.empty else None)
+ts_fig = go.Figure()
+ts_fig.add_trace(go.Scatter(x=maturities, y=values, mode="lines+markers"))
+ts_fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Maturity")
+st.plotly_chart(ts_fig, use_container_width=True)
+st.markdown(
+    """
+**Wat je ziet:** de rentecurve (3M–30Y) op de gekozen datum.  
+**Interpretatie:** normaal = groei/inflatie; vlak = einde cyclus; invers = recessierisico.
+"""
+)
 
-# 2) Spreads
-# (ongewijzigd – jouw bestaande code)
+# 2) Spreads (met recessies)
+st.subheader("Spreads")
+if "spread_10_2" in df_range.columns or "spread_30_10" in df_range.columns:
+    sp = go.Figure()
+    if "spread_10_2" in df_range.columns:
+        sp.add_trace(go.Scatter(x=df_range["date"], y=df_range["spread_10_2"], name="10Y - 2Y"))
+    if "spread_30_10" in df_range.columns:
+        sp.add_trace(go.Scatter(x=df_range["date"], y=df_range["spread_30_10"], name="30Y - 10Y"))
+    sp.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Spread (pp)", xaxis_title="Date")
+    sp = add_recession_shapes(sp, show_recessions, pd.to_datetime(start_date), pd.to_datetime(end_date))
+    st.plotly_chart(sp, use_container_width=True)
+else:
+    st.info("Spreads niet beschikbaar in de view.")
+st.markdown("**Interpretatie:** 10Y–2Y < 0 = inversie (vaak 6–18 mnd vóór recessies).")
 
-# 3) Rentes per looptijd (tijdreeks) + 1D Δ
+# 3) Rentes per looptijd (tijdreeks) + 1D Δ per geselecteerde looptijd onder elkaar
 st.subheader("Rentes per looptijd (tijdreeks)")
 
 avail_yields = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
-default_sel = [c for c in ["y_2y","y_10y","y_30y"] if c in avail_yields] or avail_yields[:2]
+default_sel  = [c for c in ["y_2y","y_10y","y_30y"] if c in avail_yields] or avail_yields[:2]
 sel = st.multiselect("Selecteer looptijden", avail_yields, default=default_sel)
 
-show_1d_delta = st.toggle("Toon 1D delta (bp) onder grafiek", value=True,
-                          help="Gebruikt *_delta_bp indien aanwezig, anders diff()*100 vanaf de yield-reeks.")
+show_1d_delta = st.toggle(
+    "Toon 1D delta (bp) onder de grafiek — één rij per looptijd",
+    value=True,
+    help="Gebruikt *_delta_bp indien aanwezig, anders diff()*100 op de yield-reeks."
+)
 
 if sel:
     # helper: pak bestaande *_delta_bp of bereken on-the-fly
@@ -188,37 +308,51 @@ if sel:
         if dcol in df_in.columns:
             return pd.to_numeric(df_in[dcol], errors="coerce")
         s = pd.to_numeric(df_in[col], errors="coerce")
-        return s.diff() * 100.0
+        return s.diff() * 100.0  # procent → basispunten
+
+    n_delta_rows = len(sel) if show_1d_delta else 0
+    total_rows   = 1 + n_delta_rows
+
+    # Verhouding: 55% voor de hoofdgrafiek, 45% verdeeld over alle delta-rijen
+    if n_delta_rows > 0:
+        row_heights = [0.55] + [0.45 / n_delta_rows] * n_delta_rows
+    else:
+        row_heights = [1.0]
 
     fig = make_subplots(
-        rows=2 if show_1d_delta else 1, cols=1, shared_xaxes=True,
-        row_heights=[0.7, 0.3] if show_1d_delta else [1.0],
-        vertical_spacing=0.07
+        rows=total_rows, cols=1, shared_xaxes=True,
+        row_heights=row_heights, vertical_spacing=0.06
     )
 
+    # Rij 1: yields (lijnen)
     for col in sel:
         fig.add_trace(
             go.Scatter(x=df_range["date"], y=df_range[col], name=col.upper(), mode="lines"),
             row=1, col=1
         )
+    fig.update_yaxes(title_text="Yield (%)", row=1, col=1)
 
+    # Rijen 2..: per looptijd een eigen 1D-delta-bar
     if show_1d_delta:
-        for col in sel:
+        for i, col in enumerate(sel, start=2):
             dser = get_1d_delta_bp(df_range, col)
             fig.add_trace(
-                go.Bar(x=df_range["date"], y=dser, name=f"{col.upper()} Δ1D (bp)",
-                       legendgroup=f"{col}_delta", showlegend=False),
-                row=2, col=1
+                go.Bar(
+                    x=df_range["date"], y=dser,
+                    name=f"{col.upper()} Δ1D (bp)",
+                    showlegend=False
+                ),
+                row=i, col=1
             )
-        fig.add_hline(y=0, line_width=1, line_color="gray", opacity=0.5, row=2, col=1)
+            # nul-lijn voor elke delta-rij
+            fig.add_hline(y=0, line_width=1, line_color="gray", opacity=0.5, row=i, col=1)
+            fig.update_yaxes(title_text=f"{col.upper()} Δ1D (bp)", row=i, col=1, zeroline=True)
 
-    fig.update_yaxes(title_text="Yield (%)", row=1, col=1)
-    if show_1d_delta:
-        fig.update_yaxes(title_text="Δ1D (bp)", row=2, col=1, zeroline=True)
-    fig.update_xaxes(title_text="Date", row=2 if show_1d_delta else 1, col=1)
+    # X-as titel onderaan
+    fig.update_xaxes(title_text="Date", row=total_rows, col=1)
+    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
 
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), barmode="group")
-
+    # Recessie-overlay over alle rijen
     if show_recessions:
         x_start, x_end = pd.to_datetime(start_date), pd.to_datetime(end_date)
         for start, end in NBER_RECESSIONS:
@@ -233,10 +367,97 @@ if sel:
     st.plotly_chart(fig, use_container_width=True)
 
 # 4) Heatmap
-# (ongewijzigd – jouw bestaande code)
+st.subheader("Heatmap van rentes")
+avail_yields_hm = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
+hm = df_range[["date"] + avail_yields_hm].set_index("date")
+hfig = go.Figure(data=go.Heatmap(
+    z=hm[avail_yields_hm].T.values, x=hm.index.astype(str),
+    y=[c.replace("y_","").upper() for c in avail_yields_hm], coloraxis="coloraxis"
+))
+hfig.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="Viridis")
+st.plotly_chart(hfig, use_container_width=True)
 
 # ================== DELTA-SECTIE ==================
-# (ongewijzigd – jouw bestaande code)
+st.header("Δ Deltas (basispunten)")
+
+# Detecteer beschikbare delta-horizons
+available_horizons = []
+for hname, suffix_h in HORIZONS:
+    if any([(f"{b}{suffix_h}" in df_range.columns) for _, b in DELTA_BASES]):
+        available_horizons.append((hname, suffix_h))
+
+# 4a) Delta-matrix heatmap (laatste dag)
+try:
+    last_row = df_range.iloc[-1]
+    base_items = [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
+                  ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]
+    mat_labels, data_by_h = [], []
+    for hname, suffix_h in available_horizons:
+        vals, labs = [], []
+        for base, label in base_items:
+            col = f"{base}{suffix_h}"
+            if col in df_range.columns:
+                vals.append(last_row[col]); labs.append(label)
+        if vals:
+            data_by_h.append(vals); mat_labels = labs
+    if data_by_h:
+        st.subheader("Delta-matrix (laatste dag in gekozen periode)")
+        hm2 = go.Figure(data=go.Heatmap(
+            z=np.array(data_by_h).T, x=[h for h, _ in available_horizons],
+            y=mat_labels, coloraxis="coloraxis"
+        ))
+        hm2.update_layout(margin=dict(l=10,r=10,t=10,b=10),
+                          coloraxis_colorscale="RdBu", coloraxis_cmid=0)
+        st.plotly_chart(hm2, use_container_width=True)
+        st.caption("Rood = stijging (bp), Blauw = daling. Waarden van de laatste dag.")
+except Exception:
+    pass
+
+# 4b) Mini-bars per horizon (laatste dag)
+if available_horizons:
+    st.subheader("Delta-overzicht per horizon (laatste dag)")
+    colL, colR = st.columns(2)
+    target_cols = [colL, colR]
+    base_items = [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
+                  ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]
+    for idx, (hname, suffix_h) in enumerate(available_horizons):
+        vals, labs = [], []
+        for base, label in base_items:
+            col = f"{base}{suffix_h}"
+            if col in df_range.columns:
+                vals.append(last_row[col]); labs.append(label)
+        if not vals: continue
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=labs, y=vals, name=f"{hname} Δbp"))
+        fig.update_layout(title=f"{hname} Δbp (laatste dag)",
+                          margin=dict(l=10,r=10,t=40,b=10),
+                          yaxis_title="Δ (bp)", xaxis_title="")
+        target_cols[idx % 2].plotly_chart(fig, use_container_width=True)
+
+# 4c) Delta tijdreeks
+st.subheader("Delta tijdreeks")
+hoptions = [h for h, _ in available_horizons] or []
+if hoptions:
+    hsel = st.selectbox("Horizon", hoptions, index=0)
+    suffix_sel = dict(available_horizons)[hsel]
+    candidates, labels_map = [], {}
+    for base, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
+                        ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]:
+        col = f"{base}{suffix_sel}"
+        if col in df_range.columns:
+            candidates.append(col); labels_map[col] = f"{label} ({hsel})"
+    default_pick = [c for c in candidates if c.startswith("y_10y")] or candidates[:1]
+    choose = st.multiselect("Kies metrics", candidates, default=default_pick,
+                            format_func=lambda c: labels_map.get(c, c))
+    if choose:
+        figd = go.Figure()
+        for c in choose:
+            figd.add_trace(go.Scatter(x=df_range["date"], y=df_range[c], name=labels_map.get(c, c)))
+        figd.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Δ (bp)", xaxis_title="Date")
+        st.plotly_chart(figd, use_container_width=True)
+        st.caption("Positief = stijging over de gekozen horizon; negatief = daling.")
+else:
+    st.info("Geen delta-kolommen gevonden in de view (verwacht *_delta_bp, *_delta_5d_bp, *_delta_21d_bp).")
 
 # ---------- Tabel + download ----------
 if show_table:
