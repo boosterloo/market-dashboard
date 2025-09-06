@@ -120,6 +120,17 @@ d = df[(df["date"]>=start_date)&(df["date"]<=end_date)].reset_index(drop=True).c
 if "delta_abs" not in d or d["delta_abs"].isna().all(): d["delta_abs"]=d["close"].diff()
 if "delta_pct" not in d or d["delta_pct"].isna().all(): d["delta_pct"]=d["close"].pct_change()*100.0
 
+# ✨ Nieuw: keuzemenu voor delta in paneel 3
+delta_mode = st.selectbox("Paneel 3: kies delta-metric", ["Δ punten", "Δ %"], index=0)
+if delta_mode == "Δ %":
+    delta_series = d["delta_pct"]
+    delta_title = "Δ dag (%)"
+    delta_legend = "Δ dag (%)"
+else:
+    delta_series = d["delta_abs"]
+    delta_title = "Δ dag (punten)"
+    delta_legend = "Δ dag (punten)"
+
 # ---- Indicators ----
 d["ema20"], d["ema50"], d["ema200"] = ema(d["close"],20), ema(d["close"],50), ema(d["close"],200)
 d["rsi14"] = rsi(d["close"],14); d["cci20"] = cci(d,20)
@@ -144,11 +155,6 @@ c5.metric("YTD Return",  f"{ytd_full:.2f}%"  if ytd_full  is not None else "—"
 c6.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—")
 
 # ---- Chart (5 panelen) ----
-# Paneel 1: Heikin-Ashi + Donchian + Supertrend
-# Paneel 2: Close+EMA (primaire as) + VIX (secundaire as)
-# Paneel 3: Dagelijkse delta (bars)
-# Paneel 4: RSI
-# Paneel 5: CCI
 fig = make_subplots(
     rows=5, cols=1, shared_xaxes=True,
     specs=[
@@ -161,7 +167,7 @@ fig = make_subplots(
     subplot_titles=[
         "SP500 Heikin-Ashi + Supertrend (10,1) + Donchian",
         "Close + EMA(20/50/200) + VIX (2e y-as)",
-        "Δ dag (punten)",
+        delta_title,
         "RSI(14)",
         "CCI(20)"
     ],
@@ -200,9 +206,9 @@ if "vix_close" in d.columns and d["vix_close"].notna().any():
                              name="VIX (sec. y)"),
                   row=2, col=1, secondary_y=True)
 
-# (3) Dagelijkse delta (bars)
-delta_colors = np.where(d["delta_abs"] >= 0, "rgba(16,150,24,0.7)", "rgba(219,64,82,0.7)")
-fig.add_trace(go.Bar(x=d["date"], y=d["delta_abs"], name="Δ dag (punten)",
+# (3) Delta-bars (punten of procenten)
+delta_colors = np.where(delta_series >= 0, "rgba(16,150,24,0.7)", "rgba(219,64,82,0.7)")
+fig.add_trace(go.Bar(x=d["date"], y=delta_series, name=delta_legend,
                      marker=dict(color=delta_colors), opacity=0.9),
               row=3, col=1)
 
@@ -221,11 +227,10 @@ fig.update_layout(
 )
 fig.update_layout(xaxis_rangeslider_visible=False); fig.update_xaxes(rangeslider_visible=False)
 
-# Y-assen titels
 fig.update_yaxes(title_text="Index (HA)", row=1,col=1)
 fig.update_yaxes(title_text="Close/EMA", row=2,col=1, secondary_y=False)
 fig.update_yaxes(title_text="VIX", row=2,col=1, secondary_y=True)
-fig.update_yaxes(title_text="Δ dag (punten)", row=3,col=1)
+fig.update_yaxes(title_text=delta_title, row=3,col=1)
 fig.update_yaxes(title_text="RSI", row=4,col=1)
 fig.update_yaxes(title_text="CCI", row=5,col=1)
 
@@ -241,6 +246,7 @@ with c1:
     fig_abs.update_layout(title="Δ abs (punten)", height=320, bargap=0.02, margin=dict(l=10,r=10,t=40,b=10))
     st.plotly_chart(fig_abs, use_container_width=True)
 with c2:
-    fig_pct = go.Figure([go.Histogram(x=hist_df["delta_pct"]*100.0, nbinsx=int(bins))])
+    # FIX: delta_pct is al in %, dus geen extra *100
+    fig_pct = go.Figure([go.Histogram(x=hist_df["delta_pct"], nbinsx=int(bins))])
     fig_pct.update_layout(title="Δ %", height=320, bargap=0.02, margin=dict(l=10,r=10,t=40,b=10))
     st.plotly_chart(fig_pct, use_container_width=True)
