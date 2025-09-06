@@ -15,7 +15,8 @@ SPX_VIEW = st.secrets.get("tables", {}).get(
 
 # ---- Health ----
 try:
-    if not bq_ping(): st.error("Geen BigQuery-verbinding."); st.stop()
+    if not bq_ping():
+        st.error("Geen BigQuery-verbinding."); st.stop()
 except Exception as e:
     st.error("Geen BigQuery-verbinding."); st.caption(f"Details: {e}"); st.stop()
 
@@ -26,14 +27,17 @@ def load_spx():
 
 with st.spinner("SPX data laden…"):
     df = load_spx()
-if df.empty: st.warning("Geen data in view."); st.stop()
+if df.empty:
+    st.warning("Geen data in view."); st.stop()
 
 df["date"] = pd.to_datetime(df["date"]).dt.date
 for c in ["open","high","low","close","vix_close","delta_abs","delta_pct"]:
-    if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
 # ---- Helpers ----
-def ema(s: pd.Series, span: int): return s.ewm(span=span, adjust=False).mean()
+def ema(s: pd.Series, span: int):
+    return s.ewm(span=span, adjust=False).mean()
 
 def heikin_ashi(src: pd.DataFrame):
     ha_close = (src["open"] + src["high"] + src["low"] + src["close"]) / 4.0
@@ -51,7 +55,6 @@ def atr_rma(high, low, close, length: int):
     return tr.ewm(alpha=1/length, adjust=False).mean()
 
 def supertrend_on_ha(ha: pd.DataFrame, length: int = 10, multiplier: float = 1.0):
-    """Geeft st_line + trend terug, ALLEEN met index (geen date-kolom)."""
     high, low, close = ha["ha_high"], ha["ha_low"], ha["ha_close"]
     atr = atr_rma(high, low, close, length)
     hl2 = (high + low) / 2.0
@@ -72,9 +75,12 @@ def supertrend_on_ha(ha: pd.DataFrame, length: int = 10, multiplier: float = 1.0
         final_upper[i] = upper_basic.iloc[i] if (upper_basic.iloc[i] < final_upper[i-1]) or (close.iloc[i-1] > final_upper[i-1]) else final_upper[i-1]
         final_lower[i] = lower_basic.iloc[i] if (lower_basic.iloc[i] > final_lower[i-1]) or (close.iloc[i-1] < final_lower[i-1]) else final_lower[i-1]
 
-        if close.iloc[i] > final_upper[i-1]:   trend[i] = 1
-        elif close.iloc[i] < final_lower[i-1]: trend[i] = -1
-        else:                                  trend[i] = trend[i-1]
+        if close.iloc[i] > final_upper[i-1]:
+            trend[i] = 1
+        elif close.iloc[i] < final_lower[i-1]:
+            trend[i] = -1
+        else:
+            trend[i] = trend[i-1]
 
     st_line = pd.Series(np.where(trend == 1, final_lower, final_upper), index=ha.index, name="st_line")
     trend_s = pd.Series(trend, index=ha.index, name="trend")
@@ -138,15 +144,37 @@ c5.metric("YTD Return",  f"{ytd_full:.2f}%"  if ytd_full  is not None else "—"
 c6.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—")
 
 # ---- Chart (5 panelen) ----
+# Paneel 1: Heikin-Ashi + Donchian + Supertrend
+# Paneel 2: Close+EMA (primaire as) + VIX (secundaire as)
+# Paneel 3: Dagelijkse delta (bars)
+# Paneel 4: RSI
+# Paneel 5: CCI
 fig = make_subplots(
     rows=5, cols=1, shared_xaxes=True,
-    subplot_titles=["SP500 Heikin‑Ashi + Supertrend (10,1) + Donchian",
-                    "Close + EMA(20/50/200)","VIX (Close)","RSI(14)","CCI(20)"],
-    row_heights=[0.40, 0.20, 0.15, 0.12, 0.13], vertical_spacing=0.06
+    specs=[
+        [{}],
+        [{"secondary_y": True}],
+        [{}],
+        [{}],
+        [{}],
+    ],
+    subplot_titles=[
+        "SP500 Heikin-Ashi + Supertrend (10,1) + Donchian",
+        "Close + EMA(20/50/200) + VIX (2e y-as)",
+        "Δ dag (punten)",
+        "RSI(14)",
+        "CCI(20)"
+    ],
+    row_heights=[0.38, 0.28, 0.14, 0.10, 0.10],
+    vertical_spacing=0.06
 )
+
 # (1) HA + DC + ST
-fig.add_trace(go.Candlestick(x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
-                             name="SPX (Heikin‑Ashi)"), row=1, col=1)
+fig.add_trace(go.Candlestick(
+    x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
+    name="SPX (Heikin-Ashi)"),
+    row=1, col=1
+)
 fig.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines",
                          line=dict(dash="dot", width=2), name="DC High"), row=1, col=1)
 fig.add_trace(go.Scatter(x=d["date"], y=d["dc_low"], mode="lines",
@@ -157,29 +185,50 @@ fig.add_trace(go.Scatter(x=d["date"], y=st_up, mode="lines",
 fig.add_trace(go.Scatter(x=d["date"], y=st_dn, mode="lines",
                          line=dict(width=2, color="red"),   name="Supertrend ↓ (10,1)"), row=1,col=1)
 
-# (2) Close + EMA
-fig.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close"), row=2,col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], mode="lines", name="EMA20"), row=2,col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], mode="lines", name="EMA50"), row=2,col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"), row=2,col=1)
+# (2) Close + EMA (primair) & VIX (secundair)
+fig.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close"),
+              row=2, col=1, secondary_y=False)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], mode="lines", name="EMA20"),
+              row=2, col=1, secondary_y=False)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], mode="lines", name="EMA50"),
+              row=2, col=1, secondary_y=False)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"),
+              row=2, col=1, secondary_y=False)
 
-# (3) VIX
 if "vix_close" in d.columns and d["vix_close"].notna().any():
-    fig.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX"), row=3,col=1)
+    fig.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines",
+                             name="VIX (sec. y)"),
+                  row=2, col=1, secondary_y=True)
+
+# (3) Dagelijkse delta (bars)
+delta_colors = np.where(d["delta_abs"] >= 0, "rgba(16,150,24,0.7)", "rgba(219,64,82,0.7)")
+fig.add_trace(go.Bar(x=d["date"], y=d["delta_abs"], name="Δ dag (punten)",
+                     marker=dict(color=delta_colors), opacity=0.9),
+              row=3, col=1)
 
 # (4) RSI
 fig.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)"), row=4,col=1)
 fig.add_hline(y=70, line_dash="dot", row=4, col=1); fig.add_hline(y=30, line_dash="dot", row=4, col=1)
+
 # (5) CCI
 fig.add_trace(go.Scatter(x=d["date"], y=d["cci20"], mode="lines", name="CCI(20)"), row=5,col=1)
 fig.add_hline(y=100, line_dash="dot", row=5, col=1); fig.add_hline(y=-100, line_dash="dot", row=5, col=1)
 
-fig.update_layout(height=1400, margin=dict(l=20,r=20,t=60,b=20),
-                  legend_orientation="h", legend_yanchor="top", legend_y=1.08, legend_x=0)
+# Layout & assen
+fig.update_layout(
+    height=1400, margin=dict(l=20,r=20,t=60,b=20),
+    legend_orientation="h", legend_yanchor="top", legend_y=1.08, legend_x=0
+)
 fig.update_layout(xaxis_rangeslider_visible=False); fig.update_xaxes(rangeslider_visible=False)
-fig.update_yaxes(title_text="Index", row=1,col=1); fig.update_yaxes(title_text="Close/EMA", row=2,col=1)
-fig.update_yaxes(title_text="VIX", row=3,col=1);   fig.update_yaxes(title_text="RSI", row=4,col=1)
+
+# Y-assen titels
+fig.update_yaxes(title_text="Index (HA)", row=1,col=1)
+fig.update_yaxes(title_text="Close/EMA", row=2,col=1, secondary_y=False)
+fig.update_yaxes(title_text="VIX", row=2,col=1, secondary_y=True)
+fig.update_yaxes(title_text="Δ dag (punten)", row=3,col=1)
+fig.update_yaxes(title_text="RSI", row=4,col=1)
 fig.update_yaxes(title_text="CCI", row=5,col=1)
+
 st.plotly_chart(fig, use_container_width=True)
 
 # ---- Histogrammen ----
