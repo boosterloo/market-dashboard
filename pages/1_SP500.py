@@ -120,8 +120,10 @@ d = df[(df["date"]>=start_date)&(df["date"]<=end_date)].reset_index(drop=True).c
 if "delta_abs" not in d or d["delta_abs"].isna().all(): d["delta_abs"]=d["close"].diff()
 if "delta_pct" not in d or d["delta_pct"].isna().all(): d["delta_pct"]=d["close"].pct_change()*100.0
 
-# ✨ Nieuw: keuzemenu voor delta in paneel 3
-delta_mode = st.selectbox("Paneel 3: kies delta-metric", ["Δ punten", "Δ %"], index=0)
+# 🔘 Toggle bij de DELTA-grafiek
+left, right = st.columns([1,4])
+with left:
+    delta_mode = st.radio("Δ onder prijs", ["Δ punten", "Δ %"], index=0, horizontal=False)
 if delta_mode == "Δ %":
     delta_series = d["delta_pct"]
     delta_title = "Δ dag (%)"
@@ -139,77 +141,70 @@ ha = heikin_ashi(d); st_df = supertrend_on_ha(ha, length=10, multiplier=1.0)
 d[["ha_open","ha_high","ha_low","ha_close"]] = ha[["ha_open","ha_high","ha_low","ha_close"]]
 d["st_line"], d["st_trend"] = st_df["st_line"], st_df["trend"]
 
-# ---- KPI ----
-last = d.iloc[-1]
-regime = ("Bullish" if (last["close"]>d["ema200"].iloc[-1]) and (d["ema50"].iloc[-1]>d["ema200"].iloc[-1])
-          else "Bearish" if (last["close"]<d["ema200"].iloc[-1]) and (d["ema50"].iloc[-1]<d["ema200"].iloc[-1])
-          else "Neutraal")
-ytd_full, pytd_full = ytd_return_full(df), pytd_return_full(df)
-
-c1,c2,c3,c4,c5,c6 = st.columns(6)
-c1.metric("Laatste close", f"{last['close']:.2f}")
-c2.metric("Δ % (dag)", f"{(last['close']/d['close'].shift(1).iloc[-1]-1)*100:.2f}%" if len(d)>1 else "—")
-c3.metric("VIX (close)", f"{last.get('vix_close'):.2f}" if pd.notnull(last.get("vix_close")) else "—")
-c4.metric("Regime", regime)
-c5.metric("YTD Return",  f"{ytd_full:.2f}%"  if ytd_full  is not None else "—")
-c6.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—")
-
-# ---- Chart (5 panelen) ----
+# ---- Chart indeling (5 panelen) ----
+# 1) Heikin-Ashi + DC + Supertrend + VIX (sec. y)
+# 2) Δ bars (punten of %)
+# 3) Close + EMA
+# 4) RSI
+# 5) CCI
 fig = make_subplots(
     rows=5, cols=1, shared_xaxes=True,
     specs=[
-        [{}],
         [{"secondary_y": True}],
+        [{}],
         [{}],
         [{}],
         [{}],
     ],
     subplot_titles=[
-        "SP500 Heikin-Ashi + Supertrend (10,1) + Donchian",
-        "Close + EMA(20/50/200) + VIX (2e y-as)",
+        "SP500 Heikin-Ashi + Supertrend (10,1) + Donchian + VIX (2e y-as)",
         delta_title,
+        "Close + EMA(20/50/200)",
         "RSI(14)",
         "CCI(20)"
     ],
-    row_heights=[0.38, 0.28, 0.14, 0.10, 0.10],
+    row_heights=[0.38, 0.16, 0.26, 0.10, 0.10],
     vertical_spacing=0.06
 )
 
-# (1) HA + DC + ST
+# (1) HA + DC + ST + VIX (sec. y)
 fig.add_trace(go.Candlestick(
     x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
     name="SPX (Heikin-Ashi)"),
-    row=1, col=1
+    row=1, col=1, secondary_y=False
 )
 fig.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines",
-                         line=dict(dash="dot", width=2), name="DC High"), row=1, col=1)
+                         line=dict(dash="dot", width=2), name="DC High"), row=1, col=1, secondary_y=False)
 fig.add_trace(go.Scatter(x=d["date"], y=d["dc_low"], mode="lines",
-                         line=dict(dash="dot", width=2), name="DC Low"), row=1, col=1)
+                         line=dict(dash="dot", width=2), name="DC Low"), row=1, col=1, secondary_y=False)
 st_up = d["st_line"].where(d["st_trend"]==1); st_dn = d["st_line"].where(d["st_trend"]==-1)
 fig.add_trace(go.Scatter(x=d["date"], y=st_up, mode="lines",
-                         line=dict(width=2, color="green"), name="Supertrend ↑ (10,1)"), row=1,col=1)
+                         line=dict(width=2, color="green"), name="Supertrend ↑ (10,1)"),
+              row=1, col=1, secondary_y=False)
 fig.add_trace(go.Scatter(x=d["date"], y=st_dn, mode="lines",
-                         line=dict(width=2, color="red"),   name="Supertrend ↓ (10,1)"), row=1,col=1)
+                         line=dict(width=2, color="red"),   name="Supertrend ↓ (10,1)"),
+              row=1, col=1, secondary_y=False)
 
-# (2) Close + EMA (primair) & VIX (secundair)
-fig.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close"),
-              row=2, col=1, secondary_y=False)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], mode="lines", name="EMA20"),
-              row=2, col=1, secondary_y=False)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], mode="lines", name="EMA50"),
-              row=2, col=1, secondary_y=False)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"),
-              row=2, col=1, secondary_y=False)
-
+# VIX op tweede y-as met autoscaling
 if "vix_close" in d.columns and d["vix_close"].notna().any():
     fig.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines",
                              name="VIX (sec. y)"),
-                  row=2, col=1, secondary_y=True)
+                  row=1, col=1, secondary_y=True)
 
-# (3) Delta-bars (punten of procenten)
+# (2) Δ bars direct onder grafiek 1
 delta_colors = np.where(delta_series >= 0, "rgba(16,150,24,0.7)", "rgba(219,64,82,0.7)")
 fig.add_trace(go.Bar(x=d["date"], y=delta_series, name=delta_legend,
                      marker=dict(color=delta_colors), opacity=0.9),
+              row=2, col=1)
+
+# (3) Close + EMA
+fig.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close"),
+              row=3, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], mode="lines", name="EMA20"),
+              row=3, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], mode="lines", name="EMA50"),
+              row=3, col=1)
+fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"),
               row=3, col=1)
 
 # (4) RSI
@@ -227,10 +222,11 @@ fig.update_layout(
 )
 fig.update_layout(xaxis_rangeslider_visible=False); fig.update_xaxes(rangeslider_visible=False)
 
-fig.update_yaxes(title_text="Index (HA)", row=1,col=1)
-fig.update_yaxes(title_text="Close/EMA", row=2,col=1, secondary_y=False)
-fig.update_yaxes(title_text="VIX", row=2,col=1, secondary_y=True)
-fig.update_yaxes(title_text=delta_title, row=3,col=1)
+# Y-labels
+fig.update_yaxes(title_text="Index (HA)", row=1,col=1, secondary_y=False)
+fig.update_yaxes(title_text="VIX", row=1,col=1, secondary_y=True)
+fig.update_yaxes(title_text=delta_title, row=2,col=1)
+fig.update_yaxes(title_text="Close/EMA", row=3,col=1)
 fig.update_yaxes(title_text="RSI", row=4,col=1)
 fig.update_yaxes(title_text="CCI", row=5,col=1)
 
@@ -246,7 +242,7 @@ with c1:
     fig_abs.update_layout(title="Δ abs (punten)", height=320, bargap=0.02, margin=dict(l=10,r=10,t=40,b=10))
     st.plotly_chart(fig_abs, use_container_width=True)
 with c2:
-    # FIX: delta_pct is al in %, dus geen extra *100
+    # delta_pct is al in %, dus geen extra *100
     fig_pct = go.Figure([go.Histogram(x=hist_df["delta_pct"], nbinsx=int(bins))])
     fig_pct.update_layout(title="Δ %", height=320, bargap=0.02, margin=dict(l=10,r=10,t=40,b=10))
     st.plotly_chart(fig_pct, use_container_width=True)
