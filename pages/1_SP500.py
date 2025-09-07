@@ -83,12 +83,14 @@ def supertrend_on_ha(ha: pd.DataFrame, length: int = 10, multiplier: float = 1.0
     return pd.DataFrame({"st_line": st_line, "trend": trend_s}, index=ha.index)
 
 def donchian(d, n=20): return d["high"].rolling(n).max(), d["low"].rolling(n).min()
-def rsi(s, n=14):
+
+def rsi(s: pd.Series, n: int = 14):
     delta = s.diff()
     up = pd.Series(np.where(delta>0, delta, 0.0), index=s.index).rolling(n).mean()
     dn = pd.Series(np.where(delta<0, -delta,0.0), index=s.index).rolling(n).mean()
     rs = up/dn
     return 100 - (100/(1+rs))
+
 def cci(df_, n=20):
     tp = (df_["high"]+df_["low"]+df_["close"])/3
     sma = tp.rolling(n).mean()
@@ -99,6 +101,7 @@ def ytd_return_full(full_df: pd.DataFrame):
     max_d = full_df["date"].max(); start = date(max_d.year, 1, 1)
     sub = full_df[full_df["date"] >= start]
     return (sub["close"].iloc[-1]/sub["close"].iloc[0]-1)*100 if len(sub)>=2 else None
+
 def pytd_return_full(full_df: pd.DataFrame):
     max_d = full_df["date"].max(); prev_year = max_d.year-1
     start = date(prev_year,1,1)
@@ -231,8 +234,8 @@ fig2 = make_subplots(
     subplot_titles=[
         f"{'Δ (%)' if delta_mode=='Δ %' else 'Δ (punten)'} — {agg_mode.lower()}{' — MA'+str(ma_window) if smooth_on else ''}",
         "Close + EMA(20/50/200)",
-        "RSI(14) — zones",
-        "CCI(20) — zones",
+        "RSI(14) — zones + pijlsignalen",
+        "CCI(20) — zones + pijlsignalen",
         f"corr(Δ% SPX, {'Δ% VIX' if corr_vs=='% change' else 'VIX level'}) — window={corr_win}"
     ],
     row_heights=[0.22, 0.30, 0.16, 0.16, 0.16],
@@ -256,11 +259,37 @@ fig2.add_hline(y=50, line_dash="dash", row=3, col=1)
 fig2.add_hrect(y0=70, y1=100, fillcolor="rgba(255,0,0,0.07)", line_width=0, row=3, col=1)  # overbought
 fig2.add_hrect(y0=0,  y1=30,  fillcolor="rgba(0,128,0,0.07)", line_width=0, row=3, col=1)  # oversold
 
+# ---- RSI pijlsignalen: upcross 30 & downcross 70
+_rsi = d["rsi14"]
+rsi_up_idx = _rsi[(_rsi >= 30) & (_rsi.shift(1) < 30)].index
+rsi_dn_idx = _rsi[(_rsi <= 70) & (_rsi.shift(1) > 70)].index
+fig2.add_trace(go.Scatter(
+    x=d.loc[rsi_up_idx, "date"], y=_rsi.loc[rsi_up_idx], mode="markers",
+    name="RSI ↑30", marker=dict(symbol="triangle-up", size=10, color="green", line=dict(width=1, color="black")),
+    hovertemplate="RSI ↑30<br>%{x}<br>RSI=%{y:.1f}<extra></extra>"), row=3, col=1)
+fig2.add_trace(go.Scatter(
+    x=d.loc[rsi_dn_idx, "date"], y=_rsi.loc[rsi_dn_idx], mode="markers",
+    name="RSI ↓70", marker=dict(symbol="triangle-down", size=10, color="red", line=dict(width=1, color="black")),
+    hovertemplate="RSI ↓70<br>%{x}<br>RSI=%{y:.1f}<extra></extra>"), row=3, col=1)
+
 # (5) CCI + zones
 fig2.add_trace(go.Scatter(x=d["date"], y=d["cci20"], mode="lines", name="CCI(20)"), row=4,col=1)
 fig2.add_hline(y=100, line_dash="dot", row=4, col=1); fig2.add_hline(y=-100, line_dash="dot", row=4, col=1)
 fig2.add_hrect(y0=100,  y1=400,  fillcolor="rgba(255,0,0,0.07)", line_width=0, row=4, col=1)  # OB
 fig2.add_hrect(y0=-400, y1=-100, fillcolor="rgba(0,128,0,0.07)", line_width=0, row=4, col=1)  # OS
+
+# ---- CCI pijlsignalen: upcross −100 & downcross +100
+_cci = d["cci20"]
+cci_up_idx = _cci[(_cci >= -100) & (_cci.shift(1) < -100)].index
+cci_dn_idx = _cci[(_cci <= 100) & (_cci.shift(1) > 100)].index
+fig2.add_trace(go.Scatter(
+    x=d.loc[cci_up_idx, "date"], y=_cci.loc[cci_up_idx], mode="markers",
+    name="CCI ↑−100", marker=dict(symbol="triangle-up", size=10, color="green", line=dict(width=1, color="black")),
+    hovertemplate="CCI ↑−100<br>%{x}<br>CCI=%{y:.0f}<extra></extra>"), row=4, col=1)
+fig2.add_trace(go.Scatter(
+    x=d.loc[cci_dn_idx, "date"], y=_cci.loc[cci_dn_idx], mode="markers",
+    name="CCI ↓+100", marker=dict(symbol="triangle-down", size=10, color="red", line=dict(width=1, color="black")),
+    hovertemplate="CCI ↓+100<br>%{x}<br>CCI=%{y:.0f}<extra></extra>"), row=4, col=1)
 
 # (6) Rolling correlatie + regime zones
 fig2.add_trace(go.Scatter(x=rolling_corr.index.date, y=rolling_corr.values, mode="lines",
