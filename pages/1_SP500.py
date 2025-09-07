@@ -107,43 +107,90 @@ def pytd_return_full(full_df: pd.DataFrame):
     sub = full_df[(full_df["date"]>=start)&(full_df["date"]<=end)]
     return (sub["close"].iloc[-1]/sub["close"].iloc[0]-1)*100 if len(sub)>=2 else None
 
-# ---- UI / filter ----
+# ---- Periode ----
 min_d, max_d = df["date"].min(), df["date"].max()
 default_start = max(max_d - timedelta(days=365), min_d)
 start_date, end_date = st.slider("Periode", min_value=min_d, max_value=max_d,
                                  value=(default_start, max_d), format="YYYY-MM-DD")
 
-# ▼ Instellingen-balk (horizontaal)
-st.markdown("#### Instellingen")
-c1, c2, c3, c4, c5 = st.columns([1.2, 1.0, 1.2, 1.1, 1.1])
-with c1:
-    delta_mode = st.radio("Δ onder prijs", ["Δ punten", "Δ %"], index=0, horizontal=True,
-                          help="Weergave van dagmutatie onder de hoofdgrafiek: punten of procenten.")
-with c2:
-    agg_mode = st.selectbox("Aggregatie", ["Dagelijks", "Wekelijks", "Maandelijks"], index=0,
-                            help="Δ punten = som per periode. Δ % = gecomponeerd per periode.")
-with c3:
-    smooth_on = st.checkbox("Gladmaken (MA)", value=False,
-                            help="Voeg een voortschrijdend gemiddelde toe over de Δ-balken.")
-with c4:
-    ma_window = st.slider("MA-window", 2, 60, 5, step=1, disabled=not smooth_on,
-                          help="Aantal periodes voor de smoothing.")
-with c5:
+# ---- Algemene opties (bovenaan) ----
+c_top1, c_top2, c_top3 = st.columns([1.1,1.2,1.2])
+with c_top1:
     show_vix = st.checkbox("Toon VIX (paneel 1)", value=True,
-                            help="Zet VIX op de 2e y-as in de bovenste grafiek.")
-
-c6, c7 = st.columns([1.2, 1.8])
-with c6:
+                           help="VIX op 2e y-as in de bovenste grafiek.")
+with c_top2:
     corr_vs = st.radio("Rolling correlatie vs VIX", ["% change", "level"], index=0, horizontal=True,
                        help="Corr(Δ% SPX, Δ% VIX) of Corr(Δ% SPX, VIX-level).")
-with c7:
+with c_top3:
     corr_win = st.slider("Correlatie-window", 5, 90, 20, step=1,
-                         help="Aantal dagen voor de rolling correlatie in paneel 6.")
+                         help="Aantal dagen voor de rolling correlatie (paneel 6).")
 
-# Filter na het kiezen van periode
+# ---- Filter & basisberekeningen ----
 d = df[(df["date"]>=start_date)&(df["date"]<=end_date)].reset_index(drop=True).copy()
 if "delta_abs" not in d or d["delta_abs"].isna().all(): d["delta_abs"]=d["close"].diff()
 if "delta_pct" not in d or d["delta_pct"].isna().all(): d["delta_pct"]=d["close"].pct_change()*100.0
+
+d["ema20"], d["ema50"], d["ema200"] = ema(d["close"],20), ema(d["close"],50), ema(d["close"],200)
+dc_high, dc_low = donchian(d,20); d["dc_high"], d["dc_low"] = dc_high, dc_low
+ha = heikin_ashi(d); st_df = supertrend_on_ha(ha, length=10, multiplier=1.0)
+d[["ha_open","ha_high","ha_low","ha_close"]] = ha[["ha_open","ha_high","ha_low","ha_close"]]
+d["st_line"], d["st_trend"] = st_df["st_line"], st_df["trend"]
+d["rsi14"] = rsi(d["close"],14); d["cci20"] = cci(d,20)
+
+# ---- KPI ----
+last = d.iloc[-1]
+regime = ("Bullish" if (last["close"]>d["ema200"].iloc[-1]) and (d["ema50"].iloc[-1]>d["ema200"].iloc[-1])
+          else "Bearish" if (last["close"]<d["ema200"].iloc[-1]) and (d["ema50"].iloc[-1]<d["ema200"].iloc[-1])
+          else "Neutraal")
+ytd_full, pytd_full = ytd_return_full(df), pytd_return_full(df)
+c1m,c2m,c3m,c4m,c5m,c6m = st.columns(6)
+c1m.metric("Laatste close", f"{last['close']:.2f}")
+c2m.metric("Δ % (dag)", f"{(last['close']/d['close'].shift(1).iloc[-1]-1)*100:.2f}%" if len(d)>1 else "—")
+c3m.metric("VIX (close)", f"{last.get('vix_close'):.2f}" if pd.notnull(last.get("vix_close")) else "—")
+c4m.metric("Regime", regime)
+c5m.metric("YTD Return",  f"{ytd_full:.2f}%"  if ytd_full  is not None else "—")
+c6m.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—")
+
+# =======================
+# PANEEL 1 – prijs + VIX
+# =======================
+fig1 = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]],
+                     subplot_titles=["SP500 Heikin-Ashi + Supertrend (10,1) + Donchian" + (" + VIX (2e y-as)" if show_vix else "")])
+fig1.add_trace(go.Candlestick(x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
+                              name="SPX (Heikin-Ashi)"), row=1, col=1, secondary_y=False)
+fig1.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines",
+                          line=dict(dash="dot", width=2), name="DC High"), row=1, col=1, secondary_y=False)
+fig1.add_trace(go.Scatter(x=d["date"], y=d["dc_low"], mode="lines",
+                          line=dict(dash="dot", width=2), name="DC Low"), row=1, col=1, secondary_y=False)
+st_up = d["st_line"].where(d["st_trend"]==1); st_dn = d["st_line"].where(d["st_trend"]==-1)
+fig1.add_trace(go.Scatter(x=d["date"], y=st_up, mode="lines", line=dict(width=2, color="green"),
+                          name="Supertrend ↑ (10,1)"), row=1, col=1, secondary_y=False)
+fig1.add_trace(go.Scatter(x=d["date"], y=st_dn, mode="lines", line=dict(width=2, color="red"),
+                          name="Supertrend ↓ (10,1)"), row=1, col=1, secondary_y=False)
+if show_vix and ("vix_close" in d.columns and d["vix_close"].notna().any()):
+    fig1.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX (sec. y)"),
+                   row=1, col=1, secondary_y=True)
+
+fig1.update_layout(height=520, margin=dict(l=20,r=20,t=60,b=10),
+                   legend_orientation="h", legend_yanchor="top", legend_y=1.08, legend_x=0)
+fig1.update_xaxes(rangeslider_visible=False)
+fig1.update_yaxes(title_text="Index (HA)", row=1, col=1, secondary_y=False)
+fig1.update_yaxes(title_text="VIX", row=1, col=1, secondary_y=True)
+st.plotly_chart(fig1, use_container_width=True)
+
+# ── Δ-instellingen (tussen paneel 1 en 2)
+st.markdown("#### Δ-instellingen")
+d1, d2, d3, d4 = st.columns([1.0, 1.0, 0.9, 1.2])
+with d1:
+    delta_mode = st.radio("Weergave", ["Δ punten", "Δ %"], index=0, horizontal=True,
+                          help="Wat tonen we in het Δ-paneel direct hieronder?")
+with d2:
+    agg_mode = st.selectbox("Aggregatie", ["Dagelijks", "Wekelijks", "Maandelijks"], index=0,
+                            help="Δ punten = som per periode; Δ % = gecomponeerd per periode.")
+with d3:
+    smooth_on = st.checkbox("Smoothing (MA)", value=False)
+with d4:
+    ma_window = st.slider("MA-window", 2, 60, 5, step=1, disabled=not smooth_on)
 
 # ▶︎ Aggregatie helper
 def aggregate_delta(_df: pd.DataFrame, mode: str, how: str) -> pd.Series:
@@ -159,7 +206,7 @@ def aggregate_delta(_df: pd.DataFrame, mode: str, how: str) -> pd.Series:
     else:
         return t["delta_abs"].groupby(pd.Grouper(freq=rule)).sum(min_count=1)
 
-# Bereken Δ-serie + optionele smoothing
+# Bereken Δ-serie + smoothing
 delta_series = aggregate_delta(d, delta_mode, agg_mode)
 if smooth_on:
     delta_series = delta_series.rolling(ma_window, min_periods=1).mean()
@@ -169,109 +216,71 @@ delta_legend = "Δ (%)" if delta_mode=="Δ %" else "Δ (punten)"
 if smooth_on: delta_legend += f" — MA{ma_window}"
 delta_colors = np.where(delta_series.values >= 0, "rgba(16,150,24,0.7)", "rgba(219,64,82,0.7)")
 
-# ---- Indicators ----
-d["ema20"], d["ema50"], d["ema200"] = ema(d["close"],20), ema(d["close"],50), ema(d["close"],200)
-d["rsi14"] = rsi(d["close"],14); d["cci20"] = cci(d,20)
-dc_high, dc_low = donchian(d,20); d["dc_high"], d["dc_low"] = dc_high, dc_low
-ha = heikin_ashi(d); st_df = supertrend_on_ha(ha, length=10, multiplier=1.0)
-d[["ha_open","ha_high","ha_low","ha_close"]] = ha[["ha_open","ha_high","ha_low","ha_close"]]
-d["st_line"], d["st_trend"] = st_df["st_line"], st_df["trend"]
-
-# ---- KPI ----
-last = d.iloc[-1]
-regime = ("Bullish" if (last["close"]>d["ema200"].iloc[-1]) and (d["ema50"].iloc[-1]>d["ema200"].iloc[-1])
-          else "Bearish" if (last["close"]<d["ema200"].iloc[-1]) and (d["ema50"].iloc[-1]<d["ema200"].iloc[-1])
-          else "Neutraal")
-ytd_full, pytd_full = ytd_return_full(df), pytd_return_full(df)
-
-c1m,c2m,c3m,c4m,c5m,c6m = st.columns(6)
-c1m.metric("Laatste close", f"{last['close']:.2f}")
-c2m.metric("Δ % (dag)", f"{(last['close']/d['close'].shift(1).iloc[-1]-1)*100:.2f}%" if len(d)>1 else "—")
-c3m.metric("VIX (close)", f"{last.get('vix_close'):.2f}" if pd.notnull(last.get("vix_close")) else "—")
-c4m.metric("Regime", regime)
-c5m.metric("YTD Return",  f"{ytd_full:.2f}%"  if ytd_full  is not None else "—")
-c6m.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—")
-
-# ── Rolling correlatie data
+# ===============
+# PANEEL 2–6
+# ===============
+# Corr-data
 corr_df = d.copy(); corr_df["date_dt"] = pd.to_datetime(corr_df["date"]); corr_df = corr_df.set_index("date_dt")
 spx_ret = corr_df["delta_pct"]  # %
 vix_series = (corr_df["vix_close"].pct_change()*100.0) if corr_vs=="% change" else corr_df["vix_close"]
 corr_join = pd.concat([spx_ret.rename("spx"), vix_series.rename("vix")], axis=1).dropna()
 rolling_corr = corr_join["spx"].rolling(corr_win).corr(corr_join["vix"])
 
-# ---- Chart indeling (6 panelen) ----
-fig = make_subplots(
-    rows=6, cols=1, shared_xaxes=True,
-    specs=[[{"secondary_y": True}], [{}], [{}], [{}], [{}], [{}]],
+fig2 = make_subplots(
+    rows=5, cols=1, shared_xaxes=True,
     subplot_titles=[
-        "SP500 Heikin-Ashi + Supertrend (10,1) + Donchian" + (" + VIX (2e y-as)" if show_vix else ""),
         f"{'Δ (%)' if delta_mode=='Δ %' else 'Δ (punten)'} — {agg_mode.lower()}{' — MA'+str(ma_window) if smooth_on else ''}",
         "Close + EMA(20/50/200)",
-        "RSI(14)",
-        "CCI(20)",
+        "RSI(14) — zones",
+        "CCI(20) — zones",
         f"corr(Δ% SPX, {'Δ% VIX' if corr_vs=='% change' else 'VIX level'}) — window={corr_win}"
     ],
-    row_heights=[0.34, 0.16, 0.24, 0.09, 0.09, 0.08],
-    vertical_spacing=0.055
+    row_heights=[0.22, 0.30, 0.16, 0.16, 0.16],
+    vertical_spacing=0.06
 )
 
-# (1) HA + DC + ST + VIX
-fig.add_trace(go.Candlestick(x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
-                             name="SPX (Heikin-Ashi)"), row=1, col=1, secondary_y=False)
-fig.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines", line=dict(dash="dot", width=2), name="DC High"),
-              row=1, col=1, secondary_y=False)
-fig.add_trace(go.Scatter(x=d["date"], y=d["dc_low"], mode="lines", line=dict(dash="dot", width=2), name="DC Low"),
-              row=1, col=1, secondary_y=False)
-st_up = d["st_line"].where(d["st_trend"]==1); st_dn = d["st_line"].where(d["st_trend"]==-1)
-fig.add_trace(go.Scatter(x=d["date"], y=st_up, mode="lines", line=dict(width=2, color="green"), name="Supertrend ↑ (10,1)"),
-              row=1, col=1, secondary_y=False)
-fig.add_trace(go.Scatter(x=d["date"], y=st_dn, mode="lines", line=dict(width=2, color="red"), name="Supertrend ↓ (10,1)"),
-              row=1, col=1, secondary_y=False)
-if show_vix and ("vix_close" in d.columns and d["vix_close"].notna().any()):
-    fig.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX (sec. y)"),
-                  row=1, col=1, secondary_y=True)
-
 # (2) Δ bars
-fig.add_trace(go.Bar(x=delta_x, y=delta_series.values, name=delta_legend,
-                     marker=dict(color=delta_colors), opacity=0.9), row=2, col=1)
+fig2.add_trace(go.Bar(x=delta_x, y=delta_series.values, name=delta_legend,
+                      marker=dict(color=delta_colors), opacity=0.9), row=1, col=1)
 
 # (3) Close + EMA
-fig.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close"), row=3, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], mode="lines", name="EMA20"), row=3, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], mode="lines", name="EMA50"), row=3, col=1)
-fig.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"), row=3, col=1)
+fig2.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close"), row=2, col=1)
+fig2.add_trace(go.Scatter(x=d["date"], y=d["ema20"], mode="lines", name="EMA20"), row=2, col=1)
+fig2.add_trace(go.Scatter(x=d["date"], y=d["ema50"], mode="lines", name="EMA50"), row=2, col=1)
+fig2.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200"), row=2, col=1)
 
-# (4) RSI
-fig.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)"), row=4, col=1)
-fig.add_hline(y=70, line_dash="dot", row=4, col=1); fig.add_hline(y=30, line_dash="dot", row=4, col=1)
+# (4) RSI + zones
+fig2.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)"), row=3,col=1)
+fig2.add_hline(y=70, line_dash="dot", row=3, col=1); fig2.add_hline(y=30, line_dash="dot", row=3, col=1)
+fig2.add_hline(y=50, line_dash="dash", row=3, col=1)
+fig2.add_hrect(y0=70, y1=100, fillcolor="rgba(255,0,0,0.07)", line_width=0, row=3, col=1)  # overbought
+fig2.add_hrect(y0=0,  y1=30,  fillcolor="rgba(0,128,0,0.07)", line_width=0, row=3, col=1)  # oversold
 
-# (5) CCI
-fig.add_trace(go.Scatter(x=d["date"], y=d["cci20"], mode="lines", name="CCI(20)"), row=5, col=1)
-fig.add_hline(y=100, line_dash="dot", row=5, col=1); fig.add_hline(y=-100, line_dash="dot", row=5, col=1)
+# (5) CCI + zones
+fig2.add_trace(go.Scatter(x=d["date"], y=d["cci20"], mode="lines", name="CCI(20)"), row=4,col=1)
+fig2.add_hline(y=100, line_dash="dot", row=4, col=1); fig2.add_hline(y=-100, line_dash="dot", row=4, col=1)
+fig2.add_hrect(y0=100,  y1=400,  fillcolor="rgba(255,0,0,0.07)", line_width=0, row=4, col=1)  # OB
+fig2.add_hrect(y0=-400, y1=-100, fillcolor="rgba(0,128,0,0.07)", line_width=0, row=4, col=1)  # OS
 
-# (6) Rolling corr + regime zones
-fig.add_trace(go.Scatter(x=rolling_corr.index.date, y=rolling_corr.values, mode="lines", name="Rolling corr"),
-              row=6, col=1)
-fig.add_hline(y=0.0, line_dash="dot", row=6, col=1)
-# regime shading
-fig.add_hrect(y0=-1, y1=-0.5, fillcolor="rgba(255,0,0,0.06)", line_width=0, row=6, col=1)
-fig.add_hrect(y0=0.5, y1=1, fillcolor="rgba(0,128,0,0.06)", line_width=0, row=6, col=1)
+# (6) Rolling correlatie + regime zones
+fig2.add_trace(go.Scatter(x=rolling_corr.index.date, y=rolling_corr.values, mode="lines",
+                          name="Rolling corr"), row=5, col=1)
+fig2.add_hline(y=0.0, line_dash="dot", row=5, col=1)
+fig2.add_hrect(y0=-1, y1=-0.5, fillcolor="rgba(255,0,0,0.06)", line_width=0, row=5, col=1)
+fig2.add_hrect(y0=0.5, y1=1,   fillcolor="rgba(0,128,0,0.06)", line_width=0, row=5, col=1)
 
-# Layout
-fig.update_layout(height=1650, margin=dict(l=20,r=20,t=60,b=20),
-                  legend_orientation="h", legend_yanchor="top", legend_y=1.06, legend_x=0)
-fig.update_layout(xaxis_rangeslider_visible=False); fig.update_xaxes(rangeslider_visible=False)
-fig.update_yaxes(title_text="Index (HA)", row=1,col=1, secondary_y=False)
-fig.update_yaxes(title_text="VIX", row=1,col=1, secondary_y=True)
-fig.update_yaxes(title_text=f"{'Δ (%)' if delta_mode=='Δ %' else 'Δ (punten)'}", row=2,col=1)
-fig.update_yaxes(title_text="Close/EMA", row=3,col=1)
-fig.update_yaxes(title_text="RSI", row=4,col=1)
-fig.update_yaxes(title_text="CCI", row=5,col=1)
-fig.update_yaxes(title_text="corr", row=6,col=1, range=[-1,1])
+fig2.update_layout(height=1120, margin=dict(l=20,r=20,t=50,b=20),
+                   legend_orientation="h", legend_yanchor="top", legend_y=1.06, legend_x=0)
+fig2.update_xaxes(rangeslider_visible=False)
+fig2.update_yaxes(title_text="Δ", row=1, col=1)
+fig2.update_yaxes(title_text="Close/EMA", row=2, col=1)
+fig2.update_yaxes(title_text="RSI", row=3, col=1, range=[0,100])
+fig2.update_yaxes(title_text="CCI", row=4, col=1)
+fig2.update_yaxes(title_text="corr", row=5, col=1, range=[-1,1])
 
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig2, use_container_width=True)
 
-# ─────────────────────────── Heatmap (maand/jaar) ───────────────────────────
+# ───────────────────── Heatmap (maand/jaar) ─────────────────────
 st.subheader("Maand/jaar-heatmap van Δ")
 heat_on = st.checkbox("Toon heatmap", value=True,
                       help="Geaggregeerde Δ per maand: punten = som, % = gecomponeerd.")
