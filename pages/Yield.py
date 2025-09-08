@@ -1,4 +1,4 @@
-# pages/yield_curve.py
+# pages/Yield.py  — US op nieuwe enriched view
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,8 +11,7 @@ st.title("🧯 US Yield Curve Dashboard")
 
 PROJECT_ID = st.secrets["gcp_service_account"]["project_id"]
 TABLES     = st.secrets.get("tables", {})
-# Default naar de NIEUWE enriched view
-DEFAULT_VIEW = f"{PROJECT_ID}.marketdata.us_yield_curve_enriched_v"
+DEFAULT_VIEW = f"{PROJECT_ID}.marketdata.us_yield_curve_enriched_v"   # <- NIEUWE VIEW
 YIELD_VIEW   = TABLES.get("yield_view", DEFAULT_VIEW)
 
 # ---------- NBER recessieperioden ----------
@@ -34,11 +33,6 @@ def list_columns(fqtn: str) -> set[str]:
     dfc = run_query(sql, params={"tbl": tbl}, timeout=30)
     return set([c.lower() for c in dfc["column_name"].astype(str)])
 
-def nearest_date(dates: list[pd.Timestamp], target: pd.Timestamp) -> pd.Timestamp:
-    if not dates:
-        return target
-    return min(dates, key=lambda d: abs(pd.Timestamp(d) - target))
-
 def add_recession_shapes(fig: go.Figure, x_start: pd.Timestamp, x_end: pd.Timestamp, show: bool=True):
     if not show:
         return fig
@@ -49,11 +43,10 @@ def add_recession_shapes(fig: go.Figure, x_start: pd.Timestamp, x_end: pd.Timest
                           fillcolor="LightGray", opacity=0.22, layer="below", line_width=0)
     return fig
 
-# ---------- Kolommen ophalen ----------
 cols = list_columns(YIELD_VIEW)
 def have(c: str) -> bool: return c.lower() in cols
 
-# basis yields (enriched views hebben y_2y_synth + y_2y)
+# basis yields (enriched views hebben y_2y_synth en/of y_2y)
 y2y_pref = "y_2y_synth" if have("y_2y_synth") else ("y_2y" if have("y_2y") else None)
 if not y2y_pref:
     st.error(f"`{YIELD_VIEW}` mist `y_2y_synth`/`y_2y`.")
@@ -64,28 +57,23 @@ select_parts = ["date"]
 for src, alias in [("y_3m","y_3m"), (y2y_pref,"y_2y"), ("y_5y","y_5y"), ("y_10y","y_10y"), ("y_30y","y_30y")]:
     if have(src): select_parts.append(f"SAFE_CAST({src} AS FLOAT64) AS {alias}")
 for extra in ["spread_10_2", "spread_30_10", "snapshot_date",
-              # dag-delta bp (enriched view heeft *_d1_bp)
-              "y_3m_d1_bp","y_2y_d1_bp","y_5y_d1_bp","y_10y_d1_bp","y_30y_d1_bp"]:
+              "y_3m_d1_bp","y_2y_d1_bp","y_5y_d1_bp","y_10y_d1_bp","y_30y_d1_bp",
+              "z_spread_10_2_252"]:
     if have(extra): select_parts.append(extra)
 
-# 7d/30d deltas (enriched view heeft *_d7 & *_d30 in procentpunten)
+# 7d/30d veranderingen (pp) — converteren we in grafieken naar bp
 for base in ["y_3m","y_2y","y_5y","y_10y","y_30y","spread_10_2","spread_30_10"]:
     if have(f"{base}_d7"):  select_parts.append(f"SAFE_CAST({base}_d7  AS FLOAT64) AS {base}_d7")
     if have(f"{base}_d30"): select_parts.append(f"SAFE_CAST({base}_d30 AS FLOAT64) AS {base}_d30")
 
-# z-score op spread 10-2 (optioneel)
-if have("z_spread_10_2_252"):
-    select_parts.append("z_spread_10_2_252")
-
 sql = f"SELECT {', '.join(select_parts)} FROM `{YIELD_VIEW}` ORDER BY date"
-
 with st.spinner("Data ophalen uit BigQuery…"):
     df = run_query(sql, timeout=60)
 if df.empty:
     st.warning("Geen data gevonden.")
     st.stop()
 
-# ================ UI BOVENBALK (compact) ================
+# ================== BOVENBALK ==================
 cA, cB, cC, cD = st.columns([1.2, 1, 1, 1])
 with cA:
     strict = st.toggle("Strikt (alle looptijden)", value=False,
@@ -97,7 +85,7 @@ with cC:
 with cD:
     show_recessions = st.toggle("US recessies (NBER)", value=True)
 
-# Basis filtering
+# Filter basis
 df_f = df.copy()
 needed = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_f.columns]
 if strict and needed:
@@ -109,18 +97,17 @@ if df_f.empty:
     st.info("Na filteren geen data over.")
     st.stop()
 
-# ================ PERIODE ================
-dmin = pd.to_datetime(min(df_f["date"]))
-dmax = pd.to_datetime(max(df_f["date"]))
+# ================== PERIODE ==================
+df_f["date"] = pd.to_datetime(df_f["date"])
+dmin = df_f["date"].min()
+dmax = df_f["date"].max()
 this_year_start = pd.Timestamp(year=dmax.year, month=1, day=1)
 
 st.subheader("Periode")
-left, right = st.columns([1.6, 1])
+left, _ = st.columns([1.6, 1])
 with left:
     preset = st.radio("Presets", ["Max", "YTD", "1Y", "3Y", "5Y", "10Y", "Custom"],
                       horizontal=True, index=2)
-with right:
-    st.write("")
 
 def clamp(ts: pd.Timestamp) -> pd.Timestamp:
     return max(dmin, ts)
@@ -146,34 +133,44 @@ else:
     )
     start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
 
-mask = (pd.to_datetime(df_f["date"]) >= start_date) & (pd.to_datetime(df_f["date"]) <= end_date)
+mask = (df_f["date"] >= start_date) & (df_f["date"] <= end_date)
 df_range = df_f.loc[mask].copy()
 if df_range.empty:
     st.info("Geen data in de gekozen periode.")
     st.stop()
 
-# ================ SNAPSHOTS (selectie) ================
+# ================== SNAPSHOTS ==================
 st.subheader("Term Structure")
-snap_dates = sorted(list(pd.to_datetime(df_range["date"].dropna().unique())))
-latest_date = snap_dates[-1]
+
+# Force Timestamps voor widgets/vergelijking
+df_range["date"] = pd.to_datetime(df_range["date"])
+snap_dates: list[pd.Timestamp] = sorted(df_range["date"].dropna().unique().tolist())
+latest_date = pd.Timestamp(snap_dates[-1])
+
+def nearest_date(dates: list[pd.Timestamp], target: pd.Timestamp) -> pd.Timestamp:
+    return min(dates, key=lambda d: abs(pd.Timestamp(d) - target)) if dates else target
+
 one_month_prior = nearest_date(snap_dates, latest_date - pd.DateOffset(months=1))
+def fmt_ts(x) -> str: return pd.Timestamp(x).strftime("%Y-%m-%d")
+
+idx_primary = max(0, len(snap_dates) - 1)
+idx_secondary = snap_dates.index(one_month_prior) if one_month_prior in snap_dates else max(0, len(snap_dates) - 2)
 
 s1, s2, s3 = st.columns([1.2, 1.2, 1])
 with s1:
-    snap_primary = st.selectbox("Hoofd peildatum", options=snap_dates, index=len(snap_dates)-1, format_func=lambda d: d.date())
+    snap_primary = st.selectbox("Hoofd peildatum", options=snap_dates, index=idx_primary, format_func=fmt_ts)
 with s2:
     enable_compare = st.checkbox("Vergelijk met 2e peildatum", value=True)
     snap_secondary = None
     if enable_compare:
-        default_idx = snap_dates.index(one_month_prior) if one_month_prior in snap_dates else max(0, len(snap_dates)-2)
-        snap_secondary = st.selectbox("2e peildatum", options=snap_dates, index=default_idx, format_func=lambda d: d.date())
+        snap_secondary = st.selectbox("2e peildatum", options=snap_dates, index=idx_secondary, format_func=fmt_ts)
 with s3:
     st.caption("Kies één of twee datums voor de curve.")
 
 snap1 = df_range[df_range["date"] == snap_primary].tail(1)
 snap2 = df_range[df_range["date"] == snap_secondary].tail(1) if snap_secondary is not None else pd.DataFrame()
 
-# KPI’s
+# KPI’s (hoofd peildatum)
 def fmt_pct(x): 
     return "—" if pd.isna(x) else f"{round(float(x), round_dp)}%"
 
@@ -182,7 +179,7 @@ for col, box in zip(["y_3m","y_2y","y_5y","y_10y","y_30y"], [k1,k2,k3,k4,k5]):
     val = fmt_pct(snap1[col].values[0]) if (col in snap1.columns and not snap1.empty) else "—"
     box.metric(col.upper().replace("_",""), val)
 
-# Term structure plot (optioneel 2 sporen)
+# Term-structure plot (met optionele 2e curve)
 def curve_points(row: pd.Series):
     maturities = ["3M", "2Y", "5Y", "10Y", "30Y"]
     vals = [row.get("y_3m"), row.get("y_2y"), row.get("y_5y"), row.get("y_10y"), row.get("y_30y")]
@@ -193,19 +190,20 @@ def curve_points(row: pd.Series):
 ts_fig = go.Figure()
 if not snap1.empty:
     m, v = curve_points(snap1.iloc[0])
-    ts_fig.add_trace(go.Scatter(x=m, y=v, mode="lines+markers", name=str(snap_primary.date())))
+    ts_fig.add_trace(go.Scatter(x=m, y=v, mode="lines+markers", name=str(pd.Timestamp(snap_primary).date())))
 if enable_compare and not snap2.empty:
     m2, v2 = curve_points(snap2.iloc[0])
-    ts_fig.add_trace(go.Scatter(x=m2, y=v2, mode="lines+markers", name=str(snap_secondary.date()), line=dict(dash="dash")))
+    ts_fig.add_trace(go.Scatter(x=m2, y=v2, mode="lines+markers",
+                                name=str(pd.Timestamp(snap_secondary).date()), line=dict(dash="dash")))
 ts_fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Maturity")
 st.plotly_chart(ts_fig, use_container_width=True)
 st.caption("Normaal = stijgend; vlak = late cyclus; invers = recessierisico/verwachte cuts.")
 
-# ================ Signals (steepening/flattening) ================
+# ================== SIGNALS ==================
 st.subheader("Signals")
 sigL, sigR = st.columns([1.3, 1])
 with sigR:
-    # enriched view = 7d / 30d (niet 5d/21d)
+    # enriched view: 7d / 30d (waarden in procentpunten)
     regime_horizon = st.radio("Regime-horizon", ["7d", "30d"], horizontal=True, index=0)
     suffix = "_d7" if regime_horizon == "7d" else "_d30"
     default_steepen = 10 if regime_horizon == "7d" else 15
@@ -219,14 +217,12 @@ def last_val(col: str):
     s = pd.to_numeric(df_range[col], errors="coerce").dropna()
     return None if s.empty else float(s.iloc[-1])
 
-# Δ(10Y–2Y) op gekozen horizon (bp): enriched *_d7/_d30 zijn pp → *100
+# Δ(10Y–2Y) op gekozen horizon: pp → bp
 d_spread = None
-spread_col = f"spread_10_2{suffix}"
-if spread_col in df_range.columns:
-    val_pp = last_val(spread_col)
-    d_spread = None if val_pp is None else val_pp * 100.0
+if f"spread_10_2{suffix}" in df_range.columns:
+    v_pp = last_val(f"spread_10_2{suffix}")
+    d_spread = None if v_pp is None else v_pp * 100.0
 
-# Δ’s per looptijd (bp)
 def horizon_bp(col: str) -> float | None:
     c = f"{col}{suffix}"
     if c in df_range.columns:
@@ -273,7 +269,7 @@ if latest_spread is not None and latest_spread < 0:
 else:
     st.caption(f"10Y–2Y = { '—' if latest_spread is None else str(round(latest_spread,2)) + ' pp' }")
 
-# ================ Spreads (binnen periode) ================
+# ================== Spreads (synchroon met periode) ==================
 st.subheader("Spreads")
 if "spread_10_2" in df_range.columns or "spread_30_10" in df_range.columns:
     sp = go.Figure()
@@ -283,11 +279,11 @@ if "spread_10_2" in df_range.columns or "spread_30_10" in df_range.columns:
         sp.add_trace(go.Scatter(x=df_range["date"], y=df_range["spread_30_10"], name="30Y - 10Y"))
     sp.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Spread (pp)", xaxis_title="Date")
     sp.update_xaxes(range=[start_date, end_date])
-    sp = add_recession_shapes(sp, pd.to_datetime(start_date), pd.to_datetime(end_date), show_recessions)
+    sp = add_recession_shapes(sp, pd.to_datetime(start_date), pd.to_datetime(end_date), show=show_recessions)
     st.plotly_chart(sp, use_container_width=True)
 st.caption("10Y–2Y < 0 = inversie (vaak 6–18 mnd vóór recessies).")
 
-# ================ Rentes per looptijd + 1D deltas (synchroon) ================
+# ================== Rentes + 1D Δ ==================
 st.subheader("Rentes per looptijd (tijdreeks)")
 avail_yields = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
 default_sel  = [c for c in ["y_2y","y_10y","y_30y"] if c in avail_yields] or avail_yields[:2]
@@ -296,7 +292,7 @@ sel = st.multiselect("Selecteer looptijden", avail_yields, default=default_sel)
 show_1d_delta = st.toggle(
     "Toon 1D delta (bp) onder de grafiek — één rij per looptijd",
     value=True,
-    help="Gebruikt *_d1_bp indien aanwezig; anders diff()*100 op de reeks."
+    help="Gebruikt *_d1_bp indien aanwezig; anders diff()*100."
 )
 
 if sel:
@@ -335,7 +331,7 @@ if sel:
         fig = add_recession_shapes(fig, pd.to_datetime(start_date), pd.to_datetime(end_date), show=True)
     st.plotly_chart(fig, use_container_width=True)
 
-# ================ Heatmap (synchroon) ================
+# ================== Heatmap ==================
 st.subheader("Heatmap van rentes")
 avail_yields_hm = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
 if avail_yields_hm:
@@ -347,14 +343,14 @@ if avail_yields_hm:
     hfig.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="Viridis")
     st.plotly_chart(hfig, use_container_width=True)
 
-# ================ Deltas (7d/30d uit enriched view) ================
+# ================== Deltas (7d/30d uit enriched view) ==================
 st.header("Δ Deltas (basispunten)")
 available_horizons = []
 for name, suf in [("7d","_d7"), ("30d","_d30")]:
     if any([(f"{b}{suf}" in df_range.columns) for b in ["y_3m","y_2y","y_5y","y_10y","y_30y","spread_10_2","spread_30_10"]]):
         available_horizons.append((name, suf))
 
-# 4a) Delta-matrix (laatste dag)
+# Delta-matrix (laatste dag)
 if not df_range.empty and available_horizons:
     last_row = df_range.iloc[-1]
     base_items = [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
@@ -379,7 +375,7 @@ if not df_range.empty and available_horizons:
         st.plotly_chart(hm2, use_container_width=True)
         st.caption("Rood = stijging (bp), Blauw = daling. Waarden van de laatste dag.")
 
-# 4b) Delta tijdreeks
+# Delta tijdreeks
 st.subheader("Delta tijdreeks")
 hoptions = [h for h, _ in available_horizons] or []
 if hoptions:
@@ -401,15 +397,16 @@ if hoptions:
             yvals_bp = yvals_pp * 100.0
             colors = [("#16a34a" if (pd.notna(v) and v >= 0) else "#dc2626") for v in yvals_bp]
             figd.add_trace(go.Bar(x=df_range["date"], y=yvals_bp,
-                                  name=labels_map.get(c, c), marker_color=colors, opacity=(0.8 if len(choose)>1 else 1)))
+                                  name=labels_map.get(c, c), marker_color=colors,
+                                  opacity=(0.8 if len(choose)>1 else 1)))
         figd.add_hline(y=0, line_width=1, line_color="gray", opacity=0.5)
-        figd.update_layout(margin=dict(l=10,r=10,t=10,b=10),
+        figd.update_layout(margin=dict(l=10, r=10, t=10, b=10),
                            barmode=("overlay" if len(choose)>1 else "group"),
                            yaxis_title="Δ (bp)", xaxis_title="Date")
         figd.update_xaxes(range=[start_date, end_date])
         st.plotly_chart(figd, use_container_width=True)
 
-# ================ Z-score 10Y–2Y + Histogram Δ1D ================
+# ================== Z-score 10Y–2Y + Histogram Δ1D ==================
 st.subheader("Z-score 10Y–2Y en Δ1D histogram")
 extrasL, extrasR = st.columns(2)
 
@@ -429,7 +426,7 @@ with extrasL:
         st.plotly_chart(figz, use_container_width=True)
 
 with extrasR:
-    # Δ1D histogram (pak *_d1_bp als het bestaat, anders diff*100)
+    # Δ1D histogram (gebruik *_d1_bp indien aanwezig; anders diff()*100)
     cand = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
     if cand:
         tgt = st.selectbox("Δ1D histogram voor", cand, index=min(3, len(cand)-1))
@@ -444,7 +441,7 @@ with extrasR:
                            xaxis_title="Δ1D (bp)", yaxis_title="Aantal dagen")
         st.plotly_chart(hfig, use_container_width=True)
 
-# ================ Tabel + download ================
+# ================== Tabel + download ==================
 if show_table:
     st.subheader("Tabel")
     st.dataframe(df_range.sort_values("date", ascending=False).round(round_dp))
