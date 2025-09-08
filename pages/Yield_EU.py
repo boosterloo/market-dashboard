@@ -236,7 +236,7 @@ if (d_spread is not None) and (d_2y is not None) and (d_10y is not None):
     elif d_spread <= -thr_steepen:
         if d_2y >= 0 and d_10y <= 0:
             regime = "❌ Bear flattening"; explanation.append("Kort ↑ en Lang ↓ (tightening/groei-stress).")
-        elif d_2y < 0 en d_10y < 0:
+        elif d_2y < 0 and d_10y < 0:
             regime = "🟦 Bull flattening"; explanation.append("Beide ↓, lang harder (flight-to-quality).")
         else:
             regime = "ℹ️ Mixed flattening"
