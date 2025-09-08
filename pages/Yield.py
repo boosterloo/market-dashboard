@@ -333,11 +333,13 @@ for name, suf in [("7d","_d7"), ("30d","_d30")]:
     if any([(f"{b}{suf}" in df_range.columns) for b in ["y_3m","y_2y","y_5y","y_10y","y_30y","spread_10_2","spread_30_10"]]):
         available_horizons.append((name, suf))
 
-# 1) HISTOGRAM
+# 1) HISTOGRAMS: abs (bp) en relatieve (%)
 st.subheader("Histogram Δ (laatste periode)")
+
 if available_horizons:
     hsel = st.selectbox("Horizon", [h for h,_ in available_horizons], index=0, key="hist_h")
     suf  = dict(available_horizons)[hsel]
+
     # Kies metric
     candidates, labels_map = [], {}
     for base, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
@@ -345,20 +347,44 @@ if available_horizons:
         col = f"{base}{suf}"
         if col in df_range.columns:
             candidates.append(col); labels_map[col] = f"{label} ({hsel})"
-    default_c = next((c for c in candidates if c.startswith("y_10y")), candidates[0]) if candidates else None
-    if default_c:
+
+    if candidates:
+        default_c = next((c for c in candidates if c.startswith("y_10y")), candidates[0])
         pick = st.selectbox("Metric", candidates, index=candidates.index(default_c),
                             format_func=lambda c: labels_map.get(c, c), key="hist_metric")
-        # pp -> bp
+
+        # Absolute beweging in basispunten
         series_bp = pd.to_numeric(df_range[pick], errors="coerce") * 100.0
         series_bp = series_bp.replace([np.inf, -np.inf], np.nan).dropna()
-        hfig = go.Figure(data=[go.Histogram(x=series_bp, nbinsx=40)])
-        hfig.update_layout(margin=dict(l=10,r=10,t=10,b=10),
-                           xaxis_title="Δ (bp)", yaxis_title="Aantal dagen",
-                           bargap=0.05)
-        st.plotly_chart(hfig, use_container_width=True)
+
+        # Relatieve % verandering (Δ / vorige waarde)
+        raw_vals = pd.to_numeric(df_range[pick.replace(suf,"")], errors="coerce")
+        rel_pct = (series_bp / raw_vals.shift(1).replace(0,np.nan))  # Δbp / vorige yield
+        series_pct = rel_pct.replace([np.inf,-np.inf], np.nan).dropna()
+
+        h1, h2 = st.columns(2)
+
+        with h1:
+            hfig = go.Figure(data=[go.Histogram(x=series_bp, nbinsx=40)])
+            hfig.update_layout(
+                title="Absolute Δ (bp)",
+                margin=dict(l=10,r=10,t=30,b=10),
+                xaxis_title="Δ (bp)", yaxis_title="Aantal dagen", bargap=0.05
+            )
+            st.plotly_chart(hfig, use_container_width=True)
+
+        with h2:
+            hfig2 = go.Figure(data=[go.Histogram(x=series_pct, nbinsx=40)])
+            hfig2.update_layout(
+                title="Relatieve Δ (%)",
+                margin=dict(l=10,r=10,t=30,b=10),
+                xaxis_title="Δ (%)", yaxis_title="Aantal dagen", bargap=0.05
+            )
+            st.plotly_chart(hfig2, use_container_width=True)
+
     else:
         st.info("Geen delta-kolommen voor deze horizon.")
+
 
 # 2) TIJDREEKS
 st.subheader("Delta tijdreeks")
