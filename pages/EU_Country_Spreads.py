@@ -1,6 +1,6 @@
 # pages/EU_Country_Spreads.py — EU landen yields & spreads (levels + fragmentatie)
 # Vereist: utils.bq.run_query, st.secrets["gcp_service_account"]["project_id"]
-# Data: marketdata.eu_yields_daily (kolommen: date, country, tenor, value, spread_to_DE, spread_to_EA, ...)
+# Data: marketdata.eu_yields_daily (kolommen o.a.: date, country, tenor, value, spread_to_DE, spread_to_EA, source, snapshot_date)
 
 import streamlit as st
 import pandas as pd
@@ -20,6 +20,15 @@ EU_TABLE = TABLES.get("eu_yields_daily", f"{PROJECT_ID}.marketdata.eu_yields_dai
 def pct_fmt(x, dp=2):
     return "—" if pd.isna(x) else f"{round(float(x), dp)}%"
 
+def to_bp(x): 
+    return None if pd.isna(x) else float(x)*100.0
+
+def zscore_series(s: pd.Series, window: int) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    mu = s.rolling(window).mean()
+    sd = s.rolling(window).std()
+    return (s - mu) / sd
+
 @st.cache_data(show_spinner=False, ttl=600)
 def list_countries() -> list[str]:
     sql = f"SELECT DISTINCT country FROM `{EU_TABLE}` ORDER BY country"
@@ -30,40 +39,56 @@ def list_tenors() -> list[str]:
     sql = f"SELECT DISTINCT tenor FROM `{EU_TABLE}` ORDER BY tenor"
     return run_query(sql, timeout=20)["tenor"].tolist()
 
+@st.cache_data(show_spinner=False, ttl=300)
+def overall_minmax() -> tuple[pd.Timestamp, pd.Timestamp]:
+    sql = f"SELECT MIN(date) AS dmin, MAX(date) AS dmax FROM `{EU_TABLE}`"
+    r = run_query(sql, timeout=20).iloc[0]
+    return pd.to_datetime(r["dmin"]), pd.to_datetime(r["dmax"])
+
 @st.cache_data(show_spinner=True, ttl=300)
-def load_eu(countries: list[str], tenors: list[str], date_from: pd.Timestamp|None, date_to: pd.Timestamp|None) -> pd.DataFrame:
-    # Parameterized fetch (alleen wat we nodig hebben)
-    params = {
-        "countries": countries,
-        "tenors": tenors,
-        "dmin": None if date_from is None else str(pd.to_datetime(date_from).date()),
-        "dmax": None if date_to   is None else str(pd.to_datetime(date_to).date()),
-    }
-    where = ["country IN UNNEST(@countries)", "tenor IN UNNEST(@tenors)"]
-    if params["dmin"]: where.append("date >= @dmin")
-    if params["dmax"]: where.append("date <= @dmax")
+def load_eu(countries: list[str], tenors: list[str],
+            date_from: pd.Timestamp|None, date_to: pd.Timestamp|None) -> pd.DataFrame:
+    """
+    Robuuste fetch zonder BigQuery ARRAY-params.
+    We geven CSV strings door en bouwen arrays met SPLIT() in SQL.
+    """
+    if not countries:
+        return pd.DataFrame(columns=["date","country","tenor","value","spread_to_DE","spread_to_EA","source","snapshot_date"])
+    if not tenors:
+        tenors = ["10Y"]
+
+    countries_csv = ",".join(sorted(set(countries)))
+    tenors_csv    = ",".join(sorted(set(tenors)))
+
+    params = {"countries_csv": countries_csv, "tenors_csv": tenors_csv}
+    where = [
+        "country IN UNNEST(SPLIT(@countries_csv))",
+        "tenor   IN UNNEST(SPLIT(@tenors_csv))",
+    ]
+    if date_from is not None:
+        params["dmin"] = str(pd.to_datetime(date_from).date())
+        where.append("date >= @dmin")
+    if date_to is not None:
+        params["dmax"] = str(pd.to_datetime(date_to).date())
+        where.append("date <= @dmax")
+
     sql = f"""
-    SELECT date, country, tenor,
-           SAFE_CAST(value AS FLOAT64) AS value,
-           SAFE_CAST(spread_to_DE AS FLOAT64) AS spread_to_DE,
-           SAFE_CAST(spread_to_EA AS FLOAT64) AS spread_to_EA,
-           source, snapshot_date
+    SELECT
+      date,
+      country,
+      tenor,
+      SAFE_CAST(value AS FLOAT64)        AS value,
+      SAFE_CAST(spread_to_DE AS FLOAT64) AS spread_to_DE,
+      SAFE_CAST(spread_to_EA AS FLOAT64) AS spread_to_EA,
+      source,
+      snapshot_date
     FROM `{EU_TABLE}`
-    WHERE {" AND ".join(where)}
+    WHERE {' AND '.join(where)}
     ORDER BY date
     """
-    df = run_query(sql, params=params, timeout=60)
+    df = run_query(sql, params=params, timeout=120)
     df["date"] = pd.to_datetime(df["date"])
     return df
-
-def to_bp(x): 
-    return None if pd.isna(x) else float(x)*100.0
-
-def zscore_series(s: pd.Series, window: int) -> pd.Series:
-    s = pd.to_numeric(s, errors="coerce")
-    mu = s.rolling(window).mean()
-    sd = s.rolling(window).std()
-    return (s - mu) / sd
 
 # ============== data & filters ==============
 with st.spinner("Land- en tenorselecties laden…"):
@@ -84,24 +109,12 @@ with c4:
     z_window = st.number_input("Z-window (dagen)", min_value=20, max_value=260, value=90, step=10)
 
 # Periode presets
-dsec1, dsec2 = st.columns([1.6, 1])
-with dsec1:
-    pr = st.radio("Periode", ["3M","6M","1Y","3Y","5Y","YTD","Max","Custom"], horizontal=True, index=2)
-
-# Voor de gekozen landen halen we dmin/dmax eerst even op om slider te clammen
-@st.cache_data(show_spinner=False, ttl=300)
-def overall_minmax() -> tuple[pd.Timestamp, pd.Timestamp]:
-    sql = f"SELECT MIN(date) AS dmin, MAX(date) AS dmax FROM `{EU_TABLE}`"
-    r = run_query(sql, timeout=20).iloc[0]
-    return pd.to_datetime(r["dmin"]), pd.to_datetime(r["dmax"])
-
-GLOBAL_MIN, GLOBAL_MAX = overall_minmax()
-dmin = GLOBAL_MIN
-dmax = GLOBAL_MAX
-
+st.subheader("Periode")
+dmin, dmax = overall_minmax()
 def clamp(ts: pd.Timestamp) -> pd.Timestamp:
     return min(max(ts, dmin), dmax)
 
+pr = st.radio("Range", ["3M","6M","1Y","3Y","5Y","YTD","Max","Custom"], horizontal=True, index=2)
 if pr == "3M":  start_date, end_date = clamp(dmax - pd.DateOffset(months=3)), dmax
 elif pr == "6M":start_date, end_date = clamp(dmax - pd.DateOffset(months=6)), dmax
 elif pr == "1Y":start_date, end_date = clamp(dmax - pd.DateOffset(years=1)), dmax
@@ -116,16 +129,19 @@ else:
     start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
 
 if not sel_countries:
-    st.warning("Kies minimaal één land.")
-    st.stop()
+    st.warning("Kies minimaal één land."); st.stop()
 
-TENORS_FOR_LOAD = sorted(set([sel_tenor, "10Y"]))  # laad altijd 10Y erbij voor fragmentatie
-with st.spinner("BigQuery laden…"):
-    DF = load_eu(sel_countries, TENORS_FOR_LOAD, start_date, end_date)
+TENORS_FOR_LOAD = sorted(set([sel_tenor, "10Y"]))  # laad altijd 10Y mee (fragmentatie)
+try:
+    with st.spinner("BigQuery laden…"):
+        DF = load_eu(sel_countries, TENORS_FOR_LOAD, start_date, end_date)
+except Exception as e:
+    st.error("BigQuery-query faalde. Hieronder de exception uit je app:")
+    st.exception(e)
+    st.stop()
 
 if DF.empty:
-    st.info("Geen data voor deze selectie.")
-    st.stop()
+    st.info("Geen data voor deze selectie."); st.stop()
 
 # ============== Snapshot (laatste datum) ==============
 st.subheader("Snapshot — Laatste datum")
@@ -138,16 +154,14 @@ def get_val(df, country, col):
     s = df[df["country"]==country][col]
     return None if s.empty else float(s.iloc[0])
 
-# KPI’s per land: yield, spread vs DE, spread vs EA
 for i, cc in enumerate(sel_countries[:6]):
     with kpi_cols[i]:
-        y = get_val(DFl_t, cc, "value")
+        y   = get_val(DFl_t, cc, "value")
         sDE = get_val(DFl_t, cc, "spread_to_DE")
         sEA = get_val(DFl_t, cc, "spread_to_EA")
         st.metric(f"{cc} {sel_tenor}", pct_fmt(y,2),
                   help=f"Δ vs DE: {round(to_bp(sDE) or 0,1)} bp • Δ vs EA: {round(to_bp(sEA) or 0,1)} bp")
 
-# Bar chart: yields per land (tenor)
 fig_bar = go.Figure()
 fig_bar.add_trace(go.Bar(x=DFl_t["country"], y=DFl_t["value"], name=f"{sel_tenor} yield"))
 fig_bar.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Country")
@@ -163,8 +177,7 @@ if mode_z:
 fig_lvl = go.Figure()
 for cc in sel_countries:
     dcc = DFt[DFt["country"]==cc]
-    if dcc.empty: 
-        continue
+    if dcc.empty: continue
     fig_lvl.add_trace(go.Scatter(x=dcc["date"], y=dcc["value"], name=cc, mode="lines"))
 fig_lvl.update_layout(margin=dict(l=10,r=10,t=10,b=10),
                       yaxis_title=("Yield (z)" if mode_z else "Yield (%)"),
@@ -175,7 +188,6 @@ st.plotly_chart(fig_lvl, use_container_width=True)
 # ============== Tijdreeks — Spreads vs DE / EA ==============
 st.subheader(f"Tijdreeks — Spreads vs DE & EA ({sel_tenor})")
 DFs = DFt.copy()
-# choose metric
 mopt = st.radio("Spread baseline", ["vs DE","vs EA"], horizontal=True, index=0)
 col_sp = "spread_to_DE" if mopt=="vs DE" else "spread_to_EA"
 
@@ -183,7 +195,7 @@ fig_sp = go.Figure()
 for cc in sel_countries:
     dcc = DFs[DFs["country"]==cc]
     if dcc.empty: continue
-    y = dcc[col_sp]* (1.0 if mode_z else 100.0)  # in z of bp
+    y = dcc[col_sp]* (1.0 if mode_z else 100.0)
     if mode_z:
         y = zscore_series(y, z_window)
     fig_sp.add_trace(go.Scatter(x=dcc["date"], y=y, name=cc, mode="lines"))
@@ -197,7 +209,6 @@ st.plotly_chart(fig_sp, use_container_width=True)
 st.subheader("Fragmentatie — Bund cross spreads (10Y)")
 need_10y = DF[(DF["tenor"]=="10Y")].copy()
 if not need_10y.empty:
-    # Country−DE in pp/bp; gebruik spread_to_DE direct
     fig_frag = go.Figure()
     for cc in [c for c in sel_countries if c != "DE"]:
         dcc = need_10y[need_10y["country"]==cc]
@@ -215,7 +226,6 @@ else:
 
 # ============== Δ1d distributies en tijdreeks (bp) ==============
 st.subheader(f"Δ1d — Distributie & Tijdreeks ({sel_tenor})")
-# Δ1d uit levels
 DFt_sorted = DFt.sort_values(["country","date"])
 DFt_sorted["d1_bp"] = DFt_sorted.groupby("country")["value"].diff(1) * 100.0
 d1 = DFt_sorted.dropna(subset=["d1_bp"])
