@@ -254,24 +254,48 @@ with cH2:
 
 # ============== Heatmap — z-scores van spreads (country−DE) ==============
 st.subheader(f"Heatmap — Z-scores spreads vs DE ({sel_tenor})")
-HDF = DFt[DFt["country"]!="DE"].pivot(index="date", columns="country", values="spread_to_DE").sort_index()
+
+# 1) Filter en zorg voor één waarde per (date, country)
+tmp = (
+    DFt[DFt["country"] != "DE"]               # geen DE zelf
+    .sort_values(["country", "date", "snapshot_date"])  # nieuwste onderaan
+)
+
+# Kies de laatste observatie per (date,country) of aggregeer
+tmp_last = tmp.groupby(["date", "country"], as_index=False).last()
+
+# 2) Maak brede matrix; duplicates zijn nu opgelost
+HDF = (
+    tmp_last.pivot_table(
+        index="date", columns="country", values="spread_to_DE", aggfunc="last"
+    )
+    .sort_index()
+)
+
 if not HDF.empty:
+    # 3) Z-scores of bp
     if mode_z:
         HZ = HDF.apply(lambda s: zscore_series(s, z_window))
+        ylab = "Z-score"
     else:
-        HZ = HDF * 100.0  # bp
+        HZ = HDF * 100.0  # → bp
+        ylab = "Spread (bp)"
+
     figH = go.Figure(data=go.Heatmap(
         z=HZ.values,
         x=HZ.columns.tolist(),
         y=HZ.index,
         coloraxis="coloraxis"
     ))
-    figH.update_layout(margin=dict(l=10,r=10,t=10,b=10),
-                       coloraxis_colorscale="RdBu", coloraxis_cmid=0,
-                       xaxis_title="Country", yaxis_title="Date")
+    figH.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        coloraxis_colorscale="RdBu", coloraxis_cmid=0,
+        xaxis_title="Country", yaxis_title="Date"
+    )
     st.plotly_chart(figH, use_container_width=True)
 else:
     st.caption("Onvoldoende data om een heatmap te tonen.")
+
 
 # ============== Tabel & download ==============
 st.subheader("Gegevens (gefilterd)")
