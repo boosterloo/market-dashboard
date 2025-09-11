@@ -414,23 +414,7 @@ else:
     pctUS = (dpp_US / baseUS.shift(1).replace(0,np.nan)) * 100.0
     pctEU = (dpp_EU / baseEU.shift(1).replace(0,np.nan)) * 100.0
 
-    # Histograms (abs bp & %)
-    h1, h2 = st.columns(2)
-    with h1:
-        H = go.Figure()
-        H.add_trace(go.Histogram(x=USd.replace([np.inf,-np.inf],np.nan).dropna(), nbinsx=40, name="US", opacity=0.6))
-        H.add_trace(go.Histogram(x=EUd.replace([np.inf,-np.inf],np.nan).dropna(), nbinsx=40, name="EU", opacity=0.6))
-        H.update_layout(title=f"Δ {label_sel} — abs (bp)", barmode="overlay",
-                        margin=dict(l=10,r=10,t=40,b=10), xaxis_title="Δ (bp)", yaxis_title="Aantal dagen")
-        st.plotly_chart(H, use_container_width=True)
-    with h2:
-        H2 = go.Figure()
-        H2.add_trace(go.Histogram(x=pctUS.replace([np.inf,-np.inf],np.nan).dropna(), nbinsx=40, name="US", opacity=0.6))
-        H2.add_trace(go.Histogram(x=pctEU.replace([np.inf,-np.inf],np.nan).dropna(), nbinsx=40, name="EU", opacity=0.6))
-        H2.update_layout(title=f"Δ {label_sel} — relatief (%)", barmode="overlay",
-                         margin=dict(l=10,r=10,t=40,b=10), xaxis_title="Δ (%)", yaxis_title="Aantal dagen")
-        st.plotly_chart(H2, use_container_width=True)
-
+   
     # Δ tijdreeks (US, EU en differential)
     figd = go.Figure()
     figd.add_trace(go.Bar(x=US["date"], y=USd, name=f"US Δ{delta_h_sel} ({label_sel})", opacity=0.6))
@@ -444,75 +428,3 @@ else:
     figd.update_xaxes(range=[start_date, end_date])
     st.plotly_chart(figd, use_container_width=True)
 
-# ============== Correlatie Δ1d, Lead/Lag, Δ-scatter + beta ==============
-st.subheader("Correlatiematrix Δ1d (US & EU)")
-mats = [m for m in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if m in US.columns and m in EU.columns]
-def d1(df, c):
-    if f"{c}_d1_bp" in df.columns: return pd.to_numeric(df[f"{c}_d1_bp"], errors="coerce")
-    return pd.to_numeric(df[c], errors="coerce").diff() * 100.0
-
-if mats:
-    table = {}
-    for side, df_ in [("US", US), ("EU", EU)]:
-        for m in mats:
-            table[f"{side} {m.upper()}"] = d1(df_, m).reset_index(drop=True)
-    corr_df = pd.DataFrame(table).corr()
-    Hc = go.Figure(data=go.Heatmap(
-        z=corr_df.values, x=corr_df.columns, y=corr_df.index, coloraxis="coloraxis"
-    ))
-    Hc.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="RdBu", coloraxis_cmid=0)
-    st.plotly_chart(Hc, use_container_width=True)
-else:
-    st.info("Onvoldoende overlappende looptijden voor correlatiematrix.")
-
-st.subheader("Lead/Lag (Δ1d US vs EU)")
-lags = list(range(-10, 11))
-def crosscorr(a: pd.Series, b: pd.Series, lag: int) -> float:
-    a = pd.to_numeric(a, errors="coerce"); b = pd.to_numeric(b, errors="coerce")
-    if lag > 0:  return a.shift(lag).corr(b)
-    if lag < 0:  return a.corr(b.shift(-lag))
-    return a.corr(b)
-
-rows, ylab = [], []
-for m in mats:
-    USs = d1(US, m); EUs = d1(EU, m)
-    rows.append([crosscorr(USs, EUs, k) for k in lags])
-    ylab.append(m.upper())
-if rows:
-    LagH = go.Figure(data=go.Heatmap(z=np.array(rows), x=lags, y=ylab, coloraxis="coloraxis"))
-    LagH.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="RdBu", coloraxis_cmid=0,
-                       xaxis_title="Lag k (US_t vs EU_{t+k})", yaxis_title="Maturity")
-    st.plotly_chart(LagH, use_container_width=True)
-
-st.subheader("Δ-scatter US vs EU + beta")
-if mats:
-    m_sel = st.selectbox("Maturity", mats, index=(mats.index("y_10y") if "y_10y" in mats else 0),
-                         format_func=lambda c: c.replace("y_","").upper())
-    USs = d1(US, m_sel); EUs = d1(EU, m_sel)
-    dfR = pd.DataFrame({"US": USs, "EU": EUs}).dropna()
-    if not dfR.empty:
-        x = dfR["US"].values; y = dfR["EU"].values
-        varx = np.var(x, ddof=1)
-        if varx > 0:
-            beta = float(np.cov(x,y, ddof=1)[0,1] / varx)
-            R2 = float(np.corrcoef(x,y)[0,1]**2) if len(dfR)>2 else np.nan
-        else:
-            beta = np.nan; R2 = np.nan
-        yhat = beta*x if np.isfinite(beta) else np.zeros_like(x)
-        Sc = go.Figure()
-        Sc.add_trace(go.Scatter(x=x, y=y, mode="markers", name="observaties", opacity=0.6))
-        Sc.add_trace(go.Scatter(x=x, y=yhat, mode="lines", name=f"fit (beta={beta:.2f}, R²={R2:.2f})"))
-        Sc.update_layout(margin=dict(l=10,r=10,t=10,b=10),
-                         xaxis_title=f"US Δ1d (bp) — {m_sel[2:].upper()}",
-                         yaxis_title=f"EU Δ1d (bp) — {m_sel[2:].upper()}")
-        st.plotly_chart(Sc, use_container_width=True)
-
-# ============== Tabel & download ==============
-if show_table:
-    st.subheader("Tabel (samengevoegd, gemeenschappelijke datums)")
-    merged = pd.merge(US, EU, on="date", suffixes=("_us","_eu"))
-    st.dataframe(merged.sort_values("date", ascending=False).round(round_dp))
-
-csv = pd.merge(US, EU, on="date", suffixes=("_us","_eu")).to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Download CSV (US & EU, gefilterd)", data=csv,
-                   file_name="yield_compare_us_eu.csv", mime="text/csv")
