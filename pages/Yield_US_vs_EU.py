@@ -1,6 +1,6 @@
 # pages/Yield_US_vs_EU.py
 # 🇺🇸 vs 🇪🇺 — vergelijking met 90d μ±1σ-band & Z-scores
-# + globale periode-slider en koptekst-overlap fix
+# + globale periode-slider, KPI-balk en |Z|>2 alert
 
 import streamlit as st
 import pandas as pd
@@ -10,7 +10,6 @@ from google.api_core.exceptions import BadRequest
 from utils.bq import run_query, bq_ping
 
 st.set_page_config(page_title="🇺🇸 vs 🇪🇺 Yield Curve", layout="wide")
-
 st.title("🇺🇸 vs 🇪🇺 Yield Curve Vergelijking")
 
 # ================== SECRETS / DEFAULTS ==================
@@ -19,7 +18,7 @@ TABLES     = st.secrets.get("tables", {})
 
 US_VIEW   = TABLES.get("us_yield_view",   f"{PROJECT_ID}.marketdata.us_yield_curve_enriched_v")
 EU_VIEW   = TABLES.get("eu_yield_view",   f"{PROJECT_ID}.marketdata.eu_yield_curve_enriched_v")
-WIDE_VIEW = TABLES.get("yield_wide_view", f"{PROJECT_ID}.marketdata.yield_curve_analysis_wide")
+WIDE_VIEW = TABLES.get("yield_wide_view", f"{PROJECT_ID}.marketdata.yield_curve_analysis_wide")  # momenteel niet gebruikt
 
 with st.expander("🔎 Debug: opgegeven bronnen"):
     st.write({"US_VIEW": US_VIEW, "EU_VIEW": EU_VIEW, "WIDE_VIEW": WIDE_VIEW})
@@ -98,14 +97,8 @@ def load_from_two_enriched_views(us_fqn: str, eu_fqn: str) -> pd.DataFrame:
     return run_query(q, timeout=60)
 
 def load_data_resilient():
-    try:
-        df = load_from_two_enriched_views(US_VIEW, EU_VIEW)
-        return df, "enriched_views"
-    except Exception as e:
-        with st.expander("Technische foutmelding (enriched views)"):
-            st.code(repr(e))
-        # Fallback kan hier eventueel nog naar WIDE_VIEW, maar jouw setup gebruikt enriched; simpel houden.
-        raise
+    df = load_from_two_enriched_views(US_VIEW, EU_VIEW)
+    return df, "enriched_views"
 
 # ================== LOAD ==================
 with st.spinner("Data laden…"):
@@ -116,7 +109,9 @@ if df.empty:
     st.warning("Geen rijen."); st.stop()
 
 df["date"] = pd.to_datetime(df["date"])
-for c in ["diff_spread","diff_2y","diff_10y"]:
+
+# Rolling stats (op volledige reeks, daarna filteren met periode)
+for c in ["diff_spread", "diff_2y", "diff_10y"]:
     df = add_roll_stats(df, c)
 
 # ================== GLOBALE PERIODE ==================
@@ -159,6 +154,58 @@ mask = (df["date"] >= start_date) & (df["date"] <= end_date)
 dfp = df.loc[mask].copy()
 if dfp.empty:
     st.info("Geen data in de gekozen periode."); st.stop()
+
+# ================== KPI-BALK (gesynchroniseerd met periode) ==================
+st.subheader("KPI’s (laatste in periode)")
+try:
+    last = dfp.dropna(subset=["us_2y","us_10y","eu_2y","eu_10y"]).iloc[-1]
+except IndexError:
+    st.info("Niet genoeg data voor KPI’s in de geselecteerde periode."); last = None
+
+def fmt_pct(p): 
+    return "—" if pd.isna(p) else f"{float(p):.2f}%"
+
+def fmt_bp(x):
+    return "—" if pd.isna(x) else f"{float(x):.1f} bp"
+
+if last is not None:
+    # differentials in bp
+    diff2_bp   = (last["diff_2y"]   * 100.0) if pd.notna(last["diff_2y"])   else np.nan
+    diff10_bp  = (last["diff_10y"]  * 100.0) if pd.notna(last["diff_10y"])  else np.nan
+    diffsp_bp  = (last["diff_spread"] * 100.0) if pd.notna(last["diff_spread"]) else np.nan
+
+    r1 = st.columns(4)
+    r1[0].metric("US 2Y", fmt_pct(last["us_2y"]))
+    r1[1].metric("EU 2Y", fmt_pct(last["eu_2y"]))
+    r1[2].metric("Δ2Y (US–EU)", fmt_bp(diff2_bp), delta=(f"z={last['diff_2y_z']:.2f}" if pd.notna(last["diff_2y_z"]) else None))
+    r1[3].metric("Δ(10Y–2Y) (US–EU)", fmt_bp(diffsp_bp), delta=(f"z={last['diff_spread_z']:.2f}" if pd.notna(last["diff_spread_z"]) else None))
+
+    r2 = st.columns(3)
+    r2[0].metric("US 10Y", fmt_pct(last["us_10y"]))
+    r2[1].metric("EU 10Y", fmt_pct(last["eu_10y"]))
+    r2[2].metric("Δ10Y (US–EU)", fmt_bp(diff10_bp), delta=(f"z={last['diff_10y_z']:.2f}" if pd.notna(last["diff_10y_z"]) else None))
+
+    # ===== Alert bij |Z| > 2 =====
+    alerts = []
+    def add_alert(label, base):
+        z = last.get(f"{base}_z", np.nan)
+        val = last.get(base, np.nan)
+        if pd.notna(z) and abs(z) > 2:
+            dir_txt = "US > EU" if (pd.notna(val) and val > 0) else ("US < EU" if pd.notna(val) else "")
+            alerts.append((label, z, dir_txt))
+    add_alert("Δ(10Y–2Y)", "diff_spread")
+    add_alert("Δ2Y",       "diff_2y")
+    add_alert("Δ10Y",      "diff_10y")
+
+    if alerts:
+        # escalatie bij |z|>=3
+        sev = "warning"
+        if any(abs(z) >= 3 for _, z, _ in alerts): sev = "error"
+        msg = " • ".join([f"{lbl}: z={z:.2f} ({dir_})" for lbl, z, dir_ in alerts])
+        if sev == "error":
+            st.error(f"📣 Extreem: {msg}")
+        else:
+            st.warning(f"Let op: {msg}")
 
 # ================== CURVES (2Y/10Y) ==================
 st.subheader("Yield Curves US vs EU (2Y & 10Y)")
@@ -230,13 +277,13 @@ def plot_diff(tab, df_in: pd.DataFrame, base_col: str, title_txt: str, unit: str
             yaxis_title=y_title,
         )
         fig.update_xaxes(range=[start_date, end_date])
-        st.caption(title_txt)  # korte caption i.p.v. lange figure title
+        st.caption(title_txt)
         st.plotly_chart(fig, use_container_width=True)
 
-        last = loc.dropna(subset=[base_col, f"{base_col}_z"]).iloc[-1]
+        last_loc = loc.dropna(subset=[base_col, f"{base_col}_z"]).iloc[-1]
         c1, c2 = st.columns(2)
-        c1.metric("Laatste differential", f"{last[base_col]:.1f} {unit}")
-        c2.metric("Laatste Z-score (90d)", f"{last[f'{base_col}_z']:.2f}")
+        c1.metric("Laatste differential", f"{(last_loc[base_col]*100):.1f} {unit}" if unit=="bp" else f"{last_loc[base_col]:.2f}")
+        c2.metric("Laatste Z-score (90d)", f"{last_loc[f'{base_col}_z']:.2f}")
 
 plot_diff(tabs[0], dfp, "diff_spread", "Differential: (10Y–2Y)", "bp")
 plot_diff(tabs[1], dfp, "diff_2y",     "Differential: 2Y",       "bp")
