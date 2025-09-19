@@ -18,6 +18,9 @@ MACRO_VIEW = st.secrets.get("tables", {}).get("macro_view", DEFAULT_MACRO_VIEW)
 PALETTE  = ["#2563eb","#0891b2","#dc2626","#16a34a","#9333ea","#f59e0b",
             "#0ea5e9","#ef4444","#14b8a6","#f97316","#64748b","#d946ef"]
 
+COL_POS = "#16a34a"  # groen
+COL_NEG = "#dc2626"  # rood
+
 # ========= Helpers =========
 def best_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     lower = {c.lower(): c for c in df.columns}
@@ -52,7 +55,7 @@ def yoy_from_index(s: pd.Series) -> pd.Series:
     return (s_num / s_num.shift(12) - 1.0) * 100.0
 
 def add_metric_chip(col, title: str, value: float, delta: float, unit: str = ""):
-    color = "#16a34a" if delta > 0 else ("#dc2626" if delta < 0 else "#6b7280")
+    color = COL_POS if delta > 0 else (COL_NEG if delta < 0 else "#6b7280")
     u = f" {unit}" if unit else ""
     col.markdown(f"**{title}**")
     col.markdown(
@@ -89,7 +92,7 @@ def dynamic_conclusion(changes: dict[str, float]) -> tuple[str, str]:
     score = 0.0
     notes = []
     for k, v in changes.items():
-        if v is None or not np.isfinite(v): 
+        if v is None or not np.isfinite(v):
             continue
         k_low = k.lower()
         if any(x in k_low for x in ["cpi","pce","ppi"]):
@@ -108,9 +111,11 @@ def dynamic_conclusion(changes: dict[str, float]) -> tuple[str, str]:
     return tone, summary
 
 def tiny_delta_chart(x: pd.Series, y: pd.Series, name: str):
+    """Staafjes met groen/rood kleur per bar op basis van teken."""
     d = pd.to_numeric(y, errors="coerce").diff()
+    colors = [COL_POS if (pd.notna(v) and v >= 0) else COL_NEG for v in d]
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=x, y=d, name=f"Δ {name}"))
+    fig.add_trace(go.Bar(x=x, y=d, name=f"Δ {name}", marker=dict(color=colors)))
     fig.update_layout(
         height=160, margin=dict(l=0,r=0,t=4,b=0),
         xaxis=dict(title=""), yaxis=dict(title="Δ per stap", range=padded_range(d))
@@ -152,17 +157,17 @@ if not np.issubdtype(df["date"].dtype, np.datetime64):
 # ======== Column mapping (jouw schema + varianten) ========
 colmap = {
     # inflatie indices/YoY
-    "cpi_idx":     best_col(df, ["cpi_all","cpi","cpi_index"]),
-    "cpi_core_idx":best_col(df, ["cpi_core","cpi_core_index"]),
-    "pce_idx":     best_col(df, ["pce_all","pce","pce_index"]),
-    "cpi_yoy":     best_col(df, ["cpi_yoy","cpi_all_yoy"]),
-    "cpi_core_yoy":best_col(df, ["cpi_core_yoy"]),
-    "pce_yoy":     best_col(df, ["pce_yoy","pce_all_yoy"]),
+    "cpi_idx":      best_col(df, ["cpi_all","cpi","cpi_index"]),
+    "cpi_core_idx": best_col(df, ["cpi_core","cpi_core_index"]),
+    "pce_idx":      best_col(df, ["pce_all","pce","pce_index"]),
+    "cpi_yoy":      best_col(df, ["cpi_yoy","cpi_all_yoy"]),
+    "cpi_core_yoy": best_col(df, ["cpi_core_yoy"]),
+    "pce_yoy":      best_col(df, ["pce_yoy","pce_all_yoy"]),
     # PPI (zoveel mogelijk varianten, incl. mislabel)
-    "ppi_yoy":     best_col(df, ["ppi_yoy","ppi_all_yoy","producer_price_yoy"]),
-    "ppi_core_yoy":best_col(df, ["ppi_core_yoy"]),
-    "ppi_idx":     best_col(df, ["ppi_all","ppi","producer_price_index"]),
-    "ppi_core_idx":best_col(df, ["ppi_core"]),
+    "ppi_yoy":      best_col(df, ["ppi_yoy","ppi_all_yoy","producer_price_yoy"]),
+    "ppi_core_yoy": best_col(df, ["ppi_core_yoy"]),
+    "ppi_idx":      best_col(df, ["ppi_all","ppi","producer_price_index"]),
+    "ppi_core_idx": best_col(df, ["ppi_core"]),
     # activiteit/arbeid/geld
     "industrial_production": best_col(df, ["industrial_production","ip_index"]),
     "retail_sales":          best_col(df, ["retail_sales","retail"]),
@@ -200,7 +205,7 @@ if colmap["ppi_yoy"]:
 elif colmap["ppi_idx"]:
     ppi_headline_series = yoy_from_index(df[colmap["ppi_idx"]])
 elif colmap["maybe_ppi_in_indprod"]:
-    # Zwakke heuristic: als gebruiker dit zo heeft genoemd, bied UI-keuze aan (zie verderop)
+    # UI-fallback volgt
     pass
 
 if ppi_headline_series is not None:
@@ -245,7 +250,7 @@ info_card("Hoe lees je dit?", [
 # UI-fallback wanneer geen PPI gevonden is: laat gebruiker een kolom kiezen (bijv. 'ind_production')
 ppi_present = any(c in dfp.columns for c in ["ppi_headline","ppi_core"])
 if not ppi_present:
-    numeric_cols = [c for c in df.columns if c not in ["date"]]
+    numeric_cols = [c for c in df.columns if c != "date"]
     fallback_ppi = st.selectbox(
         "Geen PPI-kolom gedetecteerd — kies optioneel een kolom om als PPI (YoY %) te tonen:",
         options=["(geen)"] + numeric_cols, index=0,
@@ -253,8 +258,9 @@ if not ppi_present:
     )
     if fallback_ppi != "(geen)":
         try:
-            series = yoy_from_index(df[fallback_ppi])
-            dfp["ppi_headline"] = series[(df["date"].dt.date >= start) & (df["date"].dt.date <= end)]
+            tmp = df[["date", fallback_ppi]].copy()
+            tmp["ppi_headline"] = yoy_from_index(tmp[fallback_ppi])
+            dfp = dfp.merge(tmp[["date","ppi_headline"]], on="date", how="left")
         except Exception:
             st.warning(f"Kon YoY niet afleiden uit '{fallback_ppi}'.")
 
@@ -323,13 +329,16 @@ st.divider()
 # ========= Sectie: Activiteit (IP / Retail / Housing) =========
 st.subheader("Activiteit (IP / Retail / Housing)")
 
-act_cols = [c for c in ["industrial_production","retail_sales","housing_starts"] if c in colmap.values() and c in dfp.columns]
-# fallback: als 'industrial_production' niet bestaat maar 'ind_production' wel én die NIET als PPI is gekozen/afgeleid
-if "industrial_production" not in dfp.columns and colmap["maybe_ppi_in_indprod"] and "ppi_headline" not in dfp.columns:
-    dfp = dfp.merge(df[["date", colmap["maybe_ppi_in_indprod"]]], on="date", how="left", suffixes=("",""))
-    dfp = dfp.rename(columns={colmap["maybe_ppi_in_indprod"]: "industrial_production"})
-
+# FIX: bepaal gewoon uit de huidige dfp-columns (voorheen checkte je tegen colmap.values())
 act_cols = [c for c in ["industrial_production","retail_sales","housing_starts"] if c in dfp.columns]
+
+# Fallback: als 'industrial_production' niet bestaat maar de bronkolom (bijv. 'ind_production') wel,
+# en die niet al als PPI is gebruikt, voeg hem dan toe als 'industrial_production'
+if "industrial_production" not in dfp.columns and colmap["maybe_ppi_in_indprod"] and "ppi_headline" not in dfp.columns:
+    dfp = dfp.merge(df[["date", colmap["maybe_ppi_in_indprod"]]], on="date", how="left")
+    dfp = dfp.rename(columns={colmap["maybe_ppi_in_indprod"]: "industrial_production"})
+    if "industrial_production" not in act_cols:
+        act_cols.append("industrial_production")
 
 if act_cols:
     dfa = dfp[["date"] + act_cols].copy()
@@ -433,7 +442,7 @@ vel_ma_cols   = [c for c in ["m2_vel_ma3"] if c in have]
 vel_yoy_cols  = [c for c in ["m2_vel_yoy"] if c in have]
 
 def plot_block(title: str, cols: list[str], ma_cols: list[str] = None):
-    if not cols: 
+    if not cols:
         return
     st.markdown(f"### {title}")
     dfm = dfp[["date"] + cols + (ma_cols or [])].copy()
