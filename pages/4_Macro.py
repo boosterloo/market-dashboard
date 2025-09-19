@@ -329,57 +329,77 @@ st.divider()
 # ========= Sectie: Activiteit (IP / Retail / Housing) =========
 st.subheader("Activiteit (IP / Retail / Housing)")
 
-# FIX: bepaal gewoon uit de huidige dfp-columns (voorheen checkte je tegen colmap.values())
+# 1) Begin met wat er nu in dfp aanwezig is
 act_cols = [c for c in ["industrial_production","retail_sales","housing_starts"] if c in dfp.columns]
 
-# Fallback: als 'industrial_production' niet bestaat maar de bronkolom (bijv. 'ind_production') wel,
-# en die niet al als PPI is gebruikt, voeg hem dan toe als 'industrial_production'
+# 2) Fallback: als 'industrial_production' ontbreekt maar je hebt een bronkolom (bijv. 'ind_production')
+#    en die is niet al gebruikt als PPI, voeg hem dan toe als 'industrial_production'
 if "industrial_production" not in dfp.columns and colmap["maybe_ppi_in_indprod"] and "ppi_headline" not in dfp.columns:
-    dfp = dfp.merge(df[["date", colmap["maybe_ppi_in_indprod"]]], on="date", how="left")
-    dfp = dfp.rename(columns={colmap["maybe_ppi_in_indprod"]: "industrial_production"})
-    if "industrial_production" not in act_cols:
-        act_cols.append("industrial_production")
+    try:
+        dfp = dfp.merge(df[["date", colmap["maybe_ppi_in_indprod"]]], on="date", how="left")
+        dfp = dfp.rename(columns={colmap["maybe_ppi_in_indprod"]: "industrial_production"})
+    except Exception:
+        st.warning(f"Kon fallback-kolom '{colmap['maybe_ppi_in_indprod']}' niet samenvoegen voor industrial_production.")
 
-if act_cols:
-    dfa = dfp[["date"] + act_cols].copy()
+# 3) Herbereken act_cols ná fallback en beperk strikt tot beschikbare kolommen
+act_cols = [c for c in ["industrial_production","retail_sales","housing_starts"] if c in dfp.columns]
+
+if len(act_cols) == 0:
+    st.info("Geen activiteit-kolommen gevonden (industrial_production / retail_sales / housing_starts).")
+else:
+    # Veilig selecteren: alleen kolommen die écht bestaan (inclusief 'date')
+    select_cols = ["date"] + [c for c in act_cols if c in dfp.columns]
+    missing = [c for c in ["date"] + act_cols if c not in dfp.columns]
+    if missing:
+        st.warning(f"Mis kolommen in activiteitsectie: {', '.join(missing)} — toon wat beschikbaar is.")
+
+    dfa = dfp[select_cols].copy()
     dfa = maybe_daily(dfa)
 
     fig2 = go.Figure()
     if view_mode.startswith("Genormaliseerd"):
         stack = []
         for i, c in enumerate(act_cols):
+            if c not in dfa.columns:
+                continue
             s = normalize_100(dfa[c])
             stack.append(s)
             fig2.add_trace(go.Scatter(x=dfa["date"], y=s, mode="lines",
                                       name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
-        yr = padded_range(pd.concat(stack, axis=0))
+        yr = padded_range(pd.concat(stack, axis=0)) if stack else None
         fig2.update_layout(height=420, legend=dict(orientation="h"),
                            margin=dict(l=0,r=0,t=10,b=0),
                            yaxis=dict(title="Index (=100)", range=yr),
                            xaxis=dict(title="Datum"))
     else:
+        stacks = []
         for i, c in enumerate(act_cols):
+            if c not in dfa.columns:
+                continue
             s = pd.to_numeric(dfa[c], errors="coerce")
+            stacks.append(s)
             fig2.add_trace(go.Scatter(x=dfa["date"], y=s, mode="lines",
                                       name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
+        yr = padded_range(pd.concat(stacks, axis=0)) if stacks else None
         fig2.update_layout(height=420, legend=dict(orientation="h"),
                            margin=dict(l=0,r=0,t=10,b=0),
                            xaxis=dict(title="Datum"),
-                           yaxis=dict(title="Niveau", range=padded_range(pd.concat([pd.to_numeric(dfa[c], errors="coerce") for c in act_cols]))))
+                           yaxis=dict(title="Niveau", range=yr))
     st.plotly_chart(fig2, use_container_width=True)
 
-    last2 = dfa[act_cols].dropna().tail(2)
-    if len(last2) == 2:
-        changes = {c: float(last2[c].iloc[-1] - last2[c].iloc[-2]) for c in act_cols}
+    # Dynamische conclusie (laatste Δ)
+    last2 = dfa[[c for c in act_cols if c in dfa.columns]].dropna().tail(2)
+    if len(last2) == 2 and last2.shape[1] > 0:
+        changes = {c: float(last2[c].iloc[-1] - last2[c].iloc[-2]) for c in last2.columns}
         tone, summary = dynamic_conclusion(changes)
         info_card("Dynamische conclusie (activiteit)", [summary], tone=tone)
 
+    # Delta-staafjes onder elkaar, met groen/rood per bar
     st.markdown("**Dagelijkse delta per serie**")
     for c in act_cols:
-        st.caption(f"Δ {c}")
-        tiny_delta_chart(dfa["date"], dfa[c], c)
-else:
-    st.info("Geen activiteit-kolommen gevonden (industrial_production/retail_sales/housing_starts).")
+        if c in dfa.columns:
+            st.caption(f"Δ {c}")
+            tiny_delta_chart(dfa["date"], dfa[c], c)
 
 st.divider()
 
@@ -405,14 +425,17 @@ if arb_cols:
                            yaxis=dict(title="Index (=100)", range=yr),
                            xaxis=dict(title="Datum"))
     else:
+        stacks = []
         for i, c in enumerate(arb_cols):
             s = pd.to_numeric(dfl[c], errors="coerce")
+            stacks.append(s)
             fig3.add_trace(go.Scatter(x=dfl["date"], y=s, mode="lines",
                                       name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
+        yr = padded_range(pd.concat(stacks, axis=0))
         fig3.update_layout(height=400, legend=dict(orientation="h"),
                            margin=dict(l=0,r=0,t=10,b=0),
                            xaxis=dict(title="Datum"),
-                           yaxis=dict(title="Niveau", range=padded_range(pd.concat([pd.to_numeric(dfl[c], errors="coerce") for c in arb_cols]))))
+                           yaxis=dict(title="Niveau", range=yr))
     st.plotly_chart(fig3, use_container_width=True)
 
     last2 = dfl[arb_cols].dropna().tail(2)
@@ -464,14 +487,17 @@ def plot_block(title: str, cols: list[str], ma_cols: list[str] = None):
                           xaxis=dict(title="Datum"))
     else:
         series_cols = cols + (ma_cols or [])
+        stacks = []
         for i, c in enumerate(series_cols):
             s = pd.to_numeric(dfm[c], errors="coerce")
+            stacks.append(s)
             fig.add_trace(go.Scatter(x=dfm["date"], y=s, mode="lines",
                                      name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
+        yr = padded_range(pd.concat(stacks, axis=0))
         fig.update_layout(height=360, legend=dict(orientation="h"),
                           margin=dict(l=0,r=0,t=10,b=0),
                           xaxis=dict(title="Datum"),
-                          yaxis=dict(title="Niveau", range=padded_range(pd.concat([pd.to_numeric(dfm[c], errors="coerce") for c in series_cols]))))
+                          yaxis=dict(title="Niveau", range=yr))
     st.plotly_chart(fig, use_container_width=True)
 
     last2 = dfm[cols].dropna().tail(2)
