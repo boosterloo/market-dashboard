@@ -8,17 +8,13 @@ from google.api_core.exceptions import NotFound, BadRequest
 
 from utils.bq import run_query, bq_ping
 
-st.set_page_config(page_title="📊 Grafieken per categorie", layout="wide")
-st.title("Grafieken per categorie")
+st.set_page_config(page_title="📊 Macro (grafieken + deltas)", layout="wide")
+st.title("Macro-dashboard")
 
 # ========= Config =========
 DEFAULT_MACRO_VIEW = "nth-pier-468314-p7.marketdata.macro_series_wide_monthly_fill_v"
 MACRO_VIEW = st.secrets.get("tables", {}).get("macro_view", DEFAULT_MACRO_VIEW)
 
-# Contrasterende kleuren
-COL_BLUE = "#2563eb"   # primaire lijn
-COL_CYAN = "#0891b2"   # secundaire (links)
-COL_RED  = "#dc2626"   # secundaire (rechts)
 PALETTE  = ["#2563eb","#0891b2","#dc2626","#16a34a","#9333ea","#f59e0b",
             "#0ea5e9","#ef4444","#14b8a6","#f97316","#64748b","#d946ef"]
 
@@ -34,6 +30,8 @@ def padded_range(s: pd.Series, pad_ratio: float = 0.05):
     s = pd.to_numeric(s, errors="coerce").dropna()
     if s.empty: return None
     lo, hi = float(s.min()), float(s.max())
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return None
     if lo == hi:
         pad = abs(lo) * pad_ratio if lo != 0 else 1.0
         return [lo - pad, hi + pad]
@@ -46,15 +44,23 @@ def normalize_100(series: pd.Series) -> pd.Series:
     base = s.dropna().iloc[0] if s.notna().any() else np.nan
     return s / base * 100.0 if pd.notna(base) and base != 0 else s
 
-def add_metric_chip(col, title: str, value: float, delta: float):
+def yoy_from_index(s: pd.Series) -> pd.Series:
+    s_num = pd.to_numeric(s, errors="coerce")
+    # Als waarden al procenten lijken, laat staan
+    if s_num.dropna().between(-10, 60).mean() > 0.8 and s_num.notna().sum() > 6:
+        return s_num
+    return (s_num / s_num.shift(12) - 1.0) * 100.0
+
+def add_metric_chip(col, title: str, value: float, delta: float, unit: str = ""):
     color = "#16a34a" if delta > 0 else ("#dc2626" if delta < 0 else "#6b7280")
+    u = f" {unit}" if unit else ""
     col.markdown(f"**{title}**")
     col.markdown(
         f"""
         <div style="display:flex;gap:12px;align-items:baseline;">
-          <div style="font-size:1.4rem;font-weight:700;">{value:.2f}</div>
+          <div style="font-size:1.4rem;font-weight:700;">{value:.2f}{u}</div>
           <div style="padding:2px 8px;border-radius:999px;background:{color}20;color:{color};font-weight:700;">
-            {delta:+.2f}
+            {delta:+.2f}{u}
           </div>
         </div>
         """,
@@ -79,6 +85,38 @@ def info_card(title: str, bullets: list[str], tone: str = "neutral"):
         unsafe_allow_html=True,
     )
 
+def dynamic_conclusion(changes: dict[str, float]) -> tuple[str, str]:
+    score = 0.0
+    notes = []
+    for k, v in changes.items():
+        if v is None or not np.isfinite(v): 
+            continue
+        k_low = k.lower()
+        if any(x in k_low for x in ["cpi","pce","ppi"]):
+            score -= np.sign(v) * min(abs(v), 2.0)
+            notes.append(f"{k}: {v:+.2f}pp")
+        elif any(x in k_low for x in ["unemployment","claims"]):
+            score -= np.sign(v) * min(abs(v), 2.0)
+            notes.append(f"{k}: {v:+.2f}")
+        elif any(x in k_low for x in ["payroll","retail","industrial","housing","starts"]):
+            score += np.sign(v) * min(abs(v), 2.0)
+            notes.append(f"{k}: {v:+.2f}")
+    tone = "neutral"
+    if score >= 1.0: tone = "bull"
+    elif score <= -1.0: tone = "bear"
+    summary = " • ".join(notes) if notes else "Weinig richtinggevende verandering."
+    return tone, summary
+
+def tiny_delta_chart(x: pd.Series, y: pd.Series, name: str):
+    d = pd.to_numeric(y, errors="coerce").diff()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=x, y=d, name=f"Δ {name}"))
+    fig.update_layout(
+        height=160, margin=dict(l=0,r=0,t=4,b=0),
+        xaxis=dict(title=""), yaxis=dict(title="Δ per stap", range=padded_range(d))
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
 # ========= BigQuery health =========
 try:
     with st.spinner("BigQuery check…"):
@@ -95,25 +133,7 @@ def load_macro() -> pd.DataFrame:
     df = run_query(f"SELECT * FROM `{MACRO_VIEW}` ORDER BY date")
     if "date" not in df.columns:
         raise ValueError(f"Kolom 'date' niet aanwezig in view {MACRO_VIEW}")
-
-    # Map vaste namen voor hoofdpaneel
-    cpi_h = best_col(df, ["cpi_headline","cpi_all","cpi","cpi_index"])
-    cpi_c = best_col(df, ["cpi_core","core_cpi"])
-    pce_h = best_col(df, ["pce_headline","pce_all","pce","pce_index"])
-    ip    = best_col(df, ["industrial_production","ind_production","ind_prod","ip_index"])
-    retail= best_col(df, ["retail_sales","retail"])
-    house = best_col(df, ["housing_starts","housing","starts"])
-
-    need = dict(cpi_headline=cpi_h, cpi_core=cpi_c, pce_headline=pce_h,
-                industrial_production=ip, retail_sales=retail, housing_starts=house)
-    missing = [k for k,v in need.items() if v is None]
-    if missing:
-        raise ValueError(f"Verplichte velden ontbreken in {MACRO_VIEW}: {', '.join(missing)}")
-
-    return df.rename(columns={
-        cpi_h:"cpi_headline", cpi_c:"cpi_core", pce_h:"pce_headline",
-        ip:"industrial_production", retail:"retail_sales", house:"housing_starts"
-    })
+    return df
 
 # ========= Data laden =========
 try:
@@ -129,222 +149,345 @@ except (BadRequest, ValueError) as e:
 if not np.issubdtype(df["date"].dtype, np.datetime64):
     df["date"] = pd.to_datetime(df["date"])
 
-# ========= Periode (volle breedte) =========
+# ======== Column mapping (jouw schema + varianten) ========
+colmap = {
+    # inflatie indices/YoY
+    "cpi_idx":     best_col(df, ["cpi_all","cpi","cpi_index"]),
+    "cpi_core_idx":best_col(df, ["cpi_core","cpi_core_index"]),
+    "pce_idx":     best_col(df, ["pce_all","pce","pce_index"]),
+    "cpi_yoy":     best_col(df, ["cpi_yoy","cpi_all_yoy"]),
+    "cpi_core_yoy":best_col(df, ["cpi_core_yoy"]),
+    "pce_yoy":     best_col(df, ["pce_yoy","pce_all_yoy"]),
+    # PPI (zoveel mogelijk varianten, incl. mislabel)
+    "ppi_yoy":     best_col(df, ["ppi_yoy","ppi_all_yoy","producer_price_yoy"]),
+    "ppi_core_yoy":best_col(df, ["ppi_core_yoy"]),
+    "ppi_idx":     best_col(df, ["ppi_all","ppi","producer_price_index"]),
+    "ppi_core_idx":best_col(df, ["ppi_core"]),
+    # activiteit/arbeid/geld
+    "industrial_production": best_col(df, ["industrial_production","ip_index"]),
+    "retail_sales":          best_col(df, ["retail_sales","retail"]),
+    "housing_starts":        best_col(df, ["housing_starts","housing","starts"]),
+    "unemployment":          best_col(df, ["unemployment","unemp_rate"]),
+    "payrolls":              best_col(df, ["payrolls","nonfarm_payrolls"]),
+    "init_claims":           best_col(df, ["init_claims","initial_claims"]),
+    "m2":                    best_col(df, ["m2"]),
+    "m2_ma3":                best_col(df, ["m2_ma3"]),
+    "m2_real":               best_col(df, ["m2_real"]),
+    "m2_real_ma3":           best_col(df, ["m2_real_ma3"]),
+    "m2_yoy":                best_col(df, ["m2_yoy"]),
+    "m2_real_yoy":           best_col(df, ["m2_real_yoy"]),
+    "m2_vel":                best_col(df, ["m2_vel"]),
+    "m2_vel_ma3":            best_col(df, ["m2_vel_ma3"]),
+    "m2_vel_yoy":            best_col(df, ["m2_vel_yoy"]),
+    # mogelijke “mislabel” waar PPI als ind_production staat
+    "maybe_ppi_in_indprod":  best_col(df, ["ind_production","ppi_ind_production","ind_production_ppi"]),
+}
+
+# ======== Maak CPI/PCE/PPI YoY % dataframe ========
+df_pct = df.copy()
+# CPI/PCE
+df_pct["cpi_headline"] = pd.to_numeric(df[colmap["cpi_yoy"]], errors="coerce") if colmap["cpi_yoy"] \
+                         else yoy_from_index(df[colmap["cpi_idx"]]) if colmap["cpi_idx"] else np.nan
+df_pct["cpi_core"]     = pd.to_numeric(df[colmap["cpi_core_yoy"]], errors="coerce") if colmap["cpi_core_yoy"] \
+                         else yoy_from_index(df[colmap["cpi_core_idx"]]) if colmap["cpi_core_idx"] else np.nan
+df_pct["pce_headline"] = pd.to_numeric(df[colmap["pce_yoy"]], errors="coerce") if colmap["pce_yoy"] \
+                         else yoy_from_index(df[colmap["pce_idx"]]) if colmap["pce_idx"] else np.nan
+
+# PPI (direct als YoY, anders uit index). Als niets gevonden: later UI-fallback.
+ppi_headline_series = None
+if colmap["ppi_yoy"]:
+    ppi_headline_series = pd.to_numeric(df[colmap["ppi_yoy"]], errors="coerce")
+elif colmap["ppi_idx"]:
+    ppi_headline_series = yoy_from_index(df[colmap["ppi_idx"]])
+elif colmap["maybe_ppi_in_indprod"]:
+    # Zwakke heuristic: als gebruiker dit zo heeft genoemd, bied UI-keuze aan (zie verderop)
+    pass
+
+if ppi_headline_series is not None:
+    df_pct["ppi_headline"] = ppi_headline_series
+if colmap["ppi_core_yoy"]:
+    df_pct["ppi_core"] = pd.to_numeric(df[colmap["ppi_core_yoy"]], errors="coerce")
+elif colmap["ppi_core_idx"]:
+    df_pct["ppi_core"] = yoy_from_index(df[colmap["ppi_core_idx"]])
+
+# ========= UI-filters =========
 all_min, all_max = df["date"].min().date(), df["date"].max().date()
 default_start = all_max - timedelta(days=5*365)
 start, end = st.slider("Periode", min_value=all_min, max_value=all_max,
                        value=(default_start, all_max), format="YYYY-MM-DD")
-dfp = df[(df["date"].dt.date >= start) & (df["date"].dt.date <= end)].copy()
 
-st.divider()
+colA, colB = st.columns([1,1])
+with colA:
+    view_mode = st.radio("Weergave overige grafieken", ["Genormaliseerd (=100)", "Eigen schaal per serie"],
+                         horizontal=True, index=0)
+with colB:
+    daily_interp = st.checkbox("Interpoleer naar dag (experimenteel)", value=False,
+                               help="Lineaire verdeling van maandpunten naar dagelijkse waarden voor beter zicht op dagelijkse Δ.")
 
-# ========= Inflatie =========
-st.subheader("Inflatie (dual-axis)")
+dfp = df_pct[(df_pct["date"].dt.date >= start) & (df_pct["date"].dt.date <= end)].copy()
+
+def maybe_daily(dfin: pd.DataFrame) -> pd.DataFrame:
+    if not daily_interp or dfin.empty:
+        return dfin
+    d = dfin.set_index("date").asfreq("D")
+    d = d.interpolate(method="time").reset_index().rename(columns={"index":"date"})
+    return d
+
+# ========= Sectie: Inflatie (CPI/PCE + PPI) — YoY met dubbele as =========
+st.subheader("Inflatie (YoY %, CPI/PCE + PPI)")
+
 info_card("Hoe lees je dit?", [
-  "🔵 **CPI (headline)** is volatieler; **Core** filtert energie/voeding en geeft trend.",
-  "🔴 **PCE** is breder en vaak lager dan CPI; oplopend CPI–PCE verschil = andere prijsdrukmix.",
-  "▲ CPI/Core ↑ + Velocity ↑ ⇒ **inflatie-impuls**; vlak/↓ ⇒ **desinflatie**."
+  "🔵 CPI (headline) & core + 🔴 PCE (headline) op **linker y-as** (YoY %).",
+  "🟣 PPI (headline/core) op **rechter y-as** voor betere leesbaarheid (andere schaal).",
+  "Hogere YoY-inflatie/kostendruk = **bearish** voor duration/valuaties; dalend = **desinflatie**."
 ])
-if dfp.empty:
-    st.info("Geen inflatie-data in de gekozen periode.")
-else:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dfp["date"], y=pd.to_numeric(dfp["cpi_headline"], errors="coerce"),
-                             mode="lines", name="CPI (headline)",
-                             line=dict(color=COL_BLUE, width=3)))
-    fig.add_trace(go.Scatter(x=dfp["date"], y=pd.to_numeric(dfp["cpi_core"], errors="coerce"),
-                             mode="lines", name="CPI (core)",
-                             line=dict(color=COL_CYAN, width=2, dash="dash")))
-    r2 = padded_range(dfp["pce_headline"])
-    fig.add_trace(go.Scatter(x=dfp["date"], y=pd.to_numeric(dfp["pce_headline"], errors="coerce"),
-                             mode="lines", name="PCE (headline)",
-                             line=dict(color=COL_RED, width=2, dash="dash"), yaxis="y2"))
-    fig.update_layout(
-        height=420, legend=dict(orientation="h"),
-        margin=dict(l=0,r=0,t=10,b=0),
-        yaxis=dict(title="Niveau (CPI)"),
-        yaxis2=dict(title="Niveau (PCE)", overlaying="y", side="right", range=r2),
-        xaxis=dict(title="Datum")
+
+# UI-fallback wanneer geen PPI gevonden is: laat gebruiker een kolom kiezen (bijv. 'ind_production')
+ppi_present = any(c in dfp.columns for c in ["ppi_headline","ppi_core"])
+if not ppi_present:
+    numeric_cols = [c for c in df.columns if c not in ["date"]]
+    fallback_ppi = st.selectbox(
+        "Geen PPI-kolom gedetecteerd — kies optioneel een kolom om als PPI (YoY %) te tonen:",
+        options=["(geen)"] + numeric_cols, index=0,
+        help="Kies hier bijvoorbeeld 'ind_production' als je view PPI zo benoemd heeft."
     )
-    st.plotly_chart(fig, use_container_width=True)
+    if fallback_ppi != "(geen)":
+        try:
+            series = yoy_from_index(df[fallback_ppi])
+            dfp["ppi_headline"] = series[(df["date"].dt.date >= start) & (df["date"].dt.date <= end)]
+        except Exception:
+            st.warning(f"Kon YoY niet afleiden uit '{fallback_ppi}'.")
 
-    last2 = dfp[["cpi_headline","cpi_core","pce_headline"]].tail(2)
-    if len(last2) == 2:
-        (c1, c2, c3) = st.columns(3)
-        l, p = last2.iloc[-1], last2.iloc[-2]
-        add_metric_chip(c1, "CPI (headline)", float(l["cpi_headline"]), float(l["cpi_headline"] - p["cpi_headline"]))
-        add_metric_chip(c2, "CPI (core)",     float(l["cpi_core"]),     float(l["cpi_core"]     - p["cpi_core"]))
-        add_metric_chip(c3, "PCE (headline)", float(l["pce_headline"]), float(l["pce_headline"] - p["pce_headline"]))
+infl_left = [c for c in ["cpi_headline","cpi_core","pce_headline"] if c in dfp.columns]
+infl_right = [c for c in ["ppi_headline","ppi_core"] if c in dfp.columns]
 
-st.divider()
-
-# ========= Activiteit =========
-st.subheader("Activiteit (dual-axis)")
-info_card("Interpretatie", [
-  "🟦 **Industrial production (IP)**: productie-cyclus; eigen schaal zodat de lijn niet wordt platgedrukt.",
-  "🟦 IP ↘ én 🟦 **Retail** ↘ tegelijk ⇒ **vraag koelt af**; vaak zichtbaar vóór zwakkere winstgroei.",
-  "🔴 **Housing starts** is **leidend**; langdurig dalend ⇒ **groeirisico** ↑."
-])
-if dfp.empty:
-    st.info("Geen activiteit-data in de gekozen periode.")
+if not infl_left and not infl_right:
+    st.info("Geen CPI/PCE/PPI kolommen gevonden.")
 else:
-    fig2 = go.Figure()
-    # y (links): Retail sales
-    fig2.add_trace(go.Scatter(x=dfp["date"], y=pd.to_numeric(dfp["retail_sales"], errors="coerce"),
-                              mode="lines", name="Retail sales",
-                              line=dict(color=COL_CYAN, width=2, dash="dash")))
-    # y2 (rechts): Housing starts
-    y2r = padded_range(dfp["housing_starts"])
-    fig2.add_trace(go.Scatter(x=dfp["date"], y=pd.to_numeric(dfp["housing_starts"], errors="coerce"),
-                              mode="lines", name="Housing starts",
-                              line=dict(color=COL_RED, width=2, dash="dash"), yaxis="y2"))
-    # y3 (links overlay): Industrial production eigen schaal
-    y3r = padded_range(dfp["industrial_production"])
-    fig2.add_trace(go.Scatter(x=dfp["date"], y=pd.to_numeric(dfp["industrial_production"], errors="coerce"),
-                              mode="lines", name="Industrial production",
-                              line=dict(color=COL_BLUE, width=3), yaxis="y3"))
-    fig2.update_layout(
-        height=420, legend=dict(orientation="h"),
+    dfi_cols = ["date"] + infl_left + infl_right
+    dfi = dfp[dfi_cols].copy()
+    dfi = maybe_daily(dfi)
+
+    fig = go.Figure()
+    stack_left = []
+    for i, c in enumerate(infl_left):
+        s = pd.to_numeric(dfi[c], errors="coerce")
+        stack_left.append(s)
+        fig.add_trace(go.Scatter(
+            x=dfi["date"], y=s, mode="lines", name=c,
+            line=dict(width=2, color=PALETTE[i % len(PALETTE)]), yaxis="y"
+        ))
+    y_left = padded_range(pd.concat(stack_left, axis=0)) if stack_left else None
+
+    stack_right = []
+    for j, c in enumerate(infl_right):
+        s = pd.to_numeric(dfi[c], errors="coerce")
+        stack_right.append(s)
+        fig.add_trace(go.Scatter(
+            x=dfi["date"], y=s, mode="lines", name=c,
+            line=dict(width=2, dash="dash", color=PALETTE[(j+4) % len(PALETTE)]), yaxis="y2"
+        ))
+    y_right = padded_range(pd.concat(stack_right, axis=0)) if stack_right else None
+
+    fig.update_layout(
+        height=460, legend=dict(orientation="h"),
         margin=dict(l=0,r=0,t=10,b=0),
         xaxis=dict(title="Datum"),
-        yaxis=dict(title="Niveau (Retail)"),
-        yaxis2=dict(title="Niveau (Housing starts)", overlaying="y", side="right", range=y2r),
-        yaxis3=dict(overlaying="y", side="left", range=y3r, showticklabels=False, showgrid=False)
+        yaxis=dict(title="YoY % (CPI/PCE)", range=y_left),
+        yaxis2=dict(title="YoY % (PPI)", overlaying="y", side="right", range=y_right)
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
 
-    last2 = dfp[["industrial_production","retail_sales","housing_starts"]].tail(2)
+    series_all = infl_left + infl_right
+    last2 = dfi[series_all].dropna().tail(2)
     if len(last2) == 2:
-        (c1, c2, c3) = st.columns(3)
-        l, p = last2.iloc[-1], last2.iloc[-2]
-        add_metric_chip(c1, "Industrial production", float(l["industrial_production"]), float(l["industrial_production"] - p["industrial_production"]))
-        add_metric_chip(c2, "Retail sales",          float(l["retail_sales"]),          float(l["retail_sales"]          - p["retail_sales"]))
-        add_metric_chip(c3, "Housing starts",        float(l["housing_starts"]),        float(l["housing_starts"]        - p["housing_starts"]))
+        changes = {c: float(last2[c].iloc[-1] - last2[c].iloc[-2]) for c in series_all}
+        tone, summary = dynamic_conclusion(changes)
+        info_card("Dynamische conclusie (inflatie & producentenprijzen)", [summary], tone=tone)
+
+    if series_all:
+        cols = st.columns(min(5, len(series_all)))
+        for i, c in enumerate(series_all):
+            ser = dfi[c].dropna()
+            if len(ser) >= 2:
+                l, p = float(ser.iloc[-1]), float(ser.iloc[-2])
+                add_metric_chip(cols[i % len(cols)], c, l, l - p, unit="%")
+
+    st.markdown("**Dagelijkse delta per serie (pp)**")
+    for c in series_all:
+        st.caption(f"Δ {c}")
+        tiny_delta_chart(dfi["date"], dfi[c], c)
 
 st.divider()
 
-# ========= Overige macro-indicatoren =========
-st.subheader("Overige macro-indicatoren")
-mode = st.radio(
-    "Weergave overige grafieken",
-    ["Genormaliseerd (index = 100)", "Eigen as per serie"],
-    horizontal=True, index=0
-)
-show_ma3 = st.checkbox("Toon MA3 (waar beschikbaar)", value=True)
+# ========= Sectie: Activiteit (IP / Retail / Housing) =========
+st.subheader("Activiteit (IP / Retail / Housing)")
+
+act_cols = [c for c in ["industrial_production","retail_sales","housing_starts"] if c in colmap.values() and c in dfp.columns]
+# fallback: als 'industrial_production' niet bestaat maar 'ind_production' wel én die NIET als PPI is gekozen/afgeleid
+if "industrial_production" not in dfp.columns and colmap["maybe_ppi_in_indprod"] and "ppi_headline" not in dfp.columns:
+    dfp = dfp.merge(df[["date", colmap["maybe_ppi_in_indprod"]]], on="date", how="left", suffixes=("",""))
+    dfp = dfp.rename(columns={colmap["maybe_ppi_in_indprod"]: "industrial_production"})
+
+act_cols = [c for c in ["industrial_production","retail_sales","housing_starts"] if c in dfp.columns]
+
+if act_cols:
+    dfa = dfp[["date"] + act_cols].copy()
+    dfa = maybe_daily(dfa)
+
+    fig2 = go.Figure()
+    if view_mode.startswith("Genormaliseerd"):
+        stack = []
+        for i, c in enumerate(act_cols):
+            s = normalize_100(dfa[c])
+            stack.append(s)
+            fig2.add_trace(go.Scatter(x=dfa["date"], y=s, mode="lines",
+                                      name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
+        yr = padded_range(pd.concat(stack, axis=0))
+        fig2.update_layout(height=420, legend=dict(orientation="h"),
+                           margin=dict(l=0,r=0,t=10,b=0),
+                           yaxis=dict(title="Index (=100)", range=yr),
+                           xaxis=dict(title="Datum"))
+    else:
+        for i, c in enumerate(act_cols):
+            s = pd.to_numeric(dfa[c], errors="coerce")
+            fig2.add_trace(go.Scatter(x=dfa["date"], y=s, mode="lines",
+                                      name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
+        fig2.update_layout(height=420, legend=dict(orientation="h"),
+                           margin=dict(l=0,r=0,t=10,b=0),
+                           xaxis=dict(title="Datum"),
+                           yaxis=dict(title="Niveau", range=padded_range(pd.concat([pd.to_numeric(dfa[c], errors="coerce") for c in act_cols]))))
+    st.plotly_chart(fig2, use_container_width=True)
+
+    last2 = dfa[act_cols].dropna().tail(2)
+    if len(last2) == 2:
+        changes = {c: float(last2[c].iloc[-1] - last2[c].iloc[-2]) for c in act_cols}
+        tone, summary = dynamic_conclusion(changes)
+        info_card("Dynamische conclusie (activiteit)", [summary], tone=tone)
+
+    st.markdown("**Dagelijkse delta per serie**")
+    for c in act_cols:
+        st.caption(f"Δ {c}")
+        tiny_delta_chart(dfa["date"], dfa[c], c)
+else:
+    st.info("Geen activiteit-kolommen gevonden (industrial_production/retail_sales/housing_starts).")
+
+st.divider()
+
+# ========= Sectie: Arbeidsmarkt =========
+st.subheader("Arbeidsmarkt")
+
+arb_cols = [c for c in ["unemployment","payrolls","init_claims"] if c in dfp.columns]
+if arb_cols:
+    dfl = dfp[["date"] + arb_cols].copy()
+    dfl = maybe_daily(dfl)
+
+    fig3 = go.Figure()
+    if view_mode.startswith("Genormaliseerd"):
+        stack = []
+        for i, c in enumerate(arb_cols):
+            s = normalize_100(dfl[c])
+            stack.append(s)
+            fig3.add_trace(go.Scatter(x=dfl["date"], y=s, mode="lines",
+                                      name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
+        yr = padded_range(pd.concat(stack, axis=0))
+        fig3.update_layout(height=400, legend=dict(orientation="h"),
+                           margin=dict(l=0,r=0,t=10,b=0),
+                           yaxis=dict(title="Index (=100)", range=yr),
+                           xaxis=dict(title="Datum"))
+    else:
+        for i, c in enumerate(arb_cols):
+            s = pd.to_numeric(dfl[c], errors="coerce")
+            fig3.add_trace(go.Scatter(x=dfl["date"], y=s, mode="lines",
+                                      name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
+        fig3.update_layout(height=400, legend=dict(orientation="h"),
+                           margin=dict(l=0,r=0,t=10,b=0),
+                           xaxis=dict(title="Datum"),
+                           yaxis=dict(title="Niveau", range=padded_range(pd.concat([pd.to_numeric(dfl[c], errors="coerce") for c in arb_cols]))))
+    st.plotly_chart(fig3, use_container_width=True)
+
+    last2 = dfl[arb_cols].dropna().tail(2)
+    if len(last2) == 2:
+        changes = {c: float(last2[c].iloc[-1] - last2[c].iloc[-2]) for c in arb_cols}
+        tone, summary = dynamic_conclusion(changes)
+        info_card("Dynamische conclusie (arbeidsmarkt)", [summary], tone=tone)
+
+    st.markdown("**Dagelijkse delta per serie**")
+    for c in arb_cols:
+        st.caption(f"Δ {c}")
+        tiny_delta_chart(dfl["date"], dfl[c], c)
+else:
+    st.info("Geen arbeidsmarkt-kolommen gevonden (unemployment/payrolls/init_claims).")
+
+st.divider()
+
+# ========= Sectie: Geldhoeveelheid en velocity =========
+st.subheader("Geldhoeveelheid en velocity")
 
 have = set(dfp.columns)
-
-# ---------- Arbeidsmarkt ----------
-arb_cols = [c for c in ["unemployment","payrolls","init_claims"] if c in have]
-if arb_cols:
-    st.markdown("### Arbeidsmarkt")
-    info_card("Arbeidsmarkt — implicaties", [
-      "🟢 **Payrolls ↑** = krappe arbeidsmarkt; 🟠 **Initial claims ↑** = verzwakking.",
-      "📉 **Unemployment**: stijging ~0,5pp t.o.v. 12m-low (Sahm-regel) ⇒ recessiesignaal."
-    ])
-    fig = go.Figure()
-    if mode.startswith("Genormaliseerd"):
-        stack = []
-        for i, col in enumerate(arb_cols):
-            s = normalize_100(dfp[col])
-            stack.append(s)
-            fig.add_trace(go.Scatter(x=dfp["date"], y=s, mode="lines",
-                                     name=col, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
-        yr = padded_range(pd.concat(stack, axis=0))
-        fig.update_layout(height=420, legend=dict(orientation="h"),
-                          margin=dict(l=0,r=0,t=10,b=0),
-                          yaxis=dict(title="Index (=100)", range=yr),
-                          xaxis=dict(title="Datum"))
-    else:
-        for i, col in enumerate(arb_cols):
-            ax_id = "" if i == 0 else str(i+1)
-            ax_name = f"yaxis{ax_id}" if ax_id else "yaxis"
-            s = pd.to_numeric(dfp[col], errors="coerce")
-            fig.add_trace(go.Scatter(x=dfp["date"], y=s, mode="lines",
-                                     name=col, yaxis=f"y{ax_id}" if ax_id else "y",
-                                     line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
-            rng = padded_range(s)
-            if i == 0:
-                fig.update_layout(yaxis=dict(title=col, range=rng))
-            elif i == 1:
-                fig.update_layout(yaxis2=dict(title=col, overlaying="y", side="right", range=rng))
-            else:
-                side = "left" if i % 2 == 0 else "right"
-                fig["layout"][ax_name] = dict(overlaying="y", side=side, range=rng, showticklabels=False, showgrid=False)
-        fig.update_layout(height=420, legend=dict(orientation="h"), margin=dict(l=0,r=0,t=10,b=0), xaxis=dict(title="Datum"))
-    st.plotly_chart(fig, use_container_width=True)
-
-    last2 = dfp[arb_cols].tail(2)
-    if len(last2) == 2:
-        cols = st.columns(min(5, len(arb_cols)))
-        for i, col in enumerate(arb_cols):
-            l, p = float(last2[col].iloc[-1]), float(last2[col].iloc[-2])
-            add_metric_chip(cols[i % len(cols)], col, l, l - p)
-
-# ---------- M2 — niveaus ----------
 m2_level_cols = [c for c in ["m2","m2_real"] if c in have]
 m2_ma_cols    = [c for c in ["m2_ma3","m2_real_ma3"] if c in have]
-if m2_level_cols:
-    st.markdown("### M2 — niveaus")
-    info_card("M2 — implicaties", [
-      "💧 **M2 ↑ snel** ⇒ ruim beleid/liquiditeit; vlak of ↓ ⇒ neutraal/strakker.",
-      "🧮 **Reële M2** corrigeert inflatie — daling bij hoge inflatie kan reële vraag knijpen."
-    ])
+m2_yoy_cols   = [c for c in ["m2_yoy","m2_real_yoy"] if c in have]
+vel_level_cols= [c for c in ["m2_vel"] if c in have]
+vel_ma_cols   = [c for c in ["m2_vel_ma3"] if c in have]
+vel_yoy_cols  = [c for c in ["m2_vel_yoy"] if c in have]
+
+def plot_block(title: str, cols: list[str], ma_cols: list[str] = None):
+    if not cols: 
+        return
+    st.markdown(f"### {title}")
+    dfm = dfp[["date"] + cols + (ma_cols or [])].copy()
+    dfm = maybe_daily(dfm)
+
     fig = go.Figure()
-    if mode.startswith("Genormaliseerd"):
+    if view_mode.startswith("Genormaliseerd"):
         stack = []
-        series_cols = m2_level_cols + (m2_ma_cols if show_ma3 else [])
+        series_cols = cols + (ma_cols or [])
         for i, c in enumerate(series_cols):
-            s = normalize_100(dfp[c])
+            s = normalize_100(dfm[c])
             stack.append(s)
-            fig.add_trace(go.Scatter(x=dfp["date"], y=s, mode="lines",
+            fig.add_trace(go.Scatter(x=dfm["date"], y=s, mode="lines",
                                      name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
         yr = padded_range(pd.concat(stack, axis=0))
-        fig.update_layout(height=380, legend=dict(orientation="h"),
+        fig.update_layout(height=360, legend=dict(orientation="h"),
                           margin=dict(l=0,r=0,t=10,b=0),
                           yaxis=dict(title="Index (=100)", range=yr),
                           xaxis=dict(title="Datum"))
     else:
-        series_cols = m2_level_cols + (m2_ma_cols if show_ma3 else [])
+        series_cols = cols + (ma_cols or [])
         for i, c in enumerate(series_cols):
-            ax_id = "" if i == 0 else str(i+1)
-            ax_name = f"yaxis{ax_id}" if ax_id else "yaxis"
-            s = pd.to_numeric(dfp[c], errors="coerce")
-            fig.add_trace(go.Scatter(x=dfp["date"], y=s, mode="lines",
-                                     name=c, yaxis=f"y{ax_id}" if ax_id else "y",
-                                     line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
-            rng = padded_range(s)
-            if i == 0:
-                fig.update_layout(yaxis=dict(title=c, range=rng))
-            elif i == 1:
-                fig.update_layout(yaxis2=dict(title=c, overlaying="y", side="right", range=rng))
-            else:
-                side = "left" if i % 2 == 0 else "right"
-                fig["layout"][ax_name] = dict(overlaying="y", side=side, range=rng, showticklabels=False, showgrid=False)
-        fig.update_layout(height=380, legend=dict(orientation="h"), margin=dict(l=0,r=0,t=10,b=0), xaxis=dict(title="Datum"))
+            s = pd.to_numeric(dfm[c], errors="coerce")
+            fig.add_trace(go.Scatter(x=dfm["date"], y=s, mode="lines",
+                                     name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
+        fig.update_layout(height=360, legend=dict(orientation="h"),
+                          margin=dict(l=0,r=0,t=10,b=0),
+                          xaxis=dict(title="Datum"),
+                          yaxis=dict(title="Niveau", range=padded_range(pd.concat([pd.to_numeric(dfm[c], errors="coerce") for c in series_cols]))))
     st.plotly_chart(fig, use_container_width=True)
 
-    last2 = dfp[m2_level_cols].tail(2)
+    last2 = dfm[cols].dropna().tail(2)
     if len(last2) == 2:
-        cols = st.columns(min(5, len(m2_level_cols)))
-        for i, c in enumerate(m2_level_cols):
-            l, p = float(last2[c].iloc[-1]), float(last2[c].iloc[-2])
-            add_metric_chip(cols[i % len(cols)], c, l, l - p)
+        changes = {c: float(last2[c].iloc[-1] - last2[c].iloc[-2]) for c in cols}
+        tone, summary = dynamic_conclusion(changes)
+        info_card(f"Dynamische conclusie ({title})", [summary], tone=tone)
 
-# ---------- M2 — YoY ----------
-m2_yoy_cols = [c for c in ["m2_yoy","m2_real_yoy"] if c in have]
+    st.markdown("**Dagelijkse delta per serie**")
+    for c in cols:
+        st.caption(f"Δ {c}")
+        tiny_delta_chart(dfm["date"], dfm[c], c)
+
+plot_block("M2 — niveaus", m2_level_cols, m2_ma_cols)
+
 if m2_yoy_cols:
     st.markdown("### M2 — YoY (%)")
-    info_card("M2 YoY — implicaties", [
-      "🔻 **M2 YoY < 0%** = **kwantitatieve verkrapping**; historisch vaak neerwaartse druk op groei/risico-activa.",
-      "🔺 Re-acceleratie (>0%) kan vroege draai naar verruiming signaleren."
-    ], tone="bear")
+    dfm = dfp[["date"] + m2_yoy_cols].copy()
+    dfm = maybe_daily(dfm)
     fig = go.Figure()
     stack = []
     for i, c in enumerate(m2_yoy_cols):
-        s = pd.to_numeric(dfp[c], errors="coerce")
+        s = pd.to_numeric(dfm[c], errors="coerce")
         stack.append(s)
-        fig.add_trace(go.Scatter(x=dfp["date"], y=s, mode="lines",
+        fig.add_trace(go.Scatter(x=dfm["date"], y=s, mode="lines",
                                  name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
     yr = padded_range(pd.concat(stack, axis=0))
     fig.update_layout(height=320, legend=dict(orientation="h"),
@@ -353,83 +496,38 @@ if m2_yoy_cols:
                       xaxis=dict(title="Datum"))
     st.plotly_chart(fig, use_container_width=True)
 
-    last2 = dfp[m2_yoy_cols].tail(2)
+    last2 = dfm[m2_yoy_cols].dropna().tail(2)
     if len(last2) == 2:
-        cols = st.columns(min(5, len(m2_yoy_cols)))
-        for i, c in enumerate(m2_yoy_cols):
-            l, p = float(last2[c].iloc[-1]), float(last2[c].iloc[-2])
-            add_metric_chip(cols[i % len(cols)], c, l, l - p)
+        changes = {c: float(last2[c].iloc[-1] - last2[c].iloc[-2]) for c in m2_yoy_cols}
+        tone, summary = dynamic_conclusion(changes)
+        info_card("Dynamische conclusie (M2 YoY)", [summary], tone=tone)
 
-# ---------- Velocity — niveau ----------
-vel_level_cols = [c for c in ["m2_vel"] if c in have]
-vel_ma_cols    = [c for c in ["m2_vel_ma3"] if c in have]
-if vel_level_cols:
-    st.markdown("### Velocity — niveau")
-    info_card("Velocity — implicaties", [
-      "🏃 **Velocity ↑** ⇒ elke geld-euro circuleert sneller ⇒ **hogere nominale bestedingen**.",
-      "Velocity kan dalende M2 compenseren (of omgekeerd)."
-    ], tone="bull")
-    fig = go.Figure()
-    if mode.startswith("Genormaliseerd"):
-        stack = []
-        series_cols = vel_level_cols + (vel_ma_cols if show_ma3 else [])
-        for i, c in enumerate(series_cols):
-            s = normalize_100(dfp[c])
-            stack.append(s)
-            fig.add_trace(go.Scatter(x=dfp["date"], y=s, mode="lines",
-                                     name=c, line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
-        yr = padded_range(pd.concat(stack, axis=0))
-        fig.update_layout(height=320, legend=dict(orientation="h"),
-                          margin=dict(l=0,r=0,t=10,b=0),
-                          yaxis=dict(title="Index (=100)", range=yr),
-                          xaxis=dict(title="Datum"))
-    else:
-        series_cols = vel_level_cols + (vel_ma_cols if show_ma3 else [])
-        for i, c in enumerate(series_cols):
-            ax_id = "" if i == 0 else str(i+1)
-            ax_name = f"yaxis{ax_id}" if ax_id else "yaxis"
-            s = pd.to_numeric(dfp[c], errors="coerce")
-            fig.add_trace(go.Scatter(x=dfp["date"], y=s, mode="lines",
-                                     name=c, yaxis=f"y{ax_id}" if ax_id else "y",
-                                     line=dict(width=2, color=PALETTE[i % len(PALETTE)])))
-            rng = padded_range(s)
-            if i == 0:
-                fig.update_layout(yaxis=dict(title=c, range=rng))
-            elif i == 1:
-                fig.update_layout(yaxis2=dict(title=c, overlaying="y", side="right", range=rng))
-            else:
-                side = "left" if i % 2 == 0 else "right"
-                fig["layout"][ax_name] = dict(overlaying="y", side=side, range=rng, showticklabels=False, showgrid=False)
-        fig.update_layout(height=320, legend=dict(orientation="h"), margin=dict(l=0,r=0,t=10,b=0), xaxis=dict(title="Datum"))
-    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("**Dagelijkse delta per serie (pp)**")
+    for c in m2_yoy_cols:
+        st.caption(f"Δ {c}")
+        tiny_delta_chart(dfm["date"], dfm[c], c)
 
-    last2 = dfp[vel_level_cols].tail(2)
-    if len(last2) == 2:
-        cols = st.columns(min(5, len(vel_level_cols)))
-        for i, c in enumerate(vel_level_cols):
-            l, p = float(last2[c].iloc[-1]), float(last2[c].iloc[-2])
-            add_metric_chip(cols[i % len(cols)], c, l, l - p)
+plot_block("Velocity — niveau", vel_level_cols, vel_ma_cols)
 
-# ---------- Velocity — YoY ----------
-vel_yoy_cols = [c for c in ["m2_vel_yoy"] if c in have]
 if vel_yoy_cols:
     st.markdown("### Velocity — YoY (%)")
-    info_card("Velocity YoY — implicaties", [
-      "▲ Positieve YoY ⇒ **bestedingsimpuls**; ▼ negatieve YoY ⇒ **vraagtempering**.",
-      "Velocity ↑ + kerninflatie ↑ = hardnekkige prijsdruk."
-    ])
+    dfv = dfp[["date"] + vel_yoy_cols].copy()
+    dfv = maybe_daily(dfv)
+    s = pd.to_numeric(dfv[vel_yoy_cols[0]], errors="coerce")
     fig = go.Figure()
-    s = pd.to_numeric(dfp["m2_vel_yoy"], errors="coerce")
-    fig.add_trace(go.Scatter(x=dfp["date"], y=s, mode="lines",
-                             name="m2_vel_yoy", line=dict(width=2, color=PALETTE[0])))
+    fig.add_trace(go.Scatter(x=dfv["date"], y=s, mode="lines",
+                             name=vel_yoy_cols[0], line=dict(width=2, color=PALETTE[0])))
     fig.update_layout(height=280, legend=dict(orientation="h"),
                       margin=dict(l=0,r=0,t=10,b=0),
                       yaxis=dict(title="%", range=padded_range(s)),
                       xaxis=dict(title="Datum"))
     st.plotly_chart(fig, use_container_width=True)
 
-    last2 = dfp[vel_yoy_cols].tail(2)
+    last2 = dfv[vel_yoy_cols].dropna().tail(2)
     if len(last2) == 2:
-        (c1,) = st.columns(1)
-        l, p = float(last2["m2_vel_yoy"].iloc[-1]), float(last2["m2_vel_yoy"].iloc[-2])
-        add_metric_chip(c1, "m2_vel_yoy", l, l - p)
+        changes = {vel_yoy_cols[0]: float(last2[vel_yoy_cols[0]].iloc[-1] - last2[vel_yoy_cols[0]].iloc[-2])}
+        tone, summary = dynamic_conclusion(changes)
+        info_card("Dynamische conclusie (Velocity YoY)", [summary], tone=tone)
+
+    st.markdown("**Dagelijkse delta (pp)**")
+    tiny_delta_chart(dfv["date"], dfv[vel_yoy_cols[0]], vel_yoy_cols[0])
