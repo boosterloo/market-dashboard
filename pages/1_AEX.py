@@ -197,7 +197,7 @@ with col2:
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("Δ-instellingen")
-    col1, col2, col3, col4 = st.columns([1,1,1,1])
+    col1, col2, col3, col4 = st.columns([1.5, 1.5, 0.8, 1.2])
     with col1:
         delta_mode = st.radio("Weergave", ["Δ punten", "Δ %"], index=0, horizontal=True)
     with col2:
