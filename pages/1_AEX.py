@@ -185,15 +185,17 @@ def compute_indicators(full_df):
 
 df = compute_indicators(df)
 
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.header("Filters")
-    min_d = df["date"].min().date()
-    max_d = df["date"].max().date()
-    default_start = max((df["date"].max() - timedelta(days=365)).date(), min_d)
+# ---------- Periode (bovenaan, midden) ----------
+min_d = df["date"].min().date()
+max_d = df["date"].max().date()
+default_start = max((df["date"].max() - timedelta(days=365)).date(), min_d)
+col1, col2, col3 = st.columns([1, 2, 1])
+with col2:
     start_date, end_date = st.slider("Periode", min_value=min_d, max_value=max_d,
                                      value=(default_start, max_d), format="YYYY-MM-DD")
-    
+
+# ---------- Sidebar ----------
+with st.sidebar:
     st.header("Δ-instellingen")
     col1, col2, col3, col4 = st.columns([1,1,1,1])
     with col1:
