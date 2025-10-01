@@ -72,26 +72,6 @@ pairs_all = sorted([c.removesuffix("_close") for c in close_cols])
 priority = ["eurusd", "gbpusd", "usdjpy", "usdchf", "audusd", "nzdusd"]
 ordered = [p for p in priority if p in pairs_all] + [p for p in pairs_all if p not in priority]
 
-# ---------- UI: periode (full width) + MA type ----------
-min_d, max_d = df_wide["date"].min(), df_wide["date"].max()
-default_start = max_d - timedelta(days=365)
-default_start = default_start if default_start > min_d else min_d
-
-with st.container():
-    start, end = st.slider(
-        "📅 Periode",
-        min_value=min_d, max_value=max_d,
-        value=(default_start, max_d),
-        step=timedelta(days=1),
-        format="YYYY-MM-DD",
-    )
-
-avg_mode = st.radio("Gemiddelde", ["EMA", "SMA"], index=0, horizontal=True)
-
-# ---------- Filter ----------
-mask = (df_wide["date"] >= start) & (df_wide["date"] <= end)
-df = df_wide.loc[mask].sort_values("date").copy()
-
 # ---------- Helpers ----------
 def cols_for(p: str) -> dict:
     return {
@@ -112,6 +92,80 @@ def compute_ma(series: pd.Series, kind: str, window: int) -> pd.Series:
 
 def _f(s):  # to float
     return pd.to_numeric(s, errors="coerce").astype(float)
+
+def _last_non_nan(series: pd.Series):
+    # pak laatste niet-NaN waarde
+    s = pd.to_numeric(series, errors="coerce")
+    if s.notna().any():
+        return s.dropna().iloc[-1]
+    return None
+
+def _fmt_price(val: float, pair: str) -> str:
+    if val is None or pd.isna(val):
+        return "—"
+    # adaptieve precisie: majors ~1.x → 4 dec; JPY ~100-160 → 2 dec; overige tussenvormen
+    if val < 10:
+        dec = 4
+    elif val < 100:
+        dec = 3
+    else:
+        dec = 2
+    return f"{val:.{dec}f}"
+
+# ---------- NIEUW: ‘Laatste waarneming’ balk ----------
+with st.container():
+    st.subheader("Laatste waarneming")
+    max_date = df_wide["date"].max()
+    st.caption(f"Laatste update: **{max_date}**")
+
+    grid = st.columns(6)
+    i = 0
+    for p in ordered:
+        c = cols_for(p)
+        if c["close"] not in df_wide.columns:
+            continue
+
+        last_close = _last_non_nan(df_wide[c["close"]])
+        # Delta %: gebruik kolom indien beschikbaar, anders terugvallen op 2 laatste closes
+        last_dpct = None
+        if c["d_pct"] in df_wide.columns:
+            last_dpct = _last_non_nan(df_wide[c["d_pct"]])
+            if last_dpct is not None and not pd.isna(last_dpct):
+                last_dpct = float(last_dpct) * 100.0
+        if last_dpct is None:
+            cs = df_wide[c["close"]].dropna()
+            if len(cs) >= 2:
+                last_dpct = (cs.iloc[-1] / cs.iloc[-2] - 1.0) * 100.0
+
+        col = grid[i % len(grid)]
+        with col:
+            delta_text = "—" if last_dpct is None or pd.isna(last_dpct) else f"{last_dpct:.2f}%"
+            st.metric(
+                label=p.upper(),
+                value=_fmt_price(last_close, p),
+                delta=delta_text
+            )
+        i += 1
+
+# ---------- UI: periode (full width) + MA type ----------
+min_d, max_d = df_wide["date"].min(), df_wide["date"].max()
+default_start = max_d - timedelta(days=365)
+default_start = default_start if default_start > min_d else min_d
+
+with st.container():
+    start, end = st.slider(
+        "📅 Periode",
+        min_value=min_d, max_value=max_d,
+        value=(default_start, max_d),
+        step=timedelta(days=1),
+        format="YYYY-MM-DD",
+    )
+
+avg_mode = st.radio("Gemiddelde", ["EMA", "SMA"], index=0, horizontal=True)
+
+# ---------- Filter ----------
+mask = (df_wide["date"] >= start) & (df_wide["date"] <= end)
+df = df_wide.loc[mask].sort_values("date").copy()
 
 # Kleuren
 COLOR_PRICE   = "#111111"  # near-black
