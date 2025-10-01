@@ -30,7 +30,7 @@ with st.spinner("AEX data laden…"):
 if df.empty:
     st.warning("Geen data in view."); st.stop()
 
-df["date"] = pd.to_datetime(df["date"]).dt.date
+df["date"] = pd.to_datetime(df["date"])
 df = df[df["date"].dt.weekday < 5]  # Skip weekends/holidays
 for c in ["open","high","low","close","vix_close","delta_abs","delta_pct"]:
     if c in df.columns:
@@ -144,17 +144,17 @@ def rsi(series: pd.Series, period: int = 14):
     return 100 - (100 / (1 + rs))
 
 def ytd_return_full(full_df: pd.DataFrame):
-    max_d = full_df["date"].max(); start = date(max_d.year, 1, 1)
+    max_d = full_df["date"].max(); start = pd.Timestamp(date(max_d.year, 1, 1))
     sub = full_df[full_df["date"] >= start].dropna(subset=["close"])
     return (sub["close"].iloc[-1]/sub["close"].iloc[0]-1)*100 if len(sub)>=2 else None
 
 def pytd_return_full(full_df: pd.DataFrame):
     max_d = full_df["date"].max(); prev_year = max_d.year-1
-    start = date(prev_year,1,1)
+    start = pd.Timestamp(date(prev_year,1,1))
     try: 
         end = max_d.replace(year=prev_year)
     except ValueError: 
-        end = date(prev_year,12,31)
+        end = pd.Timestamp(date(prev_year,12,31))
     sub = full_df[(full_df["date"]>=start)&(full_df["date"]<=end)].dropna(subset=["close"])
     return (sub["close"].iloc[-1]/sub["close"].iloc[0]-1)*100 if len(sub)>=2 else None
 
@@ -319,22 +319,23 @@ st.plotly_chart(fig1, use_container_width=True)
 # ---------------- Δ-instellingen ----------------
 def aggregate_delta(_df: pd.DataFrame, mode: str, how: str) -> pd.Series:
     t = _df.copy()
-    t["date_dt"] = pd.to_datetime(t["date"]); t = t.set_index("date_dt")
+    t = t.set_index("date")
     if how == "Dagelijks":
         series = t["delta_pct"].dropna() if mode == "Δ %" else t["delta_abs"].dropna()
         return series.reindex(t.index, fill_value=0)  # Fill NaNs
     rule = "W-FRI" if how == "Wekelijks" else "M"
     if mode == "Δ %":
-        return t["delta_pct"].groupby(pd.Grouper(freq=rule)).apply(
+        res = t["delta_pct"].groupby(pd.Grouper(freq=rule)).apply(
             lambda g: (np.prod((g.dropna()/100.0 + 1.0)) - 1.0) * 100.0 if len(g.dropna()) else np.nan
         )
+        return res.fillna(0)
     else:
         return t["delta_abs"].groupby(pd.Grouper(freq=rule)).sum(min_count=1).fillna(0)
 
 delta_series = aggregate_delta(d, delta_mode, agg_mode)
 if smooth_on:
     delta_series = delta_series.rolling(ma_window, min_periods=1).mean()
-delta_x = delta_series.index.date if hasattr(delta_series.index, 'date') else pd.to_datetime(d["date"]).date
+delta_x = delta_series.index
 delta_legend = "Δ (%)" if delta_mode=="Δ %" else "Δ (punten)"
 if smooth_on: delta_legend += f" — MA{ma_window}"
 delta_colors = np.where(delta_series.values >= 0, "rgba(16,150,24,0.7)", "rgba(219,64,82,0.7)")
@@ -418,14 +419,14 @@ st.plotly_chart(fig3, use_container_width=True)
 
 # ---------- Rolling correlatie met VIX ----------
 st.markdown("#### Rolling correlatie met VIX")
-corr_df = d.copy(); corr_df["date_dt"] = pd.to_datetime(corr_df["date"]); corr_df = corr_df.set_index("date_dt")
+corr_df = d.copy(); corr_df = corr_df.set_index("date")
 aex_ret = corr_df["delta_pct"]  # %
 vix_series = (corr_df["vix_close"].pct_change()*100.0) if corr_vs=="% change" else corr_df["vix_close"]
 corr_join = pd.concat([aex_ret.rename("aex"), vix_series.rename("vix")], axis=1).dropna()
 rolling_corr = corr_join["aex"].rolling(corr_win).corr(corr_join["vix"])
 
 fig_corr = go.Figure()
-fig_corr.add_trace(go.Scatter(x=rolling_corr.index.date, y=rolling_corr.values, mode="lines", name="Rolling corr"))
+fig_corr.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr.values, mode="lines", name="Rolling corr"))
 fig_corr.add_hline(y=0.0, line_dash="dot")
 fig_corr.add_hrect(y0=-1, y1=-0.5, fillcolor="rgba(255,0,0,0.06)", line_width=0)
 fig_corr.add_hrect(y0=0.5, y1=1,   fillcolor="rgba(0,128,0,0.06)", line_width=0)
@@ -436,7 +437,7 @@ st.plotly_chart(fig_corr, use_container_width=True)
 if heat_on:
     st.subheader("Maand/jaar-heatmap van Δ")
     t = d.copy()
-    t["date_dt"] = pd.to_datetime(t["date"]); t = t.set_index("date_dt")
+    t = t.set_index("date")
     if delta_mode == "Δ %":
         monthly = t["delta_pct"].groupby(pd.Grouper(freq="M")).apply(
             lambda g: (np.prod((g.dropna()/100.0 + 1.0)) - 1.0) * 100.0 if len(g.dropna()) else np.nan
