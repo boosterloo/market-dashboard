@@ -391,7 +391,7 @@ def run_backtest(df_, start_capital, atr_mult, fee_bps, slip_bps, risk_pct,
                 cash -= abs(shares*sell_px)*fee
                 pos=-1; entry_px=sell_px; entry_idx=i+1; stop=init_stop; took_tp1=False
 
-    eq_series = pd.Series(equity_curve, index=df_["date"], name="equity")
+    eq_series = pd.Series(equity_curve, index=pd.to_datetime(df_["date"]), name="equity")
     trades_df = pd.DataFrame(trades)
     return eq_series, trades_df
 
@@ -412,36 +412,60 @@ eq_short, _ = run_backtest(
     tp1_r=TP1_R, tp2_r=TP2_R, tp1_part=TP1_PART, move_be=MOVE_BE
 )
 
-# Buy & Hold (equity)
-def buyhold_equity(df_, start_cap):
-    df_ = df_.copy().reset_index(drop=True)
-    if len(df_) < 2: return pd.Series([start_cap], index=df_["date"])
-    buy_px = float(df_.loc[1, "open"])
+# Buy & Hold (equity) — ROBUUST
+def buyhold_equity(df_: pd.DataFrame, start_cap: float) -> pd.Series:
+    dfx = df_.copy().reset_index(drop=True)
+    dfx["date"] = pd.to_datetime(dfx["date"])
+    if len(dfx) < 2:
+        s = pd.Series([start_cap], index=dfx["date"])
+        s.name = "bh_equity"
+        return s
+    buy_px = float(dfx.loc[1, "open"])  # start op eerstvolgende open
     shares = start_cap / buy_px
-    return (shares * df_["close"]).rename("bh_equity")
+    eq = shares * dfx["close"]
+    eq.index = dfx["date"]
+    eq.name = "bh_equity"
+    return eq
 
 bh_equity = buyhold_equity(d, START_CAP)
 
-# ----- metrics -----
-def perf_metrics(eq: pd.Series, trading_days_per_year=252):
+# ====== ZORG DAT INDEXES DATETIME ZIJN VOOR METRICS ======
+eq_combined.index = pd.to_datetime(eq_combined.index)
+eq_long.index     = pd.to_datetime(eq_long.index)
+eq_short.index    = pd.to_datetime(eq_short.index)
+bh_equity.index   = pd.to_datetime(bh_equity.index)
+
+# ----- metrics (ROBUUST) -----
+def perf_metrics(eq: pd.Series, trading_days_per_year: int = 252):
     eq = eq.dropna()
-    rets = eq.pct_change().fillna(0)
-    total_ret = eq.iloc[-1] / eq.iloc[0] - 1.0
-    years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1e-9)
-    cagr = (1 + total_ret)**(1/years) - 1 if years>0 else np.nan
-    vol = rets.std() * np.sqrt(trading_days_per_year)
-    sharpe = (rets.mean() * trading_days_per_year) / (vol + 1e-12)
+    if len(eq) < 2:
+        return {"CAGR": np.nan, "Vol": np.nan, "Sharpe": np.nan, "MaxDD": np.nan}
+
+    idx = pd.to_datetime(eq.index)
+    span_days = (idx[-1] - idx[0]) / np.timedelta64(1, "D")
+    years = max(float(span_days) / 365.25, 1e-9)
+
+    rets = eq.pct_change().fillna(0.0)
+    mu = rets.mean()
+    sigma = rets.std()
+    vol_ann = sigma * np.sqrt(trading_days_per_year)
+    sharpe = (mu * trading_days_per_year) / (vol_ann + 1e-12)
+
+    total_ret = float(eq.iloc[-1] / eq.iloc[0] - 1.0)
+    cagr = (1.0 + total_ret) ** (1.0 / years) - 1.0 if years > 0 else np.nan
+
     roll_max = eq.cummax()
-    dd = eq/roll_max - 1.0
+    dd = eq / roll_max - 1.0
     maxdd = dd.min()
-    return {"CAGR": cagr, "Vol": vol, "Sharpe": sharpe, "MaxDD": maxdd}
+
+    return {"CAGR": cagr, "Vol": vol_ann, "Sharpe": sharpe, "MaxDD": maxdd}
 
 metrics = pd.DataFrame({
     "Buy&Hold": perf_metrics(bh_equity),
     "Combined": perf_metrics(eq_combined),
     "Long-only": perf_metrics(eq_long),
     "Short-only": perf_metrics(eq_short)
-}).T.applymap(lambda x: np.nan if pd.isna(x) else x)
+}).T
 
 # =========================
 # KPI’s
@@ -460,8 +484,8 @@ k1.metric("Laatste close", f"{last['close']:.2f}")
 k2.metric("Δ % (dag)", f"{(d['close'].pct_change().iloc[-1]*100):.2f}%")
 k3.metric("VIX (close)", f"{last.get('vix_close', np.nan):.2f}")
 k4.metric("Regime", regime)
-k5.metric("YTD Return",  f"{(ytd_full or 0):.2f}%") if ytd_full is not None else k5.metric("YTD Return","—")
-k6.metric("PYTD Return", f"{(pytd_full or 0):.2f}%") if pytd_full is not None else k6.metric("PYTD Return","—")
+k5.metric("YTD Return",  f"{ytd_full:.2f}%" if ytd_full is not None else "—")
+k6.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—")
 k7.metric("Volatiliteit (std Δ%)", f"{volatility:.2f}%")
 k8.metric("Strategy vs B&H", f"{strategy_vs_bh:.1f}%")
 k9.metric("Signals (buy/sell)", f"{int(num_buys)} / {int(num_sells)}")
@@ -520,7 +544,7 @@ if show_vix and ("vix_close" in d.columns and d["vix_close"].notna().any()):
                   row=1, col=1, secondary_y=True)
 
 fig1.update_layout(
-    height=680,  # groter
+    height=700,
     margin=dict(l=60, r=60, t=80, b=40),
     legend_orientation="h", legend_yanchor="top", legend_y=1.08, legend_x=0,
     yaxis=dict(title="Index (HA)", tickfont=dict(size=13)),
@@ -566,7 +590,7 @@ fig2 = make_subplots(
         f"ADX(14) + DI± — drempel={DEFAULTS['adx_threshold']}",
         "RSI(14) — >70 overbought, <30 oversold"
     ],
-    row_heights=[0.18, 0.32, 0.2, 0.2, 0.18],  # iets meer ruimte overal
+    row_heights=[0.18, 0.32, 0.2, 0.2, 0.18],
     vertical_spacing=0.06
 )
 
@@ -610,8 +634,8 @@ fig2.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)
 fig2.add_hline(y=DEFAULTS["rsi_ob"], line_dash="dash", line_color="red", row=5, col=1)
 fig2.add_hline(y=DEFAULTS["rsi_os"], line_dash="dash", line_color="green", row=5, col=1)
 
-# Leesbaarheid (grotere hoogte + fonts)
-fig2.update_layout(height=1500, margin=dict(l=60, r=60, t=70, b=50),
+# Leesbaarheid
+fig2.update_layout(height=1550, margin=dict(l=60, r=60, t=70, b=50),
                    legend_orientation="h", legend_yanchor="top", legend_y=1.06, legend_x=0)
 fig2.update_xaxes(rangeslider_visible=False, tickfont=dict(size=13))
 for rr in range(1,6):
@@ -629,12 +653,12 @@ st.plotly_chart(fig2, use_container_width=True)
 st.subheader("Equity Curves — % sinds startkapitaal")
 def equity_to_pct(eq: pd.Series): return (eq/eq.iloc[0]-1)*100.0
 fig3 = go.Figure()
-fig3.add_trace(go.Scatter(x=d["date"], y=equity_to_pct(bh_equity), name="Buy & Hold", line=dict(width=3)))
-fig3.add_trace(go.Scatter(x=d["date"], y=equity_to_pct(eq_combined), name="Strategy (Combined)", line=dict(width=3, dash="dot")))
-fig3.add_trace(go.Scatter(x=d["date"], y=equity_to_pct(eq_long), name="Strategy (Long-only)", line=dict(width=2)))
-fig3.add_trace(go.Scatter(x=d["date"], y=equity_to_pct(eq_short), name="Strategy (Short-only)", line=dict(width=2, dash="dash")))
+fig3.add_trace(go.Scatter(x=eq_combined.index, y=equity_to_pct(bh_equity), name="Buy & Hold", line=dict(width=3)))
+fig3.add_trace(go.Scatter(x=eq_combined.index, y=equity_to_pct(eq_combined), name="Strategy (Combined)", line=dict(width=3, dash="dot")))
+fig3.add_trace(go.Scatter(x=eq_combined.index, y=equity_to_pct(eq_long), name="Strategy (Long-only)", line=dict(width=2)))
+fig3.add_trace(go.Scatter(x=eq_combined.index, y=equity_to_pct(eq_short), name="Strategy (Short-only)", line=dict(width=2, dash="dash")))
 fig3.update_layout(
-    height=520,  # groter
+    height=540,
     margin=dict(l=60, r=60, t=50, b=50),
     yaxis=dict(title="% sinds start (equity)", tickfont=dict(size=13)),
     xaxis=dict(tickfont=dict(size=13)),
@@ -646,12 +670,11 @@ st.plotly_chart(fig3, use_container_width=True)
 # Metrics tabel
 # =========================
 st.subheader("Performance-metrics")
-fmt = lambda x: "—" if pd.isna(x) else f"{x*100:,.2f}%" if abs(x) < 10 else f"{x:,.2f}"
 show = pd.DataFrame({
-    "CAGR": metrics["CAGR"].map(lambda v: f"{v*100:,.2f}%"),
-    "Vol (ann.)": metrics["Vol"].map(lambda v: f"{v*100:,.2f}%"),
-    "Sharpe": metrics["Sharpe"].map(lambda v: f"{v:,.2f}"),
-    "MaxDD": metrics["MaxDD"].map(lambda v: f"{v*100:,.2f}%")
+    "CAGR": metrics["CAGR"].map(lambda v: "—" if pd.isna(v) else f"{v*100:,.2f}%"),
+    "Vol (ann.)": metrics["Vol"].map(lambda v: "—" if pd.isna(v) else f"{v*100:,.2f}%"),
+    "Sharpe": metrics["Sharpe"].map(lambda v: "—" if pd.isna(v) else f"{v:,.2f}"),
+    "MaxDD": metrics["MaxDD"].map(lambda v: "—" if pd.isna(v) else f"{v*100:,.2f}%")
 })
 st.dataframe(show, use_container_width=True)
 
@@ -678,6 +701,7 @@ st.plotly_chart(fig_corr, use_container_width=True)
 # =========================
 # Heatmap
 # =========================
+heat_on = True if 'heat_on' not in globals() else heat_on  # safeguard
 if heat_on:
     st.subheader("Maand/jaar-heatmap van Δ")
     t = d.copy().set_index("date")
@@ -709,19 +733,21 @@ if heat_on:
 # =========================
 # Histogrammen
 # =========================
+if 'hist_on' not in globals():
+    hist_on = True
 if hist_on:
     st.subheader("Histogram dagrendementen")
     col_a, col_b = st.columns(2)
     hist_df = d.dropna(subset=["delta_abs","delta_pct"]).copy()
     with col_a:
-        fig_abs = go.Figure([go.Histogram(x=hist_df["delta_abs"], nbinsx=int(bins))])
+        fig_abs = go.Figure([go.Histogram(x=hist_df["delta_abs"], nbinsx=60)])
         fig_abs.update_layout(title="Δ abs (punten)", height=420, bargap=0.02,
                               margin=dict(l=50,r=50,t=60,b=50),
                               xaxis=dict(tickfont=dict(size=13)),
                               yaxis=dict(tickfont=dict(size=13)))
         st.plotly_chart(fig_abs, use_container_width=True)
     with col_b:
-        fig_pct = go.Figure([go.Histogram(x=hist_df["delta_pct"], nbinsx=int(bins))])
+        fig_pct = go.Figure([go.Histogram(x=hist_df["delta_pct"], nbinsx=60)])
         fig_pct.update_layout(title="Δ %", height=420, bargap=0.02,
                               margin=dict(l=50,r=50,t=60,b=50),
                               xaxis=dict(tickfont=dict(size=13)),
@@ -739,19 +765,3 @@ if len(trades_df):
                  use_container_width=True)
 else:
     st.info("Geen trades in de geselecteerde periode.")
-
-with st.expander("Uitleg / interpretatie"):
-    st.markdown(f"""
-**Leesbaarheid**  
-- Alle grafieken hebben grotere y-as (hoogte ↑), grotere tickfonts en dikkere lijnen.
-
-**Equity-curves**  
-- Je ziet nu **Buy&Hold**, **Combined**, **Long-only** en **Short-only** in één oogopslag.
-
-**Metrics**  
-- CAGR = samengestelde jaarrendementen; Sharpe gebaseerd op 252 handelsdagen; MaxDD = diepste piek-dal.
-
-**Signaalset**  
-- *Advanced*: regime (EMA50/200), **ADX > {DEFAULTS['adx_threshold']}**, MACD-hist cross, EMA20/RSI-filters.  
-- *EMA crossover*: puur **EMA fast vs slow**; zet in de sidebar en vergelijk de metrics.
-""")
