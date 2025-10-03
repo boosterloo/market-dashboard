@@ -6,21 +6,26 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from utils.bq import run_query, bq_ping
 
-st.set_page_config(page_title="📊 AEX — Signals, Windows & Options Proxy", layout="wide")
-st.title("📊 AEX — Signals, Event Windows (🟨) & Options-proxy")
+# =========================
+# App setup
+# =========================
+st.set_page_config(page_title="📊 AEX — Signals, Windows & Backtest", layout="wide")
+st.title("📊 AEX — Signals, Event Windows (🟨), Options-proxy & Advanced Backtest")
 
 AEX_VIEW = st.secrets.get("tables", {}).get(
     "aex_view", "nth-pier-468314-p7.marketdata.aex_with_vix_v"
 )
 
-# ---------- Health ----------
+# ---- Health ----
 try:
     if not bq_ping():
         st.error("Geen BigQuery-verbinding."); st.stop()
 except Exception as e:
     st.error("Geen BigQuery-verbinding."); st.caption(f"Details: {e}"); st.stop()
 
-# ---------- Data ----------
+# =========================
+# Data
+# =========================
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_aex():
     return run_query(f"SELECT * FROM `{AEX_VIEW}` ORDER BY date")
@@ -36,7 +41,9 @@ for c in ["open","high","low","close","vix_close","delta_abs","delta_pct"]:
     if c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-# ---------- Constants ----------
+# =========================
+# Constants & helpers
+# =========================
 DEFAULTS = {
     "ema_spans": [20, 50, 200],
     "macd": (12, 26, 9),
@@ -49,10 +56,9 @@ DEFAULTS = {
     "rsi_ob": 70,
     "rsi_os": 30,
     "vix_high": 25,
-    "vix_low": 15
+    "vix_low": 15,
 }
 
-# ---------- Helpers ----------
 def ema(s: pd.Series, span: int):
     return s.ewm(span=span, adjust=False, min_periods=span).mean()
 
@@ -150,6 +156,9 @@ def pytd_return_full(full_df: pd.DataFrame):
     sub = full_df[(full_df["date"]>=start)&(full_df["date"]<=end)].dropna(subset=["close"])
     return (sub["close"].iloc[-1]/sub["close"].iloc[0]-1)*100 if len(sub)>=2 else None
 
+# =========================
+# Indicators
+# =========================
 @st.cache_data(ttl=1800)
 def compute_indicators(full_df):
     for span in DEFAULTS["ema_spans"]:
@@ -172,16 +181,17 @@ def compute_indicators(full_df):
 
 df = compute_indicators(df)
 
-# ---------- Periode ----------
+# =========================
+# Periode & Sidebar
+# =========================
 min_d = df["date"].min().date()
 max_d = df["date"].max().date()
 default_start = max((df["date"].max() - timedelta(days=365)).date(), min_d)
-col1, col2, col3 = st.columns([0.1, 0.8, 0.1])
-with col2:
+c1, c2, c3 = st.columns([0.1, 0.8, 0.1])
+with c2:
     start_date, end_date = st.slider("Periode", min_value=min_d, max_value=max_d,
                                      value=(default_start, max_d), format="YYYY-MM-DD")
 
-# ---------- Sidebar ----------
 with st.sidebar:
     st.markdown("### ⚙️ Instellingen")
     st.markdown("""<style>[data-testid="stSidebar"]{min-width:360px;}</style>""", unsafe_allow_html=True)
@@ -199,6 +209,27 @@ with st.sidebar:
     corr_win  = st.slider("Correlatie-window (dagen)", 5, 90, DEFAULTS["corr_win_default"], step=1)
 
     st.divider()
+    st.markdown("#### 📐 Signaalset")
+    SIG_MODE = st.radio("Welke signalen gebruiken?", ["Advanced", "EMA crossover"], index=0, horizontal=True)
+    EMA_FAST = st.slider("EMA fast", 5, 100, 50, 1, disabled=(SIG_MODE!="EMA crossover"))
+    EMA_SLOW = st.slider("EMA slow", 20, 300, 200, 5, disabled=(SIG_MODE!="EMA crossover"))
+    ALLOW_SHORT_EMA = st.checkbox("Shorts toestaan (EMA-modus)", True, disabled=(SIG_MODE!="EMA crossover"))
+
+    st.divider()
+    st.markdown("#### 🧪 Backtest")
+    START_CAP  = st.number_input("Startkapitaal (€)", 1000.0, 2_000_000.0, 10_000.0, step=500.0)
+    ATR_MULT   = st.slider("ATR-stop multiplier", 1.0, 5.0, 2.0, 0.5)
+    TP1_R      = st.slider("TP1 (R)", 1.25, 3.0, 1.75, 0.25)
+    TP2_R      = st.slider("TP2 (R)", 2.0, 6.0, 3.0, 0.25)
+    TP1_PART   = st.slider("TP1: % sluiten", 10, 80, 50, 5)
+    MOVE_BE    = st.checkbox("Na TP1: stop → break-even", value=True)
+    FEE_BPS    = st.slider("Kosten (bps)", 0.0, 20.0, 1.0, 0.5)
+    SLIP_BPS   = st.slider("Slippage (bps)", 0.0, 20.0, 1.0, 0.5)
+    RISK_PCT   = st.slider("% equity risico per trade", 0.0, 5.0, 1.0, 0.5,
+                           help="0% = all-in; >0%: sizing = (equity×%risk)/(entry−stop).")
+    ALLOW_SHORT= st.checkbox("Shorts toestaan (Advanced)", True)
+
+    st.divider()
     st.markdown("#### 🟨 Event windows + Options-proxy")
     highlight_on = st.checkbox("Toon gele balken (event windows)", value=True)
     window_rule = st.selectbox("Window-regel", ["VIX spike", "Supertrend flip", "Donchian breakout", "UNION (alles)"], index=0)
@@ -211,19 +242,37 @@ with st.sidebar:
     strangle_prem_atr = st.slider("Short Strangle — premium (× ATR)", 0.1, 3.0, 0.6, 0.1)
     strangle_width_atr = st.slider("Short Strangle — breedte (× ATR)", 0.5, 5.0, 1.5, 0.1)
 
-# ---------- Filter ----------
+# =========================
+# Filter subset
+# =========================
 d = df[(df["date"].dt.date >= start_date) & (df["date"].dt.date <= end_date)].reset_index(drop=True).copy()
 
-# ---------- Signals (regime + momentum) ----------
-up_regime   = (d["close"] > d["ema200"]) & (d["ema50"] > d["ema200"])
-down_regime = (d["close"] < d["ema200"]) & (d["ema50"] < d["ema200"])
-strong_trend = d["adx14"] > DEFAULTS["adx_threshold"]
-d["buy_sig"]  = up_regime & strong_trend & crossed_up(d["macd_hist"]) & (d["close"] > d["ema20"]) & (d["rsi14"] > 45)
-d["sell_sig"] = ((d["close"] < d["ema20"]) | crossed_down(d["macd_hist"])) & strong_trend
-for c in ["buy_sig","sell_sig"]:
+# =========================
+# Signalen
+# =========================
+if SIG_MODE == "Advanced":
+    up_regime   = (d["close"] > d["ema200"]) & (d["ema50"] > d["ema200"])
+    down_regime = (d["close"] < d["ema200"]) & (d["ema50"] < d["ema200"])
+    strong_trend = d["adx14"] > DEFAULTS["adx_threshold"]
+
+    d["buy_sig"]   = up_regime & strong_trend & crossed_up(d["macd_hist"]) & (d["close"] > d["ema20"]) & (d["rsi14"] > 45)
+    d["sell_sig"]  = ((d["close"] < d["ema20"]) | crossed_down(d["macd_hist"])) & strong_trend
+    d["short_sig"] = down_regime & strong_trend & crossed_down(d["macd_hist"]) & (d["close"] < d["ema20"]) & (d["rsi14"] < 55)
+else:
+    d["ema_fast_custom"] = ema(d["close"], EMA_FAST)
+    d["ema_slow_custom"] = ema(d["close"], EMA_SLOW)
+    cross_up   = (d["ema_fast_custom"].shift(1) <= d["ema_slow_custom"].shift(1)) & (d["ema_fast_custom"] > d["ema_slow_custom"])
+    cross_down = (d["ema_fast_custom"].shift(1) >= d["ema_slow_custom"].shift(1)) & (d["ema_fast_custom"] < d["ema_slow_custom"])
+    d["buy_sig"]  = cross_up
+    d["sell_sig"] = cross_down
+    d["short_sig"]= cross_down if ALLOW_SHORT_EMA else False
+
+for c in ["buy_sig","sell_sig","short_sig"]:
     d[c] = d[c].fillna(False)
 
-# ---------- Event windows (gele balken) ----------
+# =========================
+# Event windows (gele balken)
+# =========================
 def _windows_from_bool(mask: pd.Series, min_len=3, pad=0):
     mask = mask.fillna(False).astype(bool)
     if pad > 0:
@@ -242,7 +291,6 @@ def _windows_from_bool(mask: pd.Series, min_len=3, pad=0):
             windows.append((d.loc[s_idx, "date"], d.loc[e_idx, "date"]))
     return windows
 
-# regels
 vix_ma = d["vix_close"].rolling(20, min_periods=20).mean()
 vix_sd = d["vix_close"].rolling(20, min_periods=20).std()
 vix_zscore = (d["vix_close"] - vix_ma) / vix_sd
@@ -272,11 +320,222 @@ def in_any_window(series_dates):
 
 in_window = in_any_window(d["date"])
 
-# ---------- KPI ----------
+# =========================
+# Backtest engine (ATR/TP, sizing, fees/slip)
+# =========================
+def run_backtest(df_, start_capital, atr_mult, fee_bps, slip_bps, risk_pct,
+                 allow_long=True, allow_short=True,
+                 tp1_r=1.75, tp2_r=3.0, tp1_part=50, move_be=True):
+    df_ = df_.copy().reset_index(drop=True)
+    fee = fee_bps/1e4; slip = slip_bps/1e4
+
+    cash = start_capital
+    pos  = 0           # 0=flat, 1=long, -1=short
+    shares = 0.0
+    entry_px = None; entry_idx = None
+    stop = np.nan
+    took_tp1 = False
+
+    equity_curve = []
+    trades = []
+
+    for i in range(len(df_)):
+        close = float(df_.loc[i,"close"])
+        # mark-to-market
+        if pos == 1:
+            equity_curve.append(cash + shares*close)
+        elif pos == -1:
+            equity_curve.append(cash + shares*(entry_px - close))  # short PnL benadering
+        else:
+            equity_curve.append(cash)
+
+        if i == len(df_) - 1:
+            break
+
+        nxt_open = float(df_.loc[i+1,"open"])
+        atr_next = float(df_.loc[i+1,"atr14"]) if pd.notna(df_.loc[i+1,"atr14"]) else float(df_.loc[i,"atr14"])
+
+        # trailing stop
+        if pos == 1:
+            stop = max(stop, close - atr_mult*atr_next)
+        elif pos == -1:
+            stop = min(stop, close + atr_mult*atr_next)
+
+        # R-now
+        if pos == 1 and not np.isnan(stop):
+            R_now = (close - entry_px) / max(entry_px - stop, 1e-9)
+        elif pos == -1 and not np.isnan(stop):
+            R_now = (entry_px - close) / max(stop - entry_px, 1e-9)
+        else:
+            R_now = 0.0
+
+        def do_exit(exec_px, reason):
+            nonlocal cash, shares, pos, stop, entry_px, entry_idx, took_tp1
+            if pos == 1:
+                cash += shares*exec_px
+                cash -= abs(shares*exec_px)*fee
+                ret = (exec_px/entry_px - 1.0)*100
+            else:
+                cash += shares*(entry_px - exec_px)
+                cash -= abs(shares*exec_px)*fee
+                ret = (1.0 - exec_px/entry_px)*100
+            trades.append({
+                "side": "LONG" if pos==1 else "SHORT",
+                "entry_date": df_.loc[entry_idx,"date"],
+                "entry_px": entry_px,
+                "exit_date": df_.loc[i+1,"date"],
+                "exit_px": exec_px,
+                "ret_pct": ret,
+                "reason": reason
+            })
+            shares=0.0; pos=0; stop=np.nan; entry_px=None; entry_idx=None; took_tp1=False
+
+        # TP2
+        if pos != 0 and R_now >= tp2_r:
+            px = nxt_open*(1 - slip) if pos==1 else nxt_open*(1 + slip)
+            do_exit(px, "TP2"); continue
+
+        # TP1 partial
+        if pos != 0 and (not took_tp1) and R_now >= tp1_r:
+            px = nxt_open*(1 - slip) if pos==1 else nxt_open*(1 + slip)
+            part = tp1_part/100.0
+            close_sh = np.floor(shares*part)
+            if close_sh >= 1:
+                if pos == 1:
+                    cash += close_sh*px
+                    cash -= abs(close_sh*px)*fee
+                else:
+                    cash += close_sh*(entry_px - px)
+                    cash -= abs(close_sh*px)*fee
+                shares -= close_sh
+            took_tp1 = True
+            if move_be:
+                stop = max(stop, entry_px) if pos==1 else min(stop, entry_px)
+
+        # Exit (signal of gap door stop)
+        exit_signal = (pos==1 and bool(df_.loc[i,"sell_sig"])) or (pos==-1 and bool(df_.loc[i,"buy_sig"]))
+        stop_gap    = (pos==1 and not np.isnan(stop) and nxt_open < stop) or (pos==-1 and not np.isnan(stop) and nxt_open > stop)
+        if pos != 0 and (exit_signal or stop_gap):
+            px = nxt_open*(1 - slip) if pos==1 else nxt_open*(1 + slip)
+            do_exit(px, "signal" if exit_signal and not stop_gap else "stop")
+            continue
+
+        # Entries (next open)
+        if pos == 0:
+            if allow_long and bool(df_.loc[i,"buy_sig"]):
+                buy_px = nxt_open*(1 + slip)
+                init_stop = buy_px - atr_mult*atr_next
+                if risk_pct > 0:
+                    risk_amt = cash*(risk_pct/100.0)
+                    per_share = max(buy_px - init_stop, 1e-9)
+                    shares = np.floor(risk_amt / per_share)
+                    cost = shares*buy_px
+                    if cost > cash:
+                        shares = np.floor(cash/buy_px); cost = shares*buy_px
+                else:
+                    cost = cash; shares = cost/buy_px
+                cash -= cost; cash -= cost*fee
+                pos=1; entry_px=buy_px; entry_idx=i+1; stop=init_stop; took_tp1=False
+
+            elif allow_short and bool(df_.loc[i,"short_sig"]):
+                sell_px = nxt_open*(1 - slip)
+                init_stop = sell_px + atr_mult*atr_next
+                if risk_pct > 0:
+                    risk_amt = cash*(risk_pct/100.0)
+                    per_share = max(init_stop - sell_px, 1e-9)
+                    shares = np.floor(risk_amt / per_share)
+                else:
+                    shares = cash/sell_px
+                cash += shares*sell_px
+                cash -= abs(shares*sell_px)*fee
+                pos=-1; entry_px=sell_px; entry_idx=i+1; stop=init_stop; took_tp1=False
+
+    eq_series = pd.Series(equity_curve, index=pd.to_datetime(df_["date"]), name="equity")
+    trades_df = pd.DataFrame(trades)
+    return eq_series, trades_df
+
+# --- Combined, Long-only, Short-only curves ---
+eq_combined, trades_df = run_backtest(
+    d, START_CAP, ATR_MULT, FEE_BPS, SLIP_BPS, RISK_PCT,
+    allow_long=True, allow_short=ALLOW_SHORT,
+    tp1_r=TP1_R, tp2_r=TP2_R, tp1_part=TP1_PART, move_be=MOVE_BE
+)
+eq_long, _ = run_backtest(
+    d, START_CAP, ATR_MULT, FEE_BPS, SLIP_BPS, RISK_PCT,
+    allow_long=True, allow_short=False,
+    tp1_r=TP1_R, tp2_r=TP2_R, tp1_part=TP1_PART, move_be=MOVE_BE
+)
+eq_short, _ = run_backtest(
+    d, START_CAP, ATR_MULT, FEE_BPS, SLIP_BPS, RISK_PCT,
+    allow_long=False, allow_short=True,
+    tp1_r=TP1_R, tp2_r=TP2_R, tp1_part=TP1_PART, move_be=MOVE_BE
+)
+
+# Buy & Hold (equity) — ROBUUST
+def buyhold_equity(df_: pd.DataFrame, start_cap: float) -> pd.Series:
+    dfx = df_.copy().reset_index(drop=True)
+    dfx["date"] = pd.to_datetime(dfx["date"])
+    if len(dfx) < 2:
+        s = pd.Series([start_cap], index=dfx["date"])
+        s.name = "bh_equity"
+        return s
+    buy_px = float(dfx.loc[1, "open"])  # start op eerstvolgende open
+    shares = start_cap / buy_px
+    eq = shares * dfx["close"]
+    eq.index = dfx["date"]
+    eq.name = "bh_equity"
+    return eq
+
+bh_equity = buyhold_equity(d, START_CAP)
+
+# ====== DATETIME index ======
+eq_combined.index = pd.to_datetime(eq_combined.index)
+eq_long.index     = pd.to_datetime(eq_long.index)
+eq_short.index    = pd.to_datetime(eq_short.index)
+bh_equity.index   = pd.to_datetime(bh_equity.index)
+
+# ----- metrics -----
+def perf_metrics(eq: pd.Series, trading_days_per_year: int = 252):
+    eq = eq.dropna()
+    if len(eq) < 2:
+        return {"CAGR": np.nan, "Vol": np.nan, "Sharpe": np.nan, "MaxDD": np.nan}
+
+    idx = pd.to_datetime(eq.index)
+    span_days = (idx[-1] - idx[0]) / np.timedelta64(1, "D")
+    years = max(float(span_days) / 365.25, 1e-9)
+
+    rets = eq.pct_change().fillna(0.0)
+    mu = rets.mean()
+    sigma = rets.std()
+    vol_ann = sigma * np.sqrt(trading_days_per_year)
+    sharpe = (mu * trading_days_per_year) / (vol_ann + 1e-12)
+
+    total_ret = float(eq.iloc[-1] / eq.iloc[0] - 1.0)
+    cagr = (1.0 + total_ret) ** (1.0 / years) - 1.0 if years > 0 else np.nan
+
+    roll_max = eq.cummax()
+    dd = eq / roll_max - 1.0
+    maxdd = dd.min()
+
+    return {"CAGR": cagr, "Vol": vol_ann, "Sharpe": sharpe, "MaxDD": maxdd}
+
+metrics = pd.DataFrame({
+    "Buy&Hold": perf_metrics(bh_equity),
+    "Combined": perf_metrics(eq_combined),
+    "Long-only": perf_metrics(eq_long),
+    "Short-only": perf_metrics(eq_short)
+}).T
+
+# =========================
+# KPI’s
+# =========================
 last = d.iloc[-1]
-regime = "Bullish" if up_regime.iloc[-1] else ("Bearish" if down_regime.iloc[-1] else "Neutraal")
+up_regime_now   = (last["close"] > last["ema200"]) and (last["ema50"] > last["ema200"])
+down_regime_now = (last["close"] < last["ema200"]) and (last["ema50"] < last["ema200"])
+regime = "Bullish" if up_regime_now else "Bearish" if down_regime_now else "Neutraal"
 ytd_full, pytd_full = ytd_return_full(df), pytd_return_full(df)
 volatility = d['delta_pct'].std()
+strategy_vs_bh = (eq_combined.iloc[-1]/eq_combined.iloc[0] - bh_equity.iloc[-1]/bh_equity.iloc[0]) * 100
 num_buys, num_sells = d['buy_sig'].sum(), d['sell_sig'].sum()
 
 k1,k2,k3,k4,k5,k6,k7,k8,k9 = st.columns(9)
@@ -287,10 +546,43 @@ k4.metric("Regime", regime)
 k5.metric("YTD Return",  f"{ytd_full:.2f}%" if ytd_full is not None else "—")
 k6.metric("PYTD Return", f"{pytd_full:.2f}%" if pytd_full is not None else "—")
 k7.metric("Volatiliteit (std Δ%)", f"{volatility:.2f}%")
-k8.metric("Windows (aantal)", f"{len(win_list)}")
+k8.metric("Strategy vs B&H", f"{strategy_vs_bh:.1f}%")
 k9.metric("Signals (buy/sell)", f"{int(num_buys)} / {int(num_sells)}")
 
-# ---------- Paneel 1 — HA + ST + Donchian (+ VIX) + 🟨 windows ----------
+# =========================
+# Alerts (kort)
+# =========================
+alerts = []
+if "vix_close" in d.columns and pd.notna(last.get("vix_close", np.nan)):
+    if last["vix_close"] > DEFAULTS["vix_high"]:
+        alerts.append(("red","VIX hoog", f"VIX {last['vix_close']:.1f} > {DEFAULTS['vix_high']}"))
+    elif last["vix_close"] < DEFAULTS["vix_low"]:
+        alerts.append(("blue","VIX laag", f"VIX {last['vix_close']:.1f} < {DEFAULTS['vix_low']}"))
+if up_regime_now and (last["adx14"] > DEFAULTS["adx_threshold"]):
+    alerts.append(("green","Trend ↑ (sterk)", f"ADX {last['adx14']:.1f}"))
+elif down_regime_now and (last["adx14"] > DEFAULTS["adx_threshold"]):
+    alerts.append(("red","Trend ↓ (sterk)", f"ADX {last['adx14']:.1f}"))
+elif last["adx14"] <= DEFAULTS["adx_threshold"]:
+    alerts.append(("gray","Trend zwak", f"ADX {last['adx14']:.1f}"))
+if crossed_up(d["macd_hist"]).iloc[-1]:
+    alerts.append(("green","Momentum draait ↑","MACD-hist cross ↑ 0"))
+elif crossed_down(d["macd_hist"]).iloc[-1]:
+    alerts.append(("red","Momentum draait ↓","MACD-hist cross ↓ 0"))
+
+def badge(color, text):
+    colors = {"green":"#00A65A","red":"#D55E00","orange":"#E69F00","blue":"#1f77b4","gray":"#6c757d"}
+    return f"""<span style="background:{colors[color]};color:white;padding:2px 8px;border-radius:12px;font-size:0.9rem;">{text}</span>"""
+
+with st.expander("⚠️ Alerts & Signal status", expanded=True):
+    if not alerts:
+        st.success("Geen alerts op dit moment.")
+    else:
+        for color, title, msg in alerts:
+            st.markdown(f"{badge(color, title)} &nbsp; {msg}", unsafe_allow_html=True)
+
+# =========================
+# Paneel 1 – HA + Supertrend + Donchian (+ VIX) + 🟨 windows
+# =========================
 fig1 = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]],
                      subplot_titles=["AEX Heikin-Ashi + Supertrend (10,1) + Donchian" + (" + VIX (2e y-as)" if show_vix else "")])
 
@@ -300,9 +592,11 @@ if highlight_on and win_list:
 
 fig1.add_trace(go.Candlestick(x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
                               name="AEX (Heikin-Ashi)"), row=1, col=1, secondary_y=False)
-fig1.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines", line=dict(dash="dot", width=2), name="DC High"),
+fig1.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines",
+                          line=dict(dash="dot", width=2), name="DC High"),
               row=1, col=1, secondary_y=False)
-fig1.add_trace(go.Scatter(x=d["date"], y=d["dc_low"], mode="lines", line=dict(dash="dot", width=2), name="DC Low"),
+fig1.add_trace(go.Scatter(x=d["date"], y=d["dc_low"], mode="lines",
+                          line=dict(dash="dot", width=2), name="DC Low"),
               row=1, col=1, secondary_y=False)
 st_up = d["st_line"].where(d["st_trend"]==1); st_dn = d["st_line"].where(d["st_trend"]==-1)
 fig1.add_trace(go.Scatter(x=d["date"], y=st_up, mode="lines", line=dict(width=3, color="green"), name="Supertrend ↑ (10,1)"),
@@ -310,17 +604,22 @@ fig1.add_trace(go.Scatter(x=d["date"], y=st_up, mode="lines", line=dict(width=3,
 fig1.add_trace(go.Scatter(x=d["date"], y=st_dn, mode="lines", line=dict(width=3, color="red"), name="Supertrend ↓ (10,1)"),
               row=1, col=1, secondary_y=False)
 if show_vix and ("vix_close" in d.columns and d["vix_close"].notna().any()):
-    fig1.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX (sec. y)"), row=1, col=1, secondary_y=True)
+    fig1.add_trace(go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX (sec. y)", line=dict(width=2)),
+                  row=1, col=1, secondary_y=True)
 
-fig1.update_layout(height=650, margin=dict(l=60,r=60,t=80,b=40),
-                   legend_orientation="h", legend_yanchor="top", legend_y=1.08, legend_x=0)
-fig1.update_xaxes(rangeslider_visible=False)
-fig1.update_yaxes(title_text="Index (HA)", row=1, col=1, secondary_y=False)
-if show_vix:
-    fig1.update_yaxes(title_text="VIX", row=1, col=1, secondary_y=True)
+fig1.update_layout(
+    height=700,
+    margin=dict(l=60, r=60, t=80, b=40),
+    legend_orientation="h", legend_yanchor="top", legend_y=1.08, legend_x=0,
+    yaxis=dict(title="Index (HA)", tickfont=dict(size=13)),
+    yaxis2=dict(title="VIX", tickfont=dict(size=13))
+)
+fig1.update_xaxes(rangeslider_visible=False, tickfont=dict(size=13))
 st.plotly_chart(fig1, use_container_width=True)
 
-# ---------- Δ-aggregatie ----------
+# =========================
+# Δ-aggregatie
+# =========================
 def aggregate_delta(_df: pd.DataFrame, mode: str, how: str) -> pd.Series:
     t = _df.copy().set_index("date")
     if how == "Dagelijks":
@@ -343,7 +642,9 @@ delta_legend = "Δ (%)" if delta_mode=="Δ %" else "Δ (punten)"
 if smooth_on: delta_legend += f" — MA{ma_window}"
 delta_colors = np.where(delta_series.values >= 0, "rgba(16,150,24,0.7)", "rgba(219,64,82,0.7)")
 
-# ---------- Paneel 2–6 ----------
+# =========================
+# Paneel 2–6: Δ, Close+EMA, MACD, ADX, RSI
+# =========================
 fig2 = make_subplots(
     rows=5, cols=1, shared_xaxes=True,
     subplot_titles=[
@@ -361,18 +662,23 @@ fig2 = make_subplots(
 fig2.add_trace(go.Bar(x=delta_x, y=delta_series.values, name=delta_legend,
                       marker=dict(color=delta_colors), opacity=0.9), row=1, col=1)
 
-# (2) Close + EMA + signals (+ optionele vrects)
+# (2) Close + EMA + signals
 fig2.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close", line=dict(width=2)), row=2, col=1)
 fig2.add_trace(go.Scatter(x=d["date"], y=d["ema20"], mode="lines", name="EMA20", line=dict(width=2)), row=2, col=1)
 fig2.add_trace(go.Scatter(x=d["date"], y=d["ema50"], mode="lines", name="EMA50", line=dict(width=2)), row=2, col=1)
 fig2.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200", line=dict(width=2)), row=2, col=1)
-buys  = d.loc[d["buy_sig"]]; sells = d.loc[d["sell_sig"]]
-fig2.add_trace(go.Scatter(x=buys["date"], y=buys["close"], mode="markers", name="Buy",
-                          marker=dict(symbol="triangle-up", size=12, color="#00A65A", line=dict(width=1, color="black"))),
-               row=2, col=1)
-fig2.add_trace(go.Scatter(x=sells["date"], y=sells["close"], mode="markers", name="Sell",
-                          marker=dict(symbol="triangle-down", size=12, color="#D55E00", line=dict(width=1, color="black"))),
-               row=2, col=1)
+
+buys  = d.loc[d["buy_sig"]]
+sells = d.loc[d["sell_sig"]]
+fig2.add_trace(go.Scatter(
+    x=buys["date"], y=buys["close"], mode="markers", name="Buy",
+    marker=dict(symbol="triangle-up", size=12, color="#00A65A", line=dict(width=1, color="black"))
+), row=2, col=1)
+fig2.add_trace(go.Scatter(
+    x=sells["date"], y=sells["close"], mode="markers", name="Sell",
+    marker=dict(symbol="triangle-down", size=12, color="#D55E00", line=dict(width=1, color="black"))
+), row=2, col=1)
+
 if highlight_on and win_list:
     for (s, e) in win_list:
         fig2.add_vrect(x0=s, x1=e, fillcolor="rgba(255,215,0,0.12)", line_width=0, row=2, col=1)
@@ -396,7 +702,7 @@ fig2.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)
 fig2.add_hline(y=DEFAULTS["rsi_ob"], line_dash="dash", line_color="red", row=5, col=1)
 fig2.add_hline(y=DEFAULTS["rsi_os"], line_dash="dash", line_color="green", row=5, col=1)
 
-fig2.update_layout(height=1500, margin=dict(l=60, r=60, t=70, b=50),
+fig2.update_layout(height=1550, margin=dict(l=60, r=60, t=70, b=50),
                    legend_orientation="h", legend_yanchor="top", legend_y=1.06, legend_x=0)
 fig2.update_xaxes(rangeslider_visible=False, tickfont=dict(size=13))
 for rr in range(1,6):
@@ -408,17 +714,125 @@ fig2.update_yaxes(title_text="ADX / DI", row=4, col=1)
 fig2.update_yaxes(title_text="RSI", row=5, col=1, range=[0,100])
 st.plotly_chart(fig2, use_container_width=True)
 
-# ---------- Options-proxy — windows vs outside ----------
+# =========================
+# Equity curves: B&H + Combined + Long-only + Short-only
+# =========================
+st.subheader("Equity Curves — % sinds startkapitaal")
+def equity_to_pct(eq: pd.Series): return (eq/eq.iloc[0]-1)*100.0
+fig3 = go.Figure()
+fig3.add_trace(go.Scatter(x=eq_combined.index, y=equity_to_pct(bh_equity), name="Buy & Hold", line=dict(width=3)))
+fig3.add_trace(go.Scatter(x=eq_combined.index, y=equity_to_pct(eq_combined), name="Strategy (Combined)", line=dict(width=3, dash="dot")))
+fig3.add_trace(go.Scatter(x=eq_combined.index, y=equity_to_pct(eq_long), name="Strategy (Long-only)", line=dict(width=2)))
+fig3.add_trace(go.Scatter(x=eq_combined.index, y=equity_to_pct(eq_short), name="Strategy (Short-only)", line=dict(width=2, dash="dash")))
+fig3.update_layout(
+    height=540,
+    margin=dict(l=60, r=60, t=50, b=50),
+    yaxis=dict(title="% sinds start (equity)", tickfont=dict(size=13)),
+    xaxis=dict(tickfont=dict(size=13)),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0)
+)
+st.plotly_chart(fig3, use_container_width=True)
+
+# =========================
+# Performance-metrics tabel
+# =========================
+st.subheader("Performance-metrics")
+show_metrics = pd.DataFrame({
+    "CAGR": metrics["CAGR"].map(lambda v: "—" if pd.isna(v) else f"{v*100:,.2f}%"),
+    "Vol (ann.)": metrics["Vol"].map(lambda v: "—" if pd.isna(v) else f"{v*100:,.2f}%"),
+    "Sharpe": metrics["Sharpe"].map(lambda v: "—" if pd.isna(v) else f"{v:,.2f}"),
+    "MaxDD": metrics["MaxDD"].map(lambda v: "—" if pd.isna(v) else f"{v*100:,.2f}%")
+})
+st.dataframe(show_metrics, use_container_width=True)
+
+# =========================
+# Rolling correlatie met VIX
+# =========================
+st.markdown("#### Rolling correlatie met VIX")
+corr_df = d.copy().set_index("date")
+aex_ret = corr_df["delta_pct"]
+vix_series = (corr_df["vix_close"].pct_change()*100.0) if corr_vs=="% change" else corr_df["vix_close"]
+corr_join = pd.concat([aex_ret.rename("aex"), vix_series.rename("vix")], axis=1).dropna()
+rolling_corr = corr_join["aex"].rolling(corr_win).corr(corr_join["vix"])
+
+fig_corr = go.Figure()
+fig_corr.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr.values, mode="lines", name="Rolling corr", line=dict(width=2)))
+fig_corr.add_hline(y=0.0, line_dash="dot")
+fig_corr.add_hrect(y0=-1, y1=-0.5, fillcolor="rgba(255,0,0,0.06)", line_width=0)
+fig_corr.add_hrect(y0=0.5, y1=1,   fillcolor="rgba(0,128,0,0.06)", line_width=0)
+fig_corr.update_layout(height=400, margin=dict(l=60,r=60,t=50,b=40),
+                       yaxis=dict(range=[-1,1], title="corr", tickfont=dict(size=13)),
+                       xaxis=dict(tickfont=dict(size=13)))
+st.plotly_chart(fig_corr, use_container_width=True)
+
+# =========================
+# Heatmap
+# =========================
+st.subheader("Maand/jaar-heatmap van Δ")
+t = d.copy().set_index("date")
+if delta_mode == "Δ %":
+    monthly = t["delta_pct"].groupby(pd.Grouper(freq="M")).apply(
+        lambda g: (np.prod((g.dropna()/100.0 + 1.0)) - 1.0) * 100.0 if len(g.dropna()) else np.nan
+    )
+    value_title = "Δ% (maand, compounded)"
+else:
+    monthly = t["delta_abs"].groupby(pd.Grouper(freq="M")).sum(min_count=1)
+    value_title = "Δ punten (maand, som)"
+
+hm = pd.DataFrame({"year": monthly.index.year, "month": monthly.index.month, "value": monthly.values}).dropna()
+month_names = {1:"jan",2:"feb",3:"mrt",4:"apr",5:"mei",6:"jun",7:"jul",8:"aug",9:"sep",10:"okt",11:"nov",12:"dec"}
+hm["mname"] = hm["month"].map(month_names)
+pivot = hm.pivot_table(index="year", columns="mname", values="value", aggfunc="first")
+pivot = pivot.reindex(columns=[month_names[m] for m in range(1,13)])
+
+z = pivot.values
+heat = go.Figure(data=go.Heatmap(z=z, x=pivot.columns, y=pivot.index,
+                                 coloraxis="coloraxis",
+                                 hovertemplate="Jaar %{y} — %{x}: %{z:.2f}<extra></extra>"))
+heat.update_layout(height=480, margin=dict(l=60, r=60, t=50, b=50),
+                   coloraxis=dict(colorscale="RdBu", cauto=True, colorbar_title=value_title),
+                   xaxis=dict(title="Maand", tickfont=dict(size=13)),
+                   yaxis=dict(title="Jaar", tickfont=dict(size=13)))
+st.plotly_chart(heat, use_container_width=True)
+
+# =========================
+# Histogrammen
+# =========================
+if 'hist_on' not in globals():
+    hist_on = True
+if hist_on:
+    st.subheader("Histogram dagrendementen")
+    col_a, col_b = st.columns(2)
+    hist_df = d.dropna(subset=["delta_abs","delta_pct"]).copy()
+    with col_a:
+        fig_abs = go.Figure([go.Histogram(x=hist_df["delta_abs"], nbinsx=60)])
+        fig_abs.update_layout(title="Δ abs (punten)", height=420, bargap=0.02,
+                              margin=dict(l=50,r=50,t=60,b=50),
+                              xaxis=dict(tickfont=dict(size=13)),
+                              yaxis=dict(tickfont=dict(size=13)))
+        st.plotly_chart(fig_abs, use_container_width=True)
+    with col_b:
+        fig_pct = go.Figure([go.Histogram(x=hist_df["delta_pct"], nbinsx=60)])
+        fig_pct.update_layout(title="Δ %", height=420, bargap=0.02,
+                              margin=dict(l=50,r=50,t=60,b=50),
+                              xaxis=dict(tickfont=dict(size=13)),
+                              yaxis=dict(tickfont=dict(size=13)))
+        st.plotly_chart(fig_pct, use_container_width=True)
+
+# =========================
+# Options-proxy (dagelijks) — windows vs outside
+# =========================
 st.subheader("Options-proxy — PnL (windows vs outside)")
 
 d["next_close"] = d["close"].shift(-1)
 valid = d.dropna(subset=["next_close","atr14"]).copy()
 valid["abs_move"] = (valid["next_close"] - valid["open"]).abs()
 
-# Long Straddle proxy
+# Long Straddle proxy: |Δ| − cost×ATR
 valid["straddle_pnl"] = valid["abs_move"] - (straddle_cost_atr * valid["atr14"])
 
-# Short Strangle proxy
+# Short Strangle proxy:
+# PnL = premium×ATR − max(0, |Δ| − width×ATR)
 overflow = (valid["abs_move"] - strangle_width_atr * valid["atr14"]).clip(lower=0.0)
 valid["strangle_pnl"] = (strangle_prem_atr * valid["atr14"]) - overflow
 
@@ -452,48 +866,14 @@ show_opt = pd.DataFrame({
 })
 st.dataframe(show_opt, use_container_width=True)
 
-# ---------- Rolling correlatie met VIX ----------
-st.markdown("#### Rolling correlatie met VIX")
-corr_df = d.copy().set_index("date")
-aex_ret = corr_df["delta_pct"]
-vix_series = (corr_df["vix_close"].pct_change()*100.0) if corr_vs=="% change" else corr_df["vix_close"]
-corr_join = pd.concat([aex_ret.rename("aex"), vix_series.rename("vix")], axis=1).dropna()
-rolling_corr = corr_join["aex"].rolling(corr_win).corr(corr_join["vix"])
-
-fig_corr = go.Figure()
-fig_corr.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr.values, mode="lines", name="Rolling corr", line=dict(width=2)))
-fig_corr.add_hline(y=0.0, line_dash="dot")
-fig_corr.add_hrect(y0=-1, y1=-0.5, fillcolor="rgba(255,0,0,0.06)", line_width=0)
-fig_corr.add_hrect(y0=0.5, y1=1,   fillcolor="rgba(0,128,0,0.06)", line_width=0)
-fig_corr.update_layout(height=380, margin=dict(l=60,r=60,t=50,b=40),
-                       yaxis=dict(range=[-1,1], title="corr", tickfont=dict(size=13)),
-                       xaxis=dict(tickfont=dict(size=13)))
-st.plotly_chart(fig_corr, use_container_width=True)
-
-# ---------- Heatmap ----------
-st.subheader("Maand/jaar-heatmap van Δ")
-t = d.copy().set_index("date")
-if delta_mode == "Δ %":
-    monthly = t["delta_pct"].groupby(pd.Grouper(freq="M")).apply(
-        lambda g: (np.prod((g.dropna()/100.0 + 1.0)) - 1.0) * 100.0 if len(g.dropna()) else np.nan
-    )
-    value_title = "Δ% (maand, compounded)"
+# =========================
+# Trades (geavanceerde backtest)
+# =========================
+st.subheader("Trades (geavanceerde backtest)")
+if len(trades_df):
+    show_tr = trades_df.copy()
+    show_tr["ret_pct"] = show_tr["ret_pct"].map(lambda x: f"{x:,.2f}%")
+    st.dataframe(show_tr[["side","entry_date","entry_px","exit_date","exit_px","ret_pct","reason"]],
+                 use_container_width=True)
 else:
-    monthly = t["delta_abs"].groupby(pd.Grouper(freq="M")).sum(min_count=1)
-    value_title = "Δ punten (maand, som)"
-
-hm = pd.DataFrame({"year": monthly.index.year, "month": monthly.index.month, "value": monthly.values}).dropna()
-month_names = {1:"jan",2:"feb",3:"mrt",4:"apr",5:"mei",6:"jun",7:"jul",8:"aug",9:"sep",10:"okt",11:"nov",12:"dec"}
-hm["mname"] = hm["month"].map(month_names)
-pivot = hm.pivot_table(index="year", columns="mname", values="value", aggfunc="first")
-pivot = pivot.reindex(columns=[month_names[m] for m in range(1,13)])
-
-z = pivot.values
-heat = go.Figure(data=go.Heatmap(z=z, x=pivot.columns, y=pivot.index,
-                                 coloraxis="coloraxis",
-                                 hovertemplate="Jaar %{y} — %{x}: %{z:.2f}<extra></extra>"))
-heat.update_layout(height=420, margin=dict(l=60, r=60, t=50, b=50),
-                   coloraxis=dict(colorscale="RdBu", cauto=True, colorbar_title=value_title),
-                   xaxis=dict(title="Maand", tickfont=dict(size=13)),
-                   yaxis=dict(title="Jaar", tickfont=dict(size=13)))
-st.plotly_chart(heat, use_container_width=True)
+    st.info("Geen trades in de geselecteerde periode.")
