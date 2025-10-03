@@ -233,6 +233,20 @@ with st.sidebar:
                            help="0% = all-in; >0%: sizing = (equity×%risk)/(entry−stop).")
     ALLOW_SHORT= st.checkbox("Shorts toestaan (Advanced)", True)
 
+    st.divider()
+    st.markdown("#### 🟨 Event windows + Options-proxy")
+    highlight_on = st.checkbox("Toon gele balken (event windows)", value=True)
+    window_rule = st.selectbox("Window-regel", ["VIX spike", "Supertrend flip", "Donchian breakout", "UNION (alles)"], index=0)
+    vix_z = st.slider("VIX spike: z-score drempel", 1.0, 4.0, 2.0, 0.1,
+                      help="(VIX - MA20) / STD20 > drempel")
+    flip_pad = st.slider("Padding rond flip/breakout (dagen)", 0, 10, 3, 1)
+    min_len = st.slider("Min. window-lengte (dagen)", 1, 30, 3, 1)
+
+    st.markdown("##### Options-proxy parameters (per dag)")
+    straddle_cost_atr = st.slider("Long Straddle — cost (× ATR)", 0.2, 3.0, 1.0, 0.1)
+    strangle_prem_atr = st.slider("Short Strangle — premium (× ATR)", 0.1, 3.0, 0.6, 0.1)
+    strangle_width_atr = st.slider("Short Strangle — breedte (× ATR)", 0.5, 5.0, 1.5, 0.1)
+
 # =========================
 # Filter subset
 # =========================
@@ -260,6 +274,59 @@ else:
 
 for c in ["buy_sig","sell_sig","short_sig"]:
     d[c] = d[c].fillna(False)
+
+# =========================
+# Event windows (gele balken)
+# =========================
+def _windows_from_bool(mask: pd.Series, min_len=3, pad=0):
+    mask = mask.fillna(False).astype(bool)
+    if pad > 0:
+        mask = mask.rolling(pad, min_periods=1).max().astype(bool) | mask | mask[::-1].rolling(pad, min_periods=1).max()[::-1].astype(bool)
+    starts, ends = [], []
+    in_win = False
+    for i, v in enumerate(mask.values):
+        if v and not in_win:
+            starts.append(i); in_win = True
+        if in_win and (not v or i == len(mask)-1):
+            ends.append(i if not v else i)  # inclusive index
+            in_win = False
+    # filter minimum lengte
+    windows = []
+    for s_idx, e_idx in zip(starts, ends):
+        if e_idx - s_idx + 1 >= min_len:
+            windows.append((d.loc[s_idx, "date"], d.loc[e_idx, "date"]))
+    return windows
+
+# regels
+vix_ma = d["vix_close"].rolling(20, min_periods=20).mean()
+vix_sd = d["vix_close"].rolling(20, min_periods=20).std()
+vix_zscore = (d["vix_close"] - vix_ma) / vix_sd
+mask_vix = vix_zscore > vix_z
+
+st_flip = d["st_trend"].fillna(method="ffill")
+mask_flip = st_flip.ne(st_flip.shift(1)).fillna(False)
+
+mask_dc_break = (d["close"] > d["dc_high"].shift(1)) | (d["close"] < d["dc_low"].shift(1))
+
+if window_rule == "VIX spike":
+    win_list = _windows_from_bool(mask_vix, min_len=min_len, pad=flip_pad)
+elif window_rule == "Supertrend flip":
+    win_list = _windows_from_bool(mask_flip, min_len=min_len, pad=flip_pad)
+elif window_rule == "Donchian breakout":
+    win_list = _windows_from_bool(mask_dc_break, min_len=min_len, pad=flip_pad)
+else:
+    union_mask = (mask_vix | mask_flip | mask_dc_break)
+    win_list = _windows_from_bool(union_mask, min_len=min_len, pad=flip_pad)
+
+# helper: snel check in-window
+def in_any_window(ts):
+    if not win_list: return pd.Series(False, index=d.index)
+    m = pd.Series(False, index=d.index)
+    for s, e in win_list:
+        m |= (d["date"] >= s) & (d["date"] <= e)
+    return m
+
+in_window = in_any_window(d["date"])
 
 # =========================
 # Backtest engine (ATR/TP, sizing, fees/slip)
@@ -417,7 +484,7 @@ def buyhold_equity(df_: pd.DataFrame, start_cap: float) -> pd.Series:
     dfx = df_.copy().reset_index(drop=True)
     dfx["date"] = pd.to_datetime(dfx["date"])
     if len(dfx) < 2:
-        s = pd.Series([start_cap], index=dfx["date"])
+        s = pd.Series([start_cap], index=ddfx["date"])
         s.name = "bh_equity"
         return s
     buy_px = float(dfx.loc[1, "open"])  # start op eerstvolgende open
@@ -522,10 +589,16 @@ with st.expander("⚠️ Alerts & Signal status", expanded=True):
             st.markdown(f"{badge(color, title)} &nbsp; {msg}", unsafe_allow_html=True)
 
 # =========================
-# Paneel 1 – HA + Supertrend + Donchian (+ VIX)
+# Paneel 1 – HA + Supertrend + Donchian (+ VIX) + GELE WINDOWS
 # =========================
 fig1 = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]],
                      subplot_titles=["S&P 500 Heikin-Ashi + Supertrend (10,1) + Donchian" + (" + VIX (2e y-as)" if show_vix else "")])
+
+# Gele balken eerst (zodat traces erboven liggen)
+if highlight_on and win_list:
+    for (s, e) in win_list:
+        fig1.add_vrect(x0=s, x1=e, fillcolor="rgba(255,215,0,0.18)", line_width=0, layer="below")
+
 fig1.add_trace(go.Candlestick(x=d["date"], open=d["ha_open"], high=d["ha_high"], low=d["ha_low"], close=d["ha_close"],
                               name="SPX (Heikin-Ashi)"), row=1, col=1, secondary_y=False)
 fig1.add_trace(go.Scatter(x=d["date"], y=d["dc_high"], mode="lines",
@@ -614,6 +687,11 @@ fig2.add_trace(go.Scatter(
     x=sells["date"], y=sells["close"], mode="markers", name="Sell",
     marker=dict(symbol="triangle-down", size=12, color="#D55E00", line=dict(width=1, color="black"))
 ), row=2, col=1)
+
+# (2) optioneel: grijze balkjes achteraf als referentie
+if highlight_on and win_list:
+    for (s, e) in win_list:
+        fig2.add_vrect(x0=s, x1=e, fillcolor="rgba(255,215,0,0.12)", line_width=0, row=2, col=1)
 
 # (3) MACD
 fig2.add_trace(go.Scatter(x=d["date"], y=d["macd_line"],   mode="lines", name="MACD",   line=dict(width=2)), row=3, col=1)
@@ -755,13 +833,62 @@ if hist_on:
         st.plotly_chart(fig_pct, use_container_width=True)
 
 # =========================
+# Options-proxy (dagelijks) — windows vs outside
+# =========================
+st.subheader("Options-proxy — PnL (windows vs outside)")
+
+# Per dag volgende close: |Δ| en ATR
+d["next_close"] = d["close"].shift(-1)
+valid = d.dropna(subset=["next_close","atr14"]).copy()
+valid["abs_move"] = (valid["next_close"] - valid["open"]).abs()
+
+# Long Straddle proxy: |Δ| − cost×ATR
+valid["straddle_pnl"] = valid["abs_move"] - (straddle_cost_atr * valid["atr14"])
+
+# Short Strangle proxy:
+# PnL = premium×ATR − max(0, |Δ| − width×ATR)
+overflow = (valid["abs_move"] - strangle_width_atr * valid["atr14"]).clip(lower=0.0)
+valid["strangle_pnl"] = (strangle_prem_atr * valid["atr14"]) - overflow
+
+valid["in_window"] = in_any_window(valid["date"])
+
+def _sumstats(df_, col):
+    x = df_[col]
+    return pd.Series({
+        "N dagen": len(x),
+        "Hit % (>0)": (x > 0).mean()*100 if len(x) else np.nan,
+        "Gem. PnL": x.mean() if len(x) else np.nan,
+        "Totaal PnL": x.sum() if len(x) else np.nan
+    })
+
+sum_win = pd.concat([
+    _sumstats(valid[valid["in_window"]], "straddle_pnl").rename("Straddle (in windows)"),
+    _sumstats(valid[~valid["in_window"]], "straddle_pnl").rename("Straddle (outside)"),
+    _sumstats(valid[valid["in_window"]], "strangle_pnl").rename("Strangle (in windows)"),
+    _sumstats(valid[~valid["in_window"]], "strangle_pnl").rename("Strangle (outside)")
+], axis=1).T
+
+# Netjes tonen
+def _fmt(x, pct=False):
+    if pd.isna(x): return "—"
+    return f"{x:,.2f}%" if pct else f"{x:,.2f}"
+
+show_opt = pd.DataFrame({
+    "N": sum_win["N dagen"].map(lambda v: f"{int(v)}"),
+    "Hit %": sum_win["Hit % (>0)"].map(lambda v: _fmt(v, pct=True)),
+    "Gem. PnL (pts)": sum_win["Gem. PnL"].map(_fmt),
+    "Totaal PnL (pts)": sum_win["Totaal PnL"].map(_fmt)
+})
+st.dataframe(show_opt, use_container_width=True)
+
+# =========================
 # Trades (geavanceerde backtest)
 # =========================
 st.subheader("Trades (geavanceerde backtest)")
 if len(trades_df):
-    show = trades_df.copy()
-    show["ret_pct"] = show["ret_pct"].map(lambda x: f"{x:,.2f}%")
-    st.dataframe(show[["side","entry_date","entry_px","exit_date","exit_px","ret_pct","reason"]],
+    show_tr = trades_df.copy()
+    show_tr["ret_pct"] = show_tr["ret_pct"].map(lambda x: f"{x:,.2f}%")
+    st.dataframe(show_tr[["side","entry_date","entry_px","exit_date","exit_px","ret_pct","reason"]],
                  use_container_width=True)
 else:
     st.info("Geen trades in de geselecteerde periode.")
