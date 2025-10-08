@@ -1,36 +1,28 @@
-# pages/Yield_US_vs_EU.py
-# 🇺🇸 vs 🇪🇺 — vergelijking met 90d μ±1σ-band & Z-scores
-# + globale periode-slider, KPI-balk en |Z|>2 alert
-
+# pages/yield_curve.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from google.api_core.exceptions import BadRequest
-from utils.bq import run_query, bq_ping
+from plotly.subplots import make_subplots
+from utils.bq import run_query
 
-st.set_page_config(page_title="🇺🇸 vs 🇪🇺 Yield Curve", layout="wide")
-st.title("🇺🇸 vs 🇪🇺 Yield Curve Vergelijking")
+st.set_page_config(page_title="Yield Curve Dashboard", layout="wide")
+st.title("🧯 Yield Curve Dashboard")
 
-# ================== SECRETS / DEFAULTS ==================
 PROJECT_ID = st.secrets["gcp_service_account"]["project_id"]
 TABLES     = st.secrets.get("tables", {})
+# Tip: zet in secrets [tables].yield_view = "<project>.marketdata.yield_curve_dashboard_v"
+YIELD_VIEW = TABLES.get("yield_view", f"{PROJECT_ID}.marketdata.yield_curve_dashboard_v")
 
-US_VIEW   = TABLES.get("us_yield_view",   f"{PROJECT_ID}.marketdata.us_yield_curve_enriched_v")
-EU_VIEW   = TABLES.get("eu_yield_view",   f"{PROJECT_ID}.marketdata.eu_yield_curve_enriched_v")
-WIDE_VIEW = TABLES.get("yield_wide_view", f"{PROJECT_ID}.marketdata.yield_curve_analysis_wide")  # momenteel niet gebruikt
+# ---------- NBER recessieperioden ----------
+NBER_RECESSIONS = [
+    ("1990-07-01", "1991-03-01"),
+    ("2001-03-01", "2001-11-01"),
+    ("2007-12-01", "2009-06-01"),
+    ("2020-02-01", "2020-04-30"),
+]
 
-with st.expander("🔎 Debug: opgegeven bronnen"):
-    st.write({"US_VIEW": US_VIEW, "EU_VIEW": EU_VIEW, "WIDE_VIEW": WIDE_VIEW})
-
-# ================== HEALTH ==================
-try:
-    if not bq_ping():
-        st.error("Geen BigQuery-verbinding."); st.stop()
-except Exception as e:
-    st.error("Geen BigQuery-verbinding."); st.caption(f"Details: {e}"); st.stop()
-
-# ================== HELPERS ==================
+# ---------- Kolommen ophalen ----------
 def list_columns(fqtn: str) -> set[str]:
     proj, dset, tbl = fqtn.split(".")
     sql = f"""
@@ -41,250 +33,543 @@ def list_columns(fqtn: str) -> set[str]:
     dfc = run_query(sql, params={"tbl": tbl}, timeout=30)
     return set([c.lower() for c in dfc["column_name"].astype(str)])
 
-def choose_col(cols: set[str], preferred: list[str]) -> str | None:
-    for c in preferred:
-        if c.lower() in cols: return c
-    return None
+cols = list_columns(YIELD_VIEW)
+def have(c: str) -> bool: return c.lower() in cols
 
-def add_roll_stats(frame: pd.DataFrame, col: str, window: int = 90, minp: int = 30):
-    mu = frame[col].rolling(window, min_periods=minp).mean()
-    sd = frame[col].rolling(window, min_periods=minp).std()
-    frame[f"{col}_mu"] = mu
-    frame[f"{col}_sd"] = sd
-    frame[f"{col}_z"]  = (frame[col] - mu) / sd
-    return frame
+# basis yields
+y2y_col = "y_2y_synth" if have("y_2y_synth") else ("y_2y" if have("y_2y") else None)
+if not y2y_col:
+    st.error(f"`{YIELD_VIEW}` bevat geen `y_2y_synth` of `y_2y`.")
+    st.stop()
 
-# ================== LOADERS ==================
-def load_from_two_enriched_views(us_fqn: str, eu_fqn: str) -> pd.DataFrame:
-    us_cols = list_columns(us_fqn)
-    eu_cols = list_columns(eu_fqn)
+# ---------- SELECT dynamisch opbouwen ----------
+select_parts = ["date"]
+for src, alias in [("y_3m","y_3m"), (y2y_col,"y_2y"), ("y_5y","y_5y"), ("y_10y","y_10y"), ("y_30y","y_30y")]:
+    if have(src): select_parts.append(f"SAFE_CAST({src} AS FLOAT64) AS {alias}")
+if have("spread_10_2"):  select_parts.append("SAFE_CAST(spread_10_2 AS FLOAT64) AS spread_10_2")
+if have("spread_30_10"): select_parts.append("SAFE_CAST(spread_30_10 AS FLOAT64) AS spread_30_10")
+if have("snapshot_date"): select_parts.append("snapshot_date")
 
-    us_2y  = choose_col(us_cols, ["y_2y_synth", "y_2y"])
-    us_10y = choose_col(us_cols, ["y_10y_synth", "y_10y"])
-    eu_2y  = choose_col(eu_cols, ["y_2y_synth", "y_2y"])
-    eu_10y = choose_col(eu_cols, ["y_10y_synth", "y_10y"])
+# delta-kolommen
+DELTA_BASES = [
+    ("y_3m","y_3m"), ("y_2y","y_2y"), ("y_5y","y_5y"),
+    ("y_10y","y_10y"), ("y_30y","y_30y"),
+    ("spread_10_2","spread_10_2"), ("spread_30_10","spread_30_10"),
+]
+HORIZONS = [("1d","_delta_bp"), ("5d","_delta_5d_bp"), ("21d","_delta_21d_bp")]
+for src, alias in DELTA_BASES:
+    for hname, suffix in HORIZONS:
+        col = f"{src}{suffix}"
+        if have(col):
+            select_parts.append(f"SAFE_CAST({col} AS FLOAT64) AS {alias}{suffix}")
 
-    missing = [n for n,v in {"US 2Y":us_2y, "US 10Y":us_10y, "EU 2Y":eu_2y, "EU 10Y":eu_10y}.items() if v is None]
-    if missing:
-        raise BadRequest(f"Ontbrekende kolommen in enriched views: {missing}")
+sql = f"SELECT {', '.join(select_parts)} FROM `{YIELD_VIEW}` ORDER BY date"
 
-    q = f"""
-    WITH us AS (
-      SELECT date,
-             SAFE_CAST({us_2y}  AS FLOAT64) AS us_2y,
-             SAFE_CAST({us_10y} AS FLOAT64) AS us_10y,
-             SAFE_CAST({us_10y} AS FLOAT64) - SAFE_CAST({us_2y} AS FLOAT64) AS us_spread
-      FROM `{us_fqn}`
-    ),
-    eu AS (
-      SELECT date,
-             SAFE_CAST({eu_2y}  AS FLOAT64) AS eu_2y,
-             SAFE_CAST({eu_10y} AS FLOAT64) AS eu_10y,
-             SAFE_CAST({eu_10y} AS FLOAT64) - SAFE_CAST({eu_2y} AS FLOAT64) AS eu_spread
-      FROM `{eu_fqn}`
-    )
-    SELECT
-      us.date,
-      us.us_2y, us.us_10y, us.us_spread,
-      eu.eu_2y, eu.eu_10y, eu.eu_spread,
-      (us.us_2y - eu.eu_2y)                   AS diff_2y,
-      (us.us_10y - eu.eu_10y)                 AS diff_10y,
-      (us.us_spread - eu.eu_spread)           AS diff_spread
-    FROM us
-    JOIN eu USING(date)
-    ORDER BY date
-    """
-    return run_query(q, timeout=60)
-
-def load_data_resilient():
-    df = load_from_two_enriched_views(US_VIEW, EU_VIEW)
-    return df, "enriched_views"
-
-# ================== LOAD ==================
-with st.spinner("Data laden…"):
-    df, mode = load_data_resilient()
-
-st.caption(f"Bronmodus: **{mode}**")
+with st.spinner("Data ophalen uit BigQuery…"):
+    df = run_query(sql, timeout=60)
 if df.empty:
-    st.warning("Geen rijen."); st.stop()
+    st.warning("Geen data gevonden.")
+    st.stop()
 
-df["date"] = pd.to_datetime(df["date"])
+# ---------- Filters ----------
+topA, topB, topC = st.columns([1.6,1,1])
+with topA:
+    strict = st.toggle("Strikt filter (alle looptijden aanwezig)", value=False,
+                       help="Uit = alleen filteren op aanwezigheid van 2Y & 10Y.")
+with topB:
+    round_dp = st.slider("Decimalen", 1, 4, 2)
+with topC:
+    show_table = st.toggle("Tabel tonen", value=False)
 
-# Rolling stats (op volledige reeks, daarna filteren met periode)
-for c in ["diff_spread", "diff_2y", "diff_10y"]:
-    df = add_roll_stats(df, c)
-
-# ================== GLOBALE PERIODE ==================
-st.subheader("Periode")
-dmin, dmax = df["date"].min(), df["date"].max()
-
-left, right = st.columns([1.8, 1])
-with left:
-    preset = st.radio(
-        "Preset",
-        ["6M","1Y","3Y","5Y","10Y","YTD","Max","Custom"],
-        horizontal=True, index=1
-    )
-
-def clamp(ts: pd.Timestamp) -> pd.Timestamp: return max(dmin, ts)
-
-if preset == "6M":
-    start_date, end_date = clamp(dmax - pd.DateOffset(months=6)), dmax
-elif preset == "1Y":
-    start_date, end_date = clamp(dmax - pd.DateOffset(years=1)), dmax
-elif preset == "3Y":
-    start_date, end_date = clamp(dmax - pd.DateOffset(years=3)), dmax
-elif preset == "5Y":
-    start_date, end_date = clamp(dmax - pd.DateOffset(years=5)), dmax
-elif preset == "10Y":
-    start_date, end_date = clamp(dmax - pd.DateOffset(years=10)), dmax
-elif preset == "YTD":
-    start_date, end_date = clamp(pd.Timestamp(dmax.year,1,1)), dmax
-elif preset == "Max":
-    start_date, end_date = dmin, dmax
+df_f = df.copy()
+needed = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_f.columns]
+if strict and needed:
+    df_f = df_f.dropna(subset=needed)
 else:
-    date_range = st.slider(
-        "Selecteer periode (Custom)",
-        min_value=dmin.date(), max_value=dmax.date(),
-        value=(clamp(dmax - pd.DateOffset(years=1)).date(), dmax.date()),
+    subset = [c for c in ["y_2y","y_10y"] if c in df_f.columns]
+    if subset: df_f = df_f.dropna(subset=subset)
+
+if df_f.empty:
+    st.info("Na filteren geen data over.")
+    st.stop()
+
+# ---------- Quick presets + Periode ----------
+dmin = pd.to_datetime(min(df_f["date"]))
+dmax = pd.to_datetime(max(df_f["date"]))
+this_year_start = pd.Timestamp(year=dmax.year, month=1, day=1)
+
+st.subheader("Periode")
+left, right = st.columns([1.5, 1])
+with left:
+    preset = st.radio("Quick presets",
+        ["Max", "YTD", "1Y", "3Y", "5Y", "10Y", "Custom"],
+        horizontal=True, index=2)
+with right:
+    show_recessions = st.toggle("Toon US recessies (NBER)", value=True)
+
+def clamp_start(ts: pd.Timestamp) -> pd.Timestamp:
+    return max(dmin, ts)
+
+if preset == "Max":
+    start_date, end_date = dmin, dmax
+elif preset == "YTD":
+    start_date, end_date = clamp_start(this_year_start), dmax
+elif preset == "1Y":
+    start_date, end_date = clamp_start(dmax - pd.DateOffset(years=1)), dmax
+elif preset == "3Y":
+    start_date, end_date = clamp_start(dmax - pd.DateOffset(years=3)), dmax
+elif preset == "5Y":
+    start_date, end_date = clamp_start(dmax - pd.DateOffset(years=5)), dmax
+elif preset == "10Y":
+    start_date, end_date = clamp_start(dmax - pd.DateOffset(years=10)), dmax
+else:
+    date_range = st.slider("Selecteer periode (Custom)",
+        min_value=dmin.to_pydatetime().date(),
+        max_value=dmax.to_pydatetime().date(),
+        value=(clamp_start(dmax - pd.DateOffset(years=1)).to_pydatetime().date(), dmax.to_pydatetime().date()),
     )
     start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
 
-mask = (df["date"] >= start_date) & (df["date"] <= end_date)
-dfp = df.loc[mask].copy()
-if dfp.empty:
-    st.info("Geen data in de gekozen periode."); st.stop()
+mask = (pd.to_datetime(df_f["date"]) >= start_date) & (pd.to_datetime(df_f["date"]) <= end_date)
+df_range = df_f.loc[mask].copy()
+if df_range.empty:
+    st.info("Geen data in de gekozen periode.")
+    st.stop()
 
-# ================== KPI-BALK (gesynchroniseerd met periode) ==================
-st.subheader("KPI’s (laatste in periode)")
-try:
-    last = dfp.dropna(subset=["us_2y","us_10y","eu_2y","eu_10y"]).iloc[-1]
-except IndexError:
-    st.info("Niet genoeg data voor KPI’s in de geselecteerde periode."); last = None
+# ---------- Snapshot-keuze ----------
+st.sidebar.header("Snapshot")
+all_dates = list(df_f["date"].dropna().unique())
+sel_date = st.sidebar.selectbox("Kies datum", all_dates, index=len(all_dates)-1, format_func=str)
+snap = df_f[df_f["date"] == sel_date].tail(1)
 
-def fmt_pct(p): 
-    return "—" if pd.isna(p) else f"{float(p):.2f}%"
+# ---------- KPI’s ----------
+def fmt_pct(x): 
+    return "—" if pd.isna(x) else f"{round(float(x), round_dp)}%"
 
-def fmt_bp(x):
-    return "—" if pd.isna(x) else f"{float(x):.1f} bp"
+k1, k2, k3, k4, k5 = st.columns(5)
+for col, box in zip(["y_3m","y_2y","y_5y","y_10y","y_30y"], [k1,k2,k3,k4,k5]):
+    val = fmt_pct(snap[col].values[0]) if (col in snap.columns and not snap.empty) else "—"
+    box.metric(col.upper().replace("_",""), val)
 
-if last is not None:
-    # differentials in bp
-    diff2_bp   = (last["diff_2y"]   * 100.0) if pd.notna(last["diff_2y"])   else np.nan
-    diff10_bp  = (last["diff_10y"]  * 100.0) if pd.notna(last["diff_10y"])  else np.nan
-    diffsp_bp  = (last["diff_spread"] * 100.0) if pd.notna(last["diff_spread"]) else np.nan
+# ---------- SIGNAL LIGHTS / ALERTS ----------
+st.subheader("Signals")
+sigL, sigR = st.columns([1.3, 1])
 
-    r1 = st.columns(4)
-    r1[0].metric("US 2Y", fmt_pct(last["us_2y"]))
-    r1[1].metric("EU 2Y", fmt_pct(last["eu_2y"]))
-    r1[2].metric("Δ2Y (US–EU)", fmt_bp(diff2_bp), delta=(f"z={last['diff_2y_z']:.2f}" if pd.notna(last["diff_2y_z"]) else None))
-    r1[3].metric("Δ(10Y–2Y) (US–EU)", fmt_bp(diffsp_bp), delta=(f"z={last['diff_spread_z']:.2f}" if pd.notna(last["diff_spread_z"]) else None))
+# Kies regime-horizon
+with sigR:
+    regime_horizon = st.radio("Regime-horizon", ["5d", "21d"], horizontal=True, index=1)
+    suffix = "_delta_5d_bp" if regime_horizon == "5d" else "_delta_21d_bp"
 
-    r2 = st.columns(3)
-    r2[0].metric("US 10Y", fmt_pct(last["us_10y"]))
-    r2[1].metric("EU 10Y", fmt_pct(last["eu_10y"]))
-    r2[2].metric("Δ10Y (US–EU)", fmt_bp(diff10_bp), delta=(f"z={last['diff_10y_z']:.2f}" if pd.notna(last["diff_10y_z"]) else None))
+    # Drempels per horizon (iets strakker voor 5d)
+    default_steepen = 8 if regime_horizon == "5d" else 10
+    default_bigmove = 10 if regime_horizon == "5d" else 15
 
-    # ===== Alert bij |Z| > 2 =====
-    alerts = []
-    def add_alert(label, base):
-        z = last.get(f"{base}_z", np.nan)
-        val = last.get(base, np.nan)
-        if pd.notna(z) and abs(z) > 2:
-            dir_txt = "US > EU" if (pd.notna(val) and val > 0) else ("US < EU" if pd.notna(val) else "")
-            alerts.append((label, z, dir_txt))
-    add_alert("Δ(10Y–2Y)", "diff_spread")
-    add_alert("Δ2Y",       "diff_2y")
-    add_alert("Δ10Y",      "diff_10y")
+    st.caption(f"Drempels ({regime_horizon} Δ in basispunten)")
+    thr_steepen = st.slider("Steil/plat drempel |Δ(10Y–2Y)|", 5, 50, default_steepen, step=1)
+    thr_bigmove  = st.slider("Grote move per looptijd/spread", 5, 50, default_bigmove, step=1)
 
-    if alerts:
-        # escalatie bij |z|>=3
-        sev = "warning"
-        if any(abs(z) >= 3 for _, z, _ in alerts): sev = "error"
-        msg = " • ".join([f"{lbl}: z={z:.2f} ({dir_})" for lbl, z, dir_ in alerts])
-        if sev == "error":
-            st.error(f"📣 Extreem: {msg}")
+def last_val(col: str):
+    if col not in df_range.columns: return None
+    s = df_range[col].dropna()
+    return None if s.empty else float(s.iloc[-1])
+
+# Δ(10Y–2Y) op gekozen horizon
+d_spread = None
+spread_col = f"spread_10_2{suffix}"
+if spread_col in df_range.columns:
+    d_spread = last_val(spread_col)
+elif {f"y_10y{suffix}", f"y_2y{suffix}"}.issubset(df_range.columns):
+    d10 = last_val(f"y_10y{suffix}") or 0.0
+    d2  = last_val(f"y_2y{suffix}")  or 0.0
+    d_spread = d10 - d2
+
+# Δ’s per looptijd
+d_2y  = last_val(f"y_2y{suffix}")
+d_10y = last_val(f"y_10y{suffix}")
+
+# Huidige spreadniveau (pp)
+if "spread_10_2" in df_f.columns:
+    latest_spread = float(df_f.dropna(subset=["spread_10_2"]).iloc[-1]["spread_10_2"])
+elif {"y_10y","y_2y"}.issubset(df_f.columns):
+    tmp = df_f.dropna(subset=["y_10y","y_2y"])
+    latest_spread = float(tmp.iloc[-1]["y_10y"] - tmp.iloc[-1]["y_2y"])
+else:
+    latest_spread = None
+
+# Regime-detectie
+regime = "—"; explanation = []
+if (d_spread is not None) and (d_2y is not None) and (d_10y is not None):
+    if d_spread >= thr_steepen:
+        if d_2y <= 0 and d_10y >= 0:
+            regime = "✅ Bull steepening"; explanation.append("Kort ↓ en Lang ↑ (easing/risico-on).")
+        elif d_2y > 0 and d_10y > 0:
+            regime = "⚠️ Bear steepening"; explanation.append("Beide ↑, lang harder (inflatiepremie).")
         else:
-            st.warning(f"Let op: {msg}")
-
-# ================== CURVES (2Y/10Y) ==================
-st.subheader("Yield Curves US vs EU (2Y & 10Y)")
-fig1 = go.Figure()
-fig1.add_trace(go.Scatter(x=dfp["date"], y=dfp["us_2y"],  mode="lines", name="US 2Y"))
-fig1.add_trace(go.Scatter(x=dfp["date"], y=dfp["us_10y"], mode="lines", name="US 10Y"))
-fig1.add_trace(go.Scatter(x=dfp["date"], y=dfp["eu_2y"],  mode="lines", name="EU 2Y", yaxis="y2"))
-fig1.add_trace(go.Scatter(x=dfp["date"], y=dfp["eu_10y"], mode="lines", name="EU 10Y", yaxis="y2"))
-fig1.update_layout(
-    margin=dict(l=10,r=10,t=6,b=10),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    yaxis=dict(title="US Yield (%)"),
-    yaxis2=dict(title="EU Yield (%)", overlaying="y", side="right"),
-)
-fig1.update_xaxes(range=[start_date, end_date])
-st.plotly_chart(fig1, use_container_width=True)
-
-# ================== SPREADS (10Y–2Y) + DIFFERENTIAL ==================
-st.subheader("10Y–2Y Spreads (US & EU) + US–EU differential")
-fig2 = go.Figure()
-fig2.add_trace(go.Scatter(x=dfp["date"], y=dfp["us_spread"], mode="lines", name="US 10Y–2Y"))
-fig2.add_trace(go.Scatter(x=dfp["date"], y=dfp["eu_spread"], mode="lines", name="EU 10Y–2Y"))
-fig2.add_trace(go.Bar(x=dfp["date"], y=dfp["diff_spread"], name="US–EU diff (bp)", opacity=0.35))
-fig2.update_layout(
-    margin=dict(l=10,r=10,t=6,b=10),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    yaxis_title="Basis points",
-    barmode="overlay",
-)
-fig2.update_xaxes(range=[start_date, end_date])
-st.plotly_chart(fig2, use_container_width=True)
-
-# ================== DIFFERENTIALS — BAND & Z-SCORES ==================
-st.subheader("US–EU differentials — 90d μ ± 1σ & Z-scores")
-show_band = st.checkbox("Toon 90d μ ± 1σ band", value=True)
-as_z      = st.checkbox("Toon als Z-scores (rolling, 90d)", value=False)
-tabs      = st.tabs(["Spread (10Y–2Y)", "2Y", "10Y"])
-
-def plot_diff(tab, df_in: pd.DataFrame, base_col: str, title_txt: str, unit: str):
-    with tab:
-        loc = df_in.loc[(df_in["date"] >= start_date) & (df_in["date"] <= end_date)].copy()
-        if loc.empty:
-            st.info("Geen data in de gekozen periode."); return
-
-        series = loc[f"{base_col}_z"] if as_z else loc[base_col]
-        mu = loc[f"{base_col}_mu"]; sd = loc[f"{base_col}_sd"]
-
-        if as_z:
-            y_title = "Z-score"
-            upper = (mu + sd - mu) / sd  # +1
-            lower = (mu - sd - mu) / sd  # -1
-            mu_plot = (mu - mu) / sd     # 0
+            regime = "ℹ️ Mixed steepening"
+    elif d_spread <= -thr_steepen:
+        if d_2y >= 0 and d_10y <= 0:
+            regime = "❌ Bear flattening"; explanation.append("Kort ↑ en Lang ↓ (tightening/groei-stress).")
+        elif d_2y < 0 and d_10y < 0:
+            regime = "🟦 Bull flattening"; explanation.append("Beide ↓, lang harder (flight-to-quality).")
         else:
-            y_title = unit
-            upper = mu + sd; lower = mu - sd; mu_plot = mu
+            regime = "ℹ️ Mixed flattening"
+    else:
+        regime = "⏸️ Neutraal"
 
-        fig = go.Figure()
-        if show_band:
-            fig.add_trace(go.Scatter(x=loc["date"], y=upper, name="μ+1σ", mode="lines",
-                                     line=dict(width=0.5), showlegend=False))
-            fig.add_trace(go.Scatter(x=loc["date"], y=lower, name="μ-1σ", mode="lines",
-                                     fill="tonexty", line=dict(width=0.5), opacity=0.20, showlegend=False))
-        fig.add_trace(go.Scatter(x=loc["date"], y=mu_plot, name="μ (90d)", mode="lines",
-                                 line=dict(width=1, dash="dot")))
-        fig.add_trace(go.Scatter(x=loc["date"], y=series, name="US–EU differential", mode="lines"))
-        fig.update_layout(
-            margin=dict(l=10,r=10,t=6,b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            yaxis_title=y_title,
+with sigL:
+    label = f"{regime} — Δ{regime_horizon}(10Y–2Y): {round(d_spread or 0.0,1)} bp"
+    if regime.startswith("✅"): st.success(label, icon="✅")
+    elif regime.startswith("❌"): st.error(label, icon="❌")
+    elif regime.startswith("⚠️"): st.warning(label, icon="⚠️")
+    elif regime.startswith("🟦"): st.info(label, icon="ℹ️")
+    else: st.info(label, icon="⏸️")
+    if explanation: st.caption(" • ".join(explanation))
+
+# Inversie-alert
+if latest_spread is not None and latest_spread < 0:
+    st.warning(f"🔻 Inversie actief: 10Y–2Y = {round(latest_spread,2)} pp (negatief).", icon="🔻")
+else:
+    st.caption(f"10Y–2Y = { '—' if latest_spread is None else str(round(latest_spread,2)) + ' pp' }")
+
+# Grote bewegingen (gekozen horizon)
+big_moves = []
+for base, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
+                    ("spread_10_2","10Y–2Y"), ("spread_30_10","30Y–10Y")]:
+    col = f"{base}{suffix}"
+    if col in df_range.columns:
+        v = last_val(col)
+        if v is not None and abs(v) >= thr_bigmove:
+            big_moves.append(f"{label}: {round(v,1)} bp")
+
+if big_moves:
+    st.info(f"📣 Grote bewegingen laatste {regime_horizon}: " + " | ".join(big_moves))
+
+# ---------- Helper recessie overlay ----------
+def add_recession_shapes(fig: go.Figure, show: bool, x_start: pd.Timestamp, x_end: pd.Timestamp):
+    if not show: return fig
+    for start, end in NBER_RECESSIONS:
+        s = pd.to_datetime(start); e = pd.to_datetime(end)
+        if (e >= x_start) and (s <= x_end):
+            fig.add_vrect(x0=max(s, x_start), x1=min(e, x_end),
+                          fillcolor="LightGray", opacity=0.25, layer="below", line_width=0)
+    return fig
+
+# ---------- Grafieken (onder elkaar) ----------
+# 1) Term Structure (snapshot)
+st.subheader(f"Term Structure • {sel_date}")
+maturities, values = [], []
+for col, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y")]:
+    if col in snap.columns:
+        maturities.append(label)
+        values.append(snap[col].values[0] if not snap.empty else None)
+ts_fig = go.Figure()
+ts_fig.add_trace(go.Scatter(x=maturities, y=values, mode="lines+markers"))
+ts_fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Maturity")
+st.plotly_chart(ts_fig, use_container_width=True)
+st.markdown(
+    """
+**Wat je ziet:** de rentecurve (3M–30Y) op de gekozen datum.  
+**Interpretatie (algemeen):** normaal = groei/inflatiepremie; vlak = late cyclus/overgang; invers = recessierisico/verwachte renteverlagingen.
+"""
+)
+
+# --- Analyse & interpretatie van de term structure (snapshot) ---
+st.subheader("Analyse: Term Structure (snapshot)")
+if not snap.empty:
+    row = snap.iloc[0]
+
+    def getv(c): 
+        return float(row[c]) if (c in snap.columns and pd.notna(row[c])) else None
+
+    y3m, y2y, y5y, y10y, y30y = (getv("y_3m"), getv("y_2y"), getv("y_5y"), getv("y_10y"), getv("y_30y"))
+    # Spreads (pp)
+    s2_3m  = (y2y - y3m) if (y2y is not None and y3m is not None) else None
+    s10_2  = (y10y - y2y) if (y10y is not None and y2y is not None) else None
+    s30_10 = (y30y - y10y) if (y30y is not None and y10y is not None) else None
+    # Curvature (butterfly 10Y vs 2Y/30Y): 2*10Y - (2Y+30Y)
+    butterfly = (2*y10y - (y2y + y30y)) if (y10y is not None and y2y is not None and y30y is not None) else None
+
+    thr_flat = 0.05  # 5 bp als 'vlak'-drempel
+
+    # Classificatie
+    label = "Onvoldoende data"
+    notes = []
+    if s10_2 is not None and s2_3m is not None and s30_10 is not None:
+        if s10_2 < -thr_flat:
+            label = "🔻 Invers (10Y < 2Y)"
+            notes.append("Markt prijst afkoeling/latere renteverlagingen in.")
+        elif abs(s2_3m) < thr_flat and abs(s10_2) < thr_flat and abs(s30_10) < thr_flat:
+            label = "⏸️ Vlak"
+            notes.append("Overgangsfase; weinig richting in cyclusverwachting.")
+        elif s2_3m > thr_flat and s10_2 > thr_flat and s30_10 >= -thr_flat:
+            label = "⤴️ Opwaarts hellend"
+            notes.append("Normaal profiel: groei/inflatiepremie; lager recessierisico.")
+        else:
+            # Curvature check
+            if butterfly is not None and butterfly > thr_flat:
+                label = "↭ Hump rond 10Y"
+                notes.append("Middensegment hoger: vraag/aanbod of duration-premie in mid maturities.")
+            elif butterfly is not None and butterfly < -thr_flat:
+                label = "∪ U-vorm"
+                notes.append("Korte & lange rente relatief hoog t.o.v. midden; defensievere premies.")
+            else:
+                label = "ℹ️ Gemengd profiel"
+                notes.append("Segmenten bewegen verschillend; let op rotatie/steepening of flattening.")
+
+    # Metrics weergave
+    m1, m2, m3, m4, m5 = st.columns(5)
+    for val, name, box in [
+        (y3m, "3M", m1), (y2y, "2Y", m2), (y5y, "5Y", m3), (y10y, "10Y", m4), (y30y, "30Y", m5)
+    ]:
+        box.metric(name, "—" if val is None else f"{round(val, round_dp)}%")
+
+    sA, sB, sC, sD = st.columns(4)
+    sA.metric("2Y–3M", "—" if s2_3m is None else f"{round(s2_3m, 2)} pp")
+    sB.metric("10Y–2Y", "—" if s10_2 is None else f"{round(s10_2, 2)} pp")
+    sC.metric("30Y–10Y", "—" if s30_10 is None else f"{round(s30_10, 2)} pp")
+    sD.metric("Curvature (10Y vs 2/30)", "—" if butterfly is None else f"{round(butterfly, 2)} pp")
+
+    # Conclusie/duiding
+    if label.startswith("🔻"): st.error(label)
+    elif label.startswith("⤴️"): st.success(label)
+    elif label.startswith("⏸️"): st.info(label)
+    elif label.startswith("↭") or label.startswith("∪"): st.warning(label)
+    else: st.info(label)
+
+    if notes:
+        st.caption(" • ".join(notes))
+
+    st.markdown(
+        """
+**Handvatten**  
+- Let op verschuivingen in **10Y–2Y** (steepening/flattening) en **30Y–10Y** (lange-staart premie/aanbod).  
+- Combineer met de **Signals**-sectie (5d/21d Δ’s) om regimewijzigingen tijdig te vangen.  
+- ‘Hump’-profielen wijzen vaak op **middellange duration-vraag** of **technische factoren**; U-vorm vaker op **risico-aversie** aan korte én lange kant.
+        """
+    )
+else:
+    st.info("Geen snapshot-data voor analyse.")
+
+# 2) Spreads (met recessies)
+st.subheader("Spreads")
+if "spread_10_2" in df_range.columns or "spread_30_10" in df_range.columns:
+    sp = go.Figure()
+    if "spread_10_2" in df_range.columns:
+        sp.add_trace(go.Scatter(x=df_range["date"], y=df_range["spread_10_2"], name="10Y - 2Y"))
+    if "spread_30_10" in df_range.columns:
+        sp.add_trace(go.Scatter(x=df_range["date"], y=df_range["spread_30_10"], name="30Y - 10Y"))
+    sp.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Spread (pp)", xaxis_title="Date")
+    sp = add_recession_shapes(sp, show_recessions, pd.to_datetime(start_date), pd.to_datetime(end_date))
+    st.plotly_chart(sp, use_container_width=True)
+else:
+    st.info("Spreads niet beschikbaar in de view.")
+st.markdown("**Interpretatie:** 10Y–2Y < 0 = inversie (vaak 6–18 mnd vóór recessies).")
+
+# 3) Rentes per looptijd (tijdreeks) + 1D Δ per geselecteerde looptijd onder elkaar
+st.subheader("Rentes per looptijd (tijdreeks)")
+
+avail_yields = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
+default_sel  = [c for c in ["y_2y","y_10y","y_30y"] if c in avail_yields] or avail_yields[:2]
+sel = st.multiselect("Selecteer looptijden", avail_yields, default=default_sel)
+
+show_1d_delta = st.toggle(
+    "Toon 1D delta (bp) onder de grafiek — één rij per looptijd",
+    value=True,
+    help="Gebruikt *_delta_bp indien aanwezig, anders diff()*100 op de yield-reeks."
+)
+
+if sel:
+    # helper: pak bestaande *_delta_bp of bereken on-the-fly
+    def get_1d_delta_bp(df_in: pd.DataFrame, col: str) -> pd.Series:
+        dcol = f"{col}_delta_bp"
+        if dcol in df_in.columns:
+            return pd.to_numeric(df_in[dcol], errors="coerce")
+        s = pd.to_numeric(df_in[col], errors="coerce")
+        return s.diff() * 100.0  # procent → basispunten
+
+    n_delta_rows = len(sel) if show_1d_delta else 0
+    total_rows   = 1 + n_delta_rows
+
+    # Verhouding: 55% voor de hoofdgrafiek, 45% verdeeld over alle delta-rijen
+    row_heights = [1.0] if n_delta_rows == 0 else [0.55] + [0.45 / n_delta_rows] * n_delta_rows
+
+    fig = make_subplots(
+        rows=total_rows, cols=1, shared_xaxes=True,
+        row_heights=row_heights, vertical_spacing=0.06
+    )
+
+    # Rij 1: yields (lijnen)
+    for col in sel:
+        fig.add_trace(
+            go.Scatter(x=df_range["date"], y=df_range[col], name=col.upper(), mode="lines"),
+            row=1, col=1
         )
-        fig.update_xaxes(range=[start_date, end_date])
-        st.caption(title_txt)
-        st.plotly_chart(fig, use_container_width=True)
+    fig.update_yaxes(title_text="Yield (%)", row=1, col=1)
 
-        last_loc = loc.dropna(subset=[base_col, f"{base_col}_z"]).iloc[-1]
-        c1, c2 = st.columns(2)
-        c1.metric("Laatste differential", f"{(last_loc[base_col]*100):.1f} {unit}" if unit=="bp" else f"{last_loc[base_col]:.2f}")
-        c2.metric("Laatste Z-score (90d)", f"{last_loc[f'{base_col}_z']:.2f}")
+    # Rijen 2..: per looptijd een eigen 1D-delta-bar
+    if show_1d_delta:
+        for i, col in enumerate(sel, start=2):
+            dser = get_1d_delta_bp(df_range, col)
+            colors = [("#16a34a" if (pd.notna(v) and v >= 0) else "#dc2626") for v in dser]
+            fig.add_trace(
+                go.Bar(
+                    x=df_range["date"], y=dser,
+                    name=f"{col.upper()} Δ1D (bp)",
+                    marker_color=colors,
+                    showlegend=False
+                ),
+                row=i, col=1
+            )
+            # nul-lijn voor elke delta-rij
+            fig.add_hline(y=0, line_width=1, line_color="gray", opacity=0.5, row=i, col=1)
+            fig.update_yaxes(title_text=f"{col.upper()} Δ1D (bp)", row=i, col=1, zeroline=True)
 
-plot_diff(tabs[0], dfp, "diff_spread", "Differential: (10Y–2Y)", "bp")
-plot_diff(tabs[1], dfp, "diff_2y",     "Differential: 2Y",       "bp")
-plot_diff(tabs[2], dfp, "diff_10y",    "Differential: 10Y",      "bp")
+    # X-as titel onderaan
+    fig.update_xaxes(title_text="Date", row=total_rows, col=1)
+    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+
+    # Recessie-overlay over alle rijen
+    if show_recessions:
+        x_start, x_end = pd.to_datetime(start_date), pd.to_datetime(end_date)
+        for start, end in NBER_RECESSIONS:
+            s = pd.to_datetime(start); e = pd.to_datetime(end)
+            if (e >= x_start) and (s <= x_end):
+                fig.add_vrect(
+                    x0=max(s, x_start), x1=min(e, x_end),
+                    fillcolor="LightGray", opacity=0.25, layer="below", line_width=0,
+                    row="all", col=1
+                )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+# 4) Heatmap
+st.subheader("Heatmap van rentes")
+avail_yields_hm = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
+if avail_yields_hm:
+    hm = df_range[["date"] + avail_yields_hm].set_index("date")
+    hfig = go.Figure(data=go.Heatmap(
+        z=hm[avail_yields_hm].T.values, x=hm.index.astype(str),
+        y=[c.replace("y_","").upper() for c in avail_yields_hm], coloraxis="coloraxis"
+    ))
+    hfig.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="Viridis")
+    st.plotly_chart(hfig, use_container_width=True)
+else:
+    st.info("Geen yields beschikbaar voor de heatmap binnen de gekozen periode.")
+
+# ================== DELTA-SECTIE ==================
+st.header("Δ Deltas (basispunten)")
+
+# Detecteer beschikbare delta-horizons
+available_horizons = []
+for hname, suffix_h in HORIZONS:
+    if any([(f"{b}{suffix_h}" in df_range.columns) for _, b in DELTA_BASES]):
+        available_horizons.append((hname, suffix_h))
+
+# 4a) Delta-matrix heatmap (laatste dag)
+try:
+    last_row = df_range.iloc[-1]
+    base_items = [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
+                  ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]
+    mat_labels, data_by_h = [], []
+    for hname, suffix_h in available_horizons:
+        vals, labs = [], []
+        for base, label in base_items:
+            col = f"{base}{suffix_h}"
+            if col in df_range.columns:
+                vals.append(last_row[col]); labs.append(label)
+        if vals:
+            data_by_h.append(vals); mat_labels = labs
+    if data_by_h:
+        st.subheader("Delta-matrix (laatste dag in gekozen periode)")
+        hm2 = go.Figure(data=go.Heatmap(
+            z=np.array(data_by_h).T, x=[h for h, _ in available_horizons],
+            y=mat_labels, coloraxis="coloraxis"
+        ))
+        hm2.update_layout(margin=dict(l=10,r=10,t=10,b=10),
+                          coloraxis_colorscale="RdBu", coloraxis_cmid=0)
+        st.plotly_chart(hm2, use_container_width=True)
+        st.caption("Rood = stijging (bp), Blauw = daling. Waarden van de laatste dag.")
+except Exception:
+    pass
+
+# 4b) Mini-bars per horizon (laatste dag)
+if available_horizons:
+    st.subheader("Delta-overzicht per horizon (laatste dag)")
+    colL, colR = st.columns(2)
+    target_cols = [colL, colR]
+    base_items = [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
+                  ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]
+    for idx, (hname, suffix_h) in enumerate(available_horizons):
+        vals, labs = [], []
+        for base, label in base_items:
+            col = f"{base}{suffix_h}"
+            if col in df_range.columns:
+                vals.append(last_row[col]); labs.append(label)
+        if not vals: continue
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=labs, y=vals, name=f"{hname} Δbp"))
+        fig.update_layout(title=f"{hname} Δbp (laatste dag)",
+                          margin=dict(l=10,r=10,t=40,b=10),
+                          yaxis_title="Δ (bp)", xaxis_title="")
+        target_cols[idx % 2].plotly_chart(fig, use_container_width=True)
+
+# 4c) Delta tijdreeks — bars groen/rood + modus: Overlay of Gestapeld
+st.subheader("Delta tijdreeks")
+hoptions = [h for h, _ in available_horizons] or []
+if hoptions:
+    hsel = st.selectbox("Horizon", hoptions, index=0)
+    suffix_sel = dict(available_horizons)[hsel]
+
+    chart_mode = st.radio(
+        "Weergave",
+        options=["Overlay", "Gestapeld"],
+        horizontal=True,
+        index=0,
+        help="Overlay: reeksen over elkaar (transparant). Gestapeld: reeksen opgeteld."
+    )
+
+    candidates, labels_map = [], {}
+    for base, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
+                        ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]:
+        col = f"{base}{suffix_sel}"
+        if col in df_range.columns:
+            candidates.append(col); labels_map[col] = f"{label} ({hsel})"
+
+    default_pick = [c for c in candidates if c.startswith("y_10y")] or candidates[:1]
+    choose = st.multiselect("Kies metrics", candidates, default=default_pick,
+                            format_func=lambda c: labels_map.get(c, c))
+
+    if choose:
+        figd = go.Figure()
+        for c in choose:
+            yvals = pd.to_numeric(df_range[c], errors="coerce")
+            colors = [("#16a34a" if (pd.notna(v) and v >= 0) else "#dc2626") for v in yvals]
+            figd.add_trace(go.Bar(
+                x=df_range["date"],
+                y=yvals,
+                name=labels_map.get(c, c),
+                marker_color=colors,
+                opacity=(0.75 if chart_mode == "Overlay" and len(choose) > 1 else 1.0)
+            ))
+
+        figd.add_hline(y=0, line_width=1, line_color="gray", opacity=0.5)
+
+        figd.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            barmode=("overlay" if chart_mode == "Overlay" else "relative"),
+            yaxis_title="Δ (bp)",
+            xaxis_title="Date",
+            legend_title_text="Reeks"
+        )
+
+        st.plotly_chart(figd, use_container_width=True)
+        st.caption("Positief = stijging over de gekozen horizon; negatief = daling.")
+
+# ---------- Tabel + download ----------
+if show_table:
+    st.subheader("Tabel")
+    st.dataframe(df_range.sort_values("date", ascending=False).round(round_dp))
+
+csv = df_range.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download CSV (gefilterd op periode)", data=csv,
+                   file_name="yield_curve_filtered.csv", mime="text/csv")
