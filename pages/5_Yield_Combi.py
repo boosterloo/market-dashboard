@@ -1,461 +1,234 @@
-# pages/Yield_Combined.py — Gecombineerd US/EU met 1d/7d/30d histograms (bp & %)
-import streamlit as st
-import pandas as pd
+# pages/8_Yield_Tijdreeks.py
+import math
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from utils.bq import run_query
+import streamlit as st
+from utils.bq import run_query, bq_ping
 
-st.set_page_config(page_title="Yield Curve Dashboard (US/EU)", layout="wide")
+st.set_page_config(page_title="📈 Rentes per looptijd (tijdreeks)", layout="wide")
+st.title("📈 Rentes per looptijd (tijdreeks)")
 
-PROJECT_ID = st.secrets["gcp_service_account"]["project_id"]
-TABLES     = st.secrets.get("tables", {})
+# ---- BigQuery view ----
+YIELD_VIEW = st.secrets.get("tables", {}).get(
+    "yield_view", "nth-pier-468314-p7.marketdata.yield_curve"
+)
 
-# Optionele overrides via secrets:
-# [tables]
-# us_yield_view = "<project>.marketdata.us_yield_curve_enriched_v"
-# eu_yield_view = "<project>.marketdata.eu_yield_curve_enriched_v"
+# ---- Healthcheck ----
+try:
+    if not bq_ping():
+        st.error("Geen BigQuery-verbinding."); st.stop()
+except Exception as e:
+    st.error("Geen BigQuery-verbinding."); st.caption(f"Details: {e}"); st.stop()
 
-REGION_CONFIG = {
-    "US": {
-        "emoji": "🧯",
-        "title": "US Yield Curve Dashboard",
-        "default_view": TABLES.get("us_yield_view", f"{PROJECT_ID}.marketdata.us_yield_curve_enriched_v"),
-        "default_recession_overlay": True,   # NBER = US
-    },
-    "EU": {
-        "emoji": "🇪🇺",
-        "title": "EU Yield Curve Dashboard",
-        "default_view": TABLES.get("eu_yield_view", f"{PROJECT_ID}.marketdata.eu_yield_curve_enriched_v"),
-        "default_recession_overlay": False,  # NBER is US-specifiek
-    },
-}
-
-# ---------- Recessieperioden (NBER; enkel als referentie) ----------
-NBER_RECESSIONS = [
-    ("1990-07-01", "1991-03-01"),
-    ("2001-03-01", "2001-11-01"),
-    ("2007-12-01", "2009-06-01"),
-    ("2020-02-01", "2020-04-30"),
-]
-
-# ---------- Helpers ----------
-def list_columns(fqtn: str) -> set[str]:
-    proj, dset, tbl = fqtn.split(".")
-    sql = f"""
-    SELECT column_name
-    FROM `{proj}.{dset}.INFORMATION_SCHEMA.COLUMNS`
-    WHERE table_name = @tbl
+# ---- Data laden ----
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_yields():
+    q = f"""
+    SELECT
+      date,
+      y_3m, y_2y, y_5y, y_10y, y_30y
+    FROM `{YIELD_VIEW}`
+    WHERE date IS NOT NULL
+    ORDER BY date
     """
-    dfc = run_query(sql, params={"tbl": tbl}, timeout=30)
-    return set([c.lower() for c in dfc["column_name"].astype(str)])
+    df = run_query(q)
+    df["date"] = pd.to_datetime(df["date"])
+    for c in df.columns:
+        if c.startswith("y_"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
-def add_recession_shapes(fig: go.Figure, x_start: pd.Timestamp, x_end: pd.Timestamp, show: bool=True):
-    if not show: return fig
-    for start, end in NBER_RECESSIONS:
-        s = pd.to_datetime(start); e = pd.to_datetime(end)
-        if (e >= x_start) and (s <= x_end):
-            fig.add_vrect(x0=max(s, x_start), x1=min(e, x_end),
-                          fillcolor="LightGray", opacity=0.22, layer="below", line_width=0)
-    return fig
-
-# ================== REGIOKEUZE ==================
-topL, topR = st.columns([1.2, 2])
-with topL:
-    region = st.selectbox("Regio", ["US", "EU"], index=0, key="region")
-cfg = REGION_CONFIG[region]
-st.title(f"{cfg['emoji']} {cfg['title']}")
-
-# View kan alsnog globaal overschreven zijn (voor volledige compat met je bestaande [tables].yield_view)
-YIELD_VIEW = TABLES.get("yield_view", cfg["default_view"])
-
-cols = list_columns(YIELD_VIEW)
-def have(c: str) -> bool: return c.lower() in cols
-
-# basis yields
-y2y_pref = "y_2y_synth" if have("y_2y_synth") else ("y_2y" if have("y_2y") else None)
-if not y2y_pref:
-    st.error(f"`{YIELD_VIEW}` mist `y_2y_synth`/`y_2y`.")
-    st.stop()
-
-# ---------- SELECT ----------
-select_parts = ["date"]
-for src, alias in [("y_3m","y_3m"), (y2y_pref,"y_2y"), ("y_5y","y_5y"), ("y_10y","y_10y"), ("y_30y","y_30y")]:
-    if have(src): select_parts.append(f"SAFE_CAST({src} AS FLOAT64) AS {alias}")
-for extra in ["spread_10_2", "spread_30_10", "snapshot_date",
-              "y_3m_d1_bp","y_2y_d1_bp","y_5y_d1_bp","y_10y_d1_bp","y_30y_d1_bp"]:
-    if have(extra): select_parts.append(extra)
-for base in ["y_3m","y_2y","y_5y","y_10y","y_30y","spread_10_2","spread_30_10"]:
-    if have(f"{base}_d7"):  select_parts.append(f"SAFE_CAST({base}_d7  AS FLOAT64) AS {base}_d7")
-    if have(f"{base}_d30"): select_parts.append(f"SAFE_CAST({base}_d30 AS FLOAT64) AS {base}_d30")
-
-sql = f"SELECT {', '.join(select_parts)} FROM `{YIELD_VIEW}` ORDER BY date"
-with st.spinner("Data ophalen uit BigQuery…"):
-    df = run_query(sql, timeout=60)
+with st.spinner("Rentes laden…"):
+    df = load_yields()
 if df.empty:
     st.warning("Geen data gevonden."); st.stop()
 
-# ================== BOVENBALK ==================
-cA, cB, cC, cD = st.columns([1.2, 1, 1, 1])
-with cA:
-    strict = st.toggle("Strikt (alle looptijden)", value=False,
-                       help="Uit = alleen 2Y & 10Y verplicht.")
-with cB:
-    round_dp = st.slider("Decimalen", 1, 4, 2)
-with cC:
-    show_table = st.toggle("Toon tabel", value=False)
-with cD:
-    show_recessions = st.toggle("US recessies (NBER)", value=cfg["default_recession_overlay"])
+# ---- Helpers: automatische ranges ----
+def round_to_step(x: float, step: float, up: bool = True) -> float:
+    if step <= 0: 
+        return float(x)
+    return math.ceil(x / step) * step if up else math.floor(x / step) * step
 
-# Filter basis
-df_f = df.copy()
-needed = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_f.columns]
-if strict and needed: df_f = df_f.dropna(subset=needed)
-else:
-    subset = [c for c in ["y_2y","y_10y"] if c in df_f.columns]
-    if subset: df_f = df_f.dropna(subset=subset)
-if df_f.empty: st.info("Na filteren geen data over."); st.stop()
+def suggest_delta_half_range_bp(df: pd.DataFrame, cols: list[str]) -> int:
+    """Robuuste suggestie: 95e percentiel van |Δ1D| per serie, dan max daarvan.
+       Altijd naar boven afronden op 5 bp. Min 15, max 200."""
+    if not cols:
+        return 25
+    best = 0.0
+    for c in cols:
+        d = (df[c].diff() * 100.0).abs()
+        val = np.nanpercentile(d.dropna(), 95) if d.notna().any() else 0.0
+        best = max(best, float(val))
+    best = round_to_step(best, 5.0, up=True)
+    return int(min(max(best, 15), 200))
 
-# ================== PERIODE ==================
-df_f["date"] = pd.to_datetime(df_f["date"])
-dmin, dmax = df_f["date"].min(), df_f["date"].max()
+def suggest_yield_pad_pp(df: pd.DataFrame, cols: list[str]) -> float:
+    """Pad in %-punt rond min/max op basis van IQR: 0.75 * IQR of 10% van span, min 0.30, max 1.50."""
+    if not cols:
+        return 0.60
+    values = pd.concat([df[c] for c in cols], axis=0).dropna()
+    if values.empty:
+        return 0.60
+    q1, q3 = np.nanpercentile(values, [25, 75])
+    iqr = max(q3 - q1, 1e-9)
+    span = float(values.max() - values.min())
+    pad_iqr = 0.75 * float(iqr)
+    pad_span = 0.10 * float(span)
+    pad = max(pad_iqr, pad_span, 0.30)
+    return float(min(pad, 1.50))
 
-st.subheader("Periode")
-left, _ = st.columns([1.75, 1])
-with left:
-    preset = st.radio(
-        "Presets",
-        ["1D","1W","1M","3M","6M","1Y","3Y","5Y","10Y","YTD","Max","Custom"],
-        horizontal=True, index=5
+# ---- UI ----
+looptijd_labels = {
+    "y_3m":  "3m",
+    "y_2y":  "2y",
+    "y_5y":  "5y",
+    "y_10y": "10y",
+    "y_30y": "30y",
+}
+beschikbaar = [c for c in looptijd_labels if c in df.columns and df[c].notna().any()]
+default_selectie = [c for c in ["y_2y", "y_10y", "y_30y"] if c in beschikbaar] or beschikbaar[:3]
+
+col_a, col_b, col_c = st.columns([2.0, 1.2, 1.0])
+with col_a:
+    geselecteerd = st.multiselect(
+        "Selecteer looptijden",
+        options=[(looptijd_labels[c], c) for c in beschikbaar],
+        default=[(looptijd_labels[c], c) for c in default_selectie],
+        format_func=lambda x: x[0],
     )
+    geselecteerd = [c for _, c in geselecteerd]
+with col_b:
+    show_delta = st.toggle("Toon 1D delta (bp) onder de grafiek — één rij per looptijd", value=True)
+with col_c:
+    auto_scale = st.toggle("Automatisch schalen (IQR/percentiel)", value=True)
 
-def clamp(ts: pd.Timestamp) -> pd.Timestamp: return max(dmin, ts)
+with st.sidebar:
+    st.header("Periode")
+    min_d, max_d = df["date"].min().date(), df["date"].max().date()
+    d_range = st.date_input("Periode", value=(min_d, max_d), min_value=min_d, max_value=max_d)
+    if isinstance(d_range, tuple) and len(d_range) == 2:
+        d_start, d_end = pd.to_datetime(d_range[0]), pd.to_datetime(d_range[1])
+        m = (df["date"] >= d_start) & (df["date"] <= d_end)
+        df = df.loc[m].copy()
 
-if preset == "1D":
-    start_date, end_date = clamp(dmax - pd.DateOffset(days=1)), dmax
-elif preset == "1W":
-    start_date, end_date = clamp(dmax - pd.DateOffset(weeks=1)), dmax
-elif preset == "1M":
-    start_date, end_date = clamp(dmax - pd.DateOffset(months=1)), dmax
-elif preset == "3M":
-    start_date, end_date = clamp(dmax - pd.DateOffset(months=3)), dmax
-elif preset == "6M":
-    start_date, end_date = clamp(dmax - pd.DateOffset(months=6)), dmax
-elif preset == "1Y":
-    start_date, end_date = clamp(dmax - pd.DateOffset(years=1)), dmax
-elif preset == "3Y":
-    start_date, end_date = clamp(dmax - pd.DateOffset(years=3)), dmax
-elif preset == "5Y":
-    start_date, end_date = clamp(dmax - pd.DateOffset(years=5)), dmax
-elif preset == "10Y":
-    start_date, end_date = clamp(dmax - pd.DateOffset(years=10)), dmax
-elif preset == "YTD":
-    start_date, end_date = clamp(pd.Timestamp(dmax.year,1,1)), dmax
-elif preset == "Max":
-    start_date, end_date = dmin, dmax
-else:
-    date_range = st.slider(
-        "Selecteer periode (Custom)",
-        min_value=dmin.date(), max_value=dmax.date(),
-        value=(clamp(dmax - pd.DateOffset(years=1)).date(), dmax.date()),
+if not geselecteerd:
+    st.info("Selecteer minimaal één looptijd."); st.stop()
+
+# Handmatige basisinstellingen (kunnen overschreven worden door auto-scale)
+col1, col2, col3 = st.columns([1.3, 1.3, 1.2])
+with col1:
+    pad_pp = st.number_input(
+        "Hoofdgrafiek marge (± %-punt)", min_value=0.0, max_value=5.0, value=0.60, step=0.05,
+        help="Extra verticale ruimte in %-punt boven en onder de rentelijnen."
     )
-    start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+with col2:
+    delta_abs = st.number_input(
+        "Delta-as half-range (bp)", min_value=5, max_value=200, value=25, step=5,
+        help="Symmetrische schaal voor Δ1D-balken (bijv. 25 → ±25 bp)."
+    )
+with col3:
+    broaden = st.button("🔎 Maak assen breder")
 
-mask = (df_f["date"] >= start_date) & (df_f["date"] <= end_date)
-df_range = df_f.loc[mask].copy()
-if df_range.empty: st.info("Geen data in de gekozen periode."); st.stop()
+# ---- Automatische schalen (indien aan) ----
+if auto_scale:
+    pad_pp = suggest_yield_pad_pp(df, geselecteerd)     # vervangt handmatige pad
+    delta_abs = suggest_delta_half_range_bp(df, geselecteerd)  # vervangt handmatige delta
 
-# ================== SNAPSHOTS (gelijke hoogte) ==================
-st.subheader("Term Structure")
+# ---- Extra verbreding via knop ----
+if broaden:
+    pad_pp *= 1.5                 # 50% extra marge op hoofdas
+    delta_abs = int(min(200, round(delta_abs * 1.5 / 5) * 5))  # 50% breder, netjes afronden op 5 bp
 
-df_range["date"] = pd.to_datetime(df_range["date"])
-snap_dates = sorted(df_range["date"].dropna().unique().tolist())
-latest_date = pd.Timestamp(snap_dates[-1])
-one_month_prior = min(snap_dates, key=lambda d: abs(pd.Timestamp(d) - (latest_date - pd.DateOffset(months=1)))) \
-                  if len(snap_dates) else latest_date
+# ---- Δ1D (bp) berekenen ----
+delta_cols = {}
+for c in geselecteerd:
+    dcol = f"{c}_d1bp"
+    df[dcol] = df[c].diff() * 100.0
+    delta_cols[c] = dcol
 
-def fmt_ts(x) -> str: return pd.Timestamp(x).strftime("%Y-%m-%d")
-idx_primary   = len(snap_dates) - 1
-idx_secondary = snap_dates.index(one_month_prior) if one_month_prior in snap_dates else max(0, len(snap_dates)-2)
+# ---- Subplots ----
+n_delta_rows = len(geselecteerd) if show_delta else 0
+rows = 1 + n_delta_rows
+row_heights = [0.72] + [0.28 / max(n_delta_rows, 1)] * n_delta_rows if show_delta else [1.0]
 
-g1, g2, g3, g4 = st.columns([1.25, 0.25, 1.25, 0.9])
-with g1:
-    snap_primary = st.selectbox("Hoofd peildatum", options=snap_dates, index=idx_primary, format_func=fmt_ts, key="snap1")
-with g2:
-    st.write("")  # spacer
-    enable_compare = st.checkbox("Vergelijk", value=True, key="cmp")
-with g3:
-    snap_secondary = st.selectbox("2e peildatum", options=snap_dates, index=idx_secondary,
-                                  format_func=fmt_ts, key="snap2", disabled=(not enable_compare))
-with g4:
-    st.caption("Kies één of twee datums voor de curve.")
-
-snap1 = df_range[df_range["date"] == snap_primary].tail(1)
-snap2 = df_range[df_range["date"] == snap_secondary].tail(1) if enable_compare else pd.DataFrame()
-
-def fmt_pct(x, dp): return "—" if pd.isna(x) else f"{round(float(x), dp)}%"
-
-k1, k2, k3, k4, k5 = st.columns(5)
-for col, box in zip(["y_3m","y_2y","y_5y","y_10y","y_30y"], [k1,k2,k3,k4,k5]):
-    val = fmt_pct(snap1[col].values[0], round_dp) if (col in snap1.columns and not snap1.empty) else "—"
-    box.metric(col.upper().replace("_",""), val)
-
-def curve_points(row: pd.Series):
-    maturities = ["3M", "2Y", "5Y", "10Y", "30Y"]
-    vals = [row.get("y_3m"), row.get("y_2y"), row.get("y_5y"), row.get("y_10y"), row.get("y_30y")]
-    m = [m for m, v in zip(maturities, vals) if pd.notna(v)]
-    v = [v for v in vals if pd.notna(v)]
-    return m, v
-
-ts_fig = go.Figure()
-if not snap1.empty:
-    m, v = curve_points(snap1.iloc[0])
-    ts_fig.add_trace(go.Scatter(x=m, y=v, mode="lines+markers", name=str(pd.Timestamp(snap_primary).date())))
-if enable_compare and not snap2.empty:
-    m2, v2 = curve_points(snap2.iloc[0])
-    ts_fig.add_trace(go.Scatter(x=m2, y=v2, mode="lines+markers",
-                                name=str(pd.Timestamp(snap_secondary).date()), line=dict(dash="dash")))
-ts_fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Maturity")
-st.plotly_chart(ts_fig, use_container_width=True)
-st.caption("Normaal = stijgend; vlak = late cyclus; invers = recessierisico/verwachte cuts.")
-
-# ================== SIGNALS ==================
-st.subheader("Signals")
-sigL, sigR = st.columns([1.3, 1])
-
-with sigR:
-    regime_horizon = st.radio("Regime-horizon", ["7d", "30d"], horizontal=True, index=0)
-    suffix = "_d7" if regime_horizon == "7d" else "_d30"
-    c1, c2 = st.columns(2)
-    with c1:
-        thr_steepen = st.slider("|Δ(10Y–2Y)| drempel (bp)", 5, 60, 10 if regime_horizon=="7d" else 15, step=1)
-    with c2:
-        thr_bigmove  = st.slider("Grote move per reeks (bp)", 5, 60, 12 if regime_horizon=="7d" else 18, step=1)
-
-def last_val(col: str):
-    if col not in df_range.columns: return None
-    s = pd.to_numeric(df_range[col], errors="coerce").dropna()
-    return None if s.empty else float(s.iloc[-1])
-
-d_spread = None
-if f"spread_10_2{suffix}" in df_range.columns:
-    v_pp = last_val(f"spread_10_2{suffix}")
-    d_spread = None if v_pp is None else v_pp * 100.0
-d_2y  = (last_val(f"y_2y{suffix}")  or None)
-d_10y = (last_val(f"y_10y{suffix}") or None)
-d_2y  = None if d_2y is None else d_2y * 100.0
-d_10y = None if d_10y is None else d_10y * 100.0
-
-latest_spread = float(df_range.dropna(subset=["spread_10_2"]).iloc[-1]["spread_10_2"]) if "spread_10_2" in df_range.columns else None
-
-regime = "⏸️ Neutraal"; explanation = []
-if (d_spread is not None) and (d_2y is not None) and (d_10y is not None):
-    if d_spread >= thr_steepen:
-        if d_2y <= 0 and d_10y >= 0:
-            regime = "✅ Bull steepening"; explanation.append("Kort ↓ en Lang ↑ (easing/risico-on).")
-        elif d_2y > 0 and d_10y > 0:
-            regime = "⚠️ Bear steepening"; explanation.append("Beide ↑, lang harder (inflatiepremie).")
-        else:
-            regime = "ℹ️ Mixed steepening"
-    elif d_spread <= -thr_steepen:
-        if d_2y >= 0 and d_10y <= 0:
-            regime = "❌ Bear flattening"; explanation.append("Kort ↑ en Lang ↓ (tightening/groei-stress).")
-        elif d_2y < 0 and d_10y < 0:
-            regime = "🟦 Bull flattening"; explanation.append("Beide ↓, lang harder (flight-to-quality).")
-        else:
-            regime = "ℹ️ Mixed flattening"
-
-with sigL:
-    label = f"{regime} — Δ{regime_horizon}(10Y–2Y): {round(d_spread or 0.0,1)} bp"
-    if regime.startswith("✅"): st.success(label, icon="✅")
-    elif regime.startswith("❌"): st.error(label, icon="❌")
-    elif regime.startswith("⚠️"): st.warning(label, icon="⚠️")
-    elif regime.startswith("🟦"): st.info(label, icon="ℹ️")
-    else: st.info(label, icon="⏸️")
-    if explanation: st.caption(" • ".join(explanation))
-if latest_spread is not None and latest_spread < 0:
-    st.warning(f"🔻 Inversie actief: 10Y–2Y = {round(latest_spread,2)} pp.", icon="🔻")
-else:
-    st.caption(f"10Y–2Y = { '—' if latest_spread is None else str(round(latest_spread,2)) + ' pp' }")
-
-# ================== Spreads ==================
-st.subheader("Spreads")
-if "spread_10_2" in df_range.columns or "spread_30_10" in df_range.columns:
-    sp = go.Figure()
-    if "spread_10_2" in df_range.columns:
-        sp.add_trace(go.Scatter(x=df_range["date"], y=df_range["spread_10_2"], name="10Y - 2Y"))
-    if "spread_30_10" in df_range.columns:
-        sp.add_trace(go.Scatter(x=df_range["date"], y=df_range["spread_30_10"], name="30Y - 10Y"))
-    sp.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Spread (pp)", xaxis_title="Date")
-    sp.update_xaxes(range=[start_date, end_date])
-    sp = add_recession_shapes(sp, pd.to_datetime(start_date), pd.to_datetime(end_date), show_recessions)
-    st.plotly_chart(sp, use_container_width=True)
-
-# ================== Rentes + 1D Δ ==================
-st.subheader("Rentes per looptijd (tijdreeks)")
-avail_yields = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
-default_sel  = [c for c in ["y_2y","y_10y","y_30y"] if c in avail_yields] or avail_yields[:2]
-sel = st.multiselect("Selecteer looptijden", avail_yields, default=default_sel)
-
-show_1d_delta = st.toggle(
-    "Toon 1D delta (bp) onder de grafiek — één rij per looptijd",
-    value=True,
-    help="Gebruikt *_d1_bp indien aanwezig; anders diff()*100."
+fig = make_subplots(
+    rows=rows,
+    cols=1,
+    shared_xaxes=True,
+    vertical_spacing=0.03,
+    row_heights=row_heights,
+    specs=[[{"type": "scatter"}]] + [[{"type": "bar"}] for _ in range(n_delta_rows)],
+    subplot_titles=([""] + [f"{looptijd_labels[c]} Δ1D (bp)" for c in geselecteerd] if show_delta else None)
 )
 
-if sel:
-    def get_1d_delta_bp(df_in: pd.DataFrame, col: str) -> pd.Series:
-        dcol = f"{col}_d1_bp"
-        if dcol in df_in.columns:
-            return pd.to_numeric(df_in[dcol], errors="coerce")
-        s = pd.to_numeric(df_in[col], errors="coerce")
-        return s.diff() * 100.0
+# ---- Hoofdgrafiek ----
+for c in geselecteerd:
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"], y=df[c],
+            mode="lines", name=looptijd_labels[c],
+            hovertemplate=f"%{{x|%Y-%m-%d}}<br>{looptijd_labels[c]}: %{{y:.3f}}%<extra></extra>"
+        ),
+        row=1, col=1
+    )
 
-    n_delta_rows = len(sel) if show_1d_delta else 0
-    total_rows   = 1 + n_delta_rows
-    row_heights = [1.0] if n_delta_rows == 0 else [0.6] + [0.4 / n_delta_rows] * n_delta_rows
+ymin = float(np.nanmin([df[c].min() for c in geselecteerd]))
+ymax = float(np.nanmax([df[c].max() for c in geselecteerd]))
+yrange = [ymin - pad_pp, ymax + pad_pp]
+fig.update_yaxes(title_text="Yield (%)", range=yrange, row=1, col=1, tickformat=".2f")
 
-    fig = make_subplots(rows=total_rows, cols=1, shared_xaxes=True,
-                        row_heights=row_heights, vertical_spacing=0.06)
-
-    for col in sel:
-        fig.add_trace(go.Scatter(x=df_range["date"], y=df_range[col], name=col.upper(), mode="lines"),
-                      row=1, col=1)
-    fig.update_yaxes(title_text="Yield (%)", row=1, col=1)
-
-    if show_1d_delta:
-        for i, col in enumerate(sel, start=2):
-            dser = get_1d_delta_bp(df_range, col)
-            colors = [("#16a34a" if (pd.notna(v) and v >= 0) else "#dc2626") for v in dser]
-            fig.add_trace(go.Bar(x=df_range["date"], y=dser, name=f"{col.upper()} Δ1D (bp)",
-                                 marker_color=colors, showlegend=False),
-                          row=i, col=1)
-            fig.add_hline(y=0, line_width=1, line_color="gray", opacity=0.5, row=i, col=1)
-            fig.update_yaxes(title_text=f"{col.upper()} Δ1D (bp)", row=i, col=1, zeroline=True)
-
-    fig.update_xaxes(title_text="Date", row=total_rows, col=1, range=[start_date, end_date])
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-    if show_recessions:
-        fig = add_recession_shapes(fig, pd.to_datetime(start_date), pd.to_datetime(end_date), show=True)
-    st.plotly_chart(fig, use_container_width=True)
-
-# ================== Heatmap ==================
-st.subheader("Heatmap van rentes")
-avail_yields_hm = [c for c in ["y_3m","y_2y","y_5y","y_10y","y_30y"] if c in df_range.columns]
-if avail_yields_hm:
-    hm = df_range[["date"] + avail_yields_hm].set_index("date")
-    hfig = go.Figure(data=go.Heatmap(
-        z=hm[avail_yields_hm].T.values, x=hm.index.astype(str),
-        y=[c.replace("y_","").upper() for c in avail_yields_hm], coloraxis="coloraxis"
-    ))
-    hfig.update_layout(margin=dict(l=10,r=10,t=10,b=10), coloraxis_colorscale="Viridis")
-    st.plotly_chart(hfig, use_container_width=True)
-
-# ================== Δ DELTAS — HISTOGRAMMEN (bp & %) ==================
-st.header("Δ Deltas (basispunten)")
-
-# Beschikbare horizons: 1d (bp), 7d/30d (pp → *100 naar bp)
-bases = ["y_3m","y_2y","y_5y","y_10y","y_30y","spread_10_2","spread_30_10"]
-available_horizons = [("1d","_d1_bp")]
-if any([(f"{b}_d7" in df_range.columns) for b in bases]):  available_horizons.append(("7d","_d7"))
-if any([(f"{b}_d30" in df_range.columns) for b in bases]): available_horizons.append(("30d","_d30"))
-
-# 1) HISTOGRAMMEN
-st.subheader("Histogram Δ (laatste periode)")
-if available_horizons:
-    hsel = st.selectbox("Horizon", [h for h,_ in available_horizons], index=0, key="hist_h")
-    suf  = dict(available_horizons)[hsel]
-
-    # metric-keuze
-    candidates, labels_map = [], {}
-    for base, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
-                        ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]:
-        col = f"{base}{suf}"
-        if (hsel == "1d") or (col in df_range.columns):
-            candidates.append((base, col))
-            labels_map[(base, col)] = f"{label} ({hsel})"
-
-    if candidates:
-        def_idx = 0
-        for i, (b, _) in enumerate(candidates):
-            if b == "y_10y": def_idx = i; break
-
-        pick_base, pick_col = st.selectbox(
-            "Metric", candidates, index=def_idx,
-            format_func=lambda t: labels_map.get(t, t[0]), key="hist_metric",
+# ---- Delta-rijen ----
+if show_delta:
+    for i, c in enumerate(geselecteerd, start=2):
+        dcol = delta_cols[c]
+        pos = df[dcol].clip(lower=0)
+        neg = df[dcol].clip(upper=0)
+        fig.add_trace(
+            go.Bar(
+                x=df["date"], y=pos, name=f"{looptijd_labels[c]} +",
+                marker_color="rgba(0,160,0,0.85)",
+                hovertemplate=f"%{{x|%Y-%m-%d}}<br>Δ1D: %{{y:.1f}} bp<extra></extra>",
+                showlegend=False
+            ),
+            row=i, col=1
+        )
+        fig.add_trace(
+            go.Bar(
+                x=df["date"], y=neg, name=f"{looptijd_labels[c]} -",
+                marker_color="rgba(200,0,0,0.85)",
+                hovertemplate=f"%{{x|%Y-%m-%d}}<br>Δ1D: %{{y:.1f}} bp<extra></extra>",
+                showlegend=False
+            ),
+            row=i, col=1
+        )
+        fig.update_yaxes(
+            title_text=f"{looptijd_labels[c]} Δ1D (bp)",
+            range=[-float(delta_abs), float(delta_abs)],
+            row=i, col=1
         )
 
-        # Abs Δ (bp)
-        if hsel == "1d":
-            if f"{pick_base}_d1_bp" in df_range.columns:
-                series_bp = pd.to_numeric(df_range[f"{pick_base}_d1_bp"], errors="coerce")
-            else:
-                series_bp = pd.to_numeric(df_range[pick_base], errors="coerce").diff() * 100.0
-            base_series_pp = pd.to_numeric(df_range[pick_base], errors="coerce")
-            delta_pp = series_bp / 100.0
-        else:
-            series_bp = pd.to_numeric(df_range[pick_col], errors="coerce") * 100.0  # pp → bp
-            base_series_pp = pd.to_numeric(df_range[pick_base], errors="coerce")
-            delta_pp = pd.to_numeric(df_range[pick_col], errors="coerce")           # pp
+# ---- Layout ----
+tot_height = 520 + (n_delta_rows * 140)
+fig.update_layout(
+    height=tot_height,
+    margin=dict(l=40, r=20, t=40, b=40),
+    barmode="relative",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
+)
+fig.update_xaxes(title_text="Date", row=rows, col=1)
 
-        series_bp = series_bp.replace([np.inf, -np.inf], np.nan).dropna()
+# ---- Render ----
+st.plotly_chart(fig, use_container_width=True)
 
-        # Relatieve Δ (%)
-        prev_pp = base_series_pp.shift(1).replace(0, np.nan)
-        series_pct = (delta_pp / prev_pp) * 100.0
-        series_pct = series_pct.replace([np.inf, -np.inf], np.nan).dropna()
-
-        h1, h2 = st.columns(2)
-        with h1:
-            hfig = go.Figure(data=[go.Histogram(x=series_bp, nbinsx=40)])
-            hfig.update_layout(title="Absolute Δ (bp)", margin=dict(l=10,r=10,t=30,b=10),
-                               xaxis_title="Δ (bp)", yaxis_title="Aantal dagen", bargap=0.05)
-            st.plotly_chart(hfig, use_container_width=True)
-        with h2:
-            hfig2 = go.Figure(data=[go.Histogram(x=series_pct, nbinsx=40)])
-            hfig2.update_layout(title="Relatieve Δ (%)", margin=dict(l=10,r=10,t=30,b=10),
-                                xaxis_title="Δ (%)", yaxis_title="Aantal dagen", bargap=0.05)
-            st.plotly_chart(hfig2, use_container_width=True)
-    else:
-        st.info("Geen delta-kolommen voor deze horizon.")
-
-# 2) TIJDREEKS
-st.subheader("Delta tijdreeks")
-if available_horizons:
-    hsel2 = st.selectbox("Horizon (tijdreeks)", [h for h,_ in available_horizons], index=0, key="ts_h")
-    suf2  = dict(available_horizons)[hsel2]
-    candidates, labels_map = [], {}
-    for base, label in [("y_3m","3M"), ("y_2y","2Y"), ("y_5y","5Y"), ("y_10y","10Y"), ("y_30y","30Y"),
-                        ("spread_10_2","10Y-2Y"), ("spread_30_10","30Y-10Y")]:
-        col = f"{base}{suf2}"
-        if (hsel2 == "1d") or (col in df_range.columns):
-            candidates.append(col); labels_map[col] = f"{label} ({hsel2})"
-    default_pick = [c for c in candidates if c.startswith("y_10y")] or candidates[:1]
-    choose = st.multiselect("Kies metrics", candidates, default=default_pick,
-                            format_func=lambda c: labels_map.get(c, c))
-    if choose:
-        figd = go.Figure()
-        for c in choose:
-            if suf2 == "_d1_bp":
-                yvals_bp = pd.to_numeric(df_range[c], errors="coerce")         # al bp
-            else:
-                yvals_bp = pd.to_numeric(df_range[c], errors="coerce") * 100.0 # pp → bp
-            colors = [("#16a34a" if (pd.notna(v) and v >= 0) else "#dc2626") for v in yvals_bp]
-            figd.add_trace(go.Bar(x=df_range["date"], y=yvals_bp,
-                                  name=labels_map.get(c, c), marker_color=colors,
-                                  opacity=(0.8 if len(choose)>1 else 1)))
-        figd.add_hline(y=0, line_width=1, line_color="gray", opacity=0.5)
-        figd.update_layout(margin=dict(l=10, r=10, t=10, b=10),
-                           barmode=("overlay" if len(choose)>1 else "group"),
-                           yaxis_title="Δ (bp)", xaxis_title="Date")
-        figd.update_xaxes(range=[start_date, end_date])
-        st.plotly_chart(figd, use_container_width=True)
-
-# ================== Tabel + download ==================
-if show_table:
-    st.subheader("Tabel")
-    st.dataframe(df_range.sort_values("date", ascending=False).round(round_dp))
-
-csv = df_range.to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Download CSV (gefilterd op periode)", data=csv,
-                   file_name=f"yield_curve_filtered_{region.lower()}.csv", mime="text/csv")
+with st.expander("ℹ️ Uitleg/instellingen"):
+    st.markdown(
+        f"""
+- **Automatisch schalen** gebruikt robuuste statistiek:
+  - Hoofdas-marge: max(**0.75×IQR**, **10% van span**), begrensd op **0.30–1.50 %-punt**.
+  - Delta-half-range: **95e percentiel** van |Δ1D| over de selectie, afgerond op **5 bp**, begrensd op **15–200 bp**.
+- **🔎 Maak assen breder** vergroot in één klik de hoofd-marge met **+50%** en de delta-range met **+50%**.
+- Zet **Automatisch schalen** uit als je handmatig vaste waarden wil (velden boven de knop).
+"""
+    )
