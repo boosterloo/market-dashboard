@@ -1,13 +1,14 @@
-# pages/Yield_Combined.py — US/EU in één pagina, simpele layout: 2 hoofdgrafieken + deselect via legenda
-# - Linker (grijze) sidebar bevat alle keuzes (regio, looptijden, periode, y-as marge)
-# - Grafiek 1: Yield curve (term structure) op gekozen peildatum
-# - Grafiek 2: Ontwikkeling per looptijd (tijdreeks) — US & EU naast/over elkaar
-# - Klik op de legenda om lijnen aan/uit te zetten (deselecteren)
+# pages/Yield_Combined.py — US/EU combi met échte autoscaling, duidelijke regio‑weergave en periodekeuze
+# Verbeteringen:
+# - Y‑assen autoscaling per grafiek met royale marge + minimale span (bijna vlakke lijnen worden leesbaar)
+# - Periode‑slider robuust (fallback als min==max, gebruik unieke datums)
+# - Yield curve toont altijd US én/óf EU duidelijk; legenda toggles werken; hover info strak
+# - Tijdreeks per tenor met dezelfde autoscaling‑logica en subplot‑titels
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import timedelta
+from datetime import timedelta, date as date_cls
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from utils.bq import run_query, bq_ping
@@ -62,18 +63,24 @@ def nice_tenor(t: str) -> str:
         return core.upper()
     return t.upper()
 
-def axis_range(values: pd.Series, pad_pct: float, symmetric: bool=False):
-    vals = pd.Series(values).dropna()
+# Autoscaling met royale marge en minimale span (in percentagepunt)
+def axis_range(values: pd.Series, pad_pct: float, min_span_pp: float = 0.30, symmetric: bool=False):
+    vals = pd.Series(values).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
     if vals.empty:
         return None
+    vmin, vmax = float(vals.min()), float(vals.max())
+    span = max(vmax - vmin, 0.0)
+    # als bijna vlak: forceer minimale span rond het midden
+    if span < min_span_pp:
+        mid = (vmax + vmin) / 2.0
+        half = min_span_pp / 2.0
+        vmin, vmax = mid - half, mid + half
+        span = min_span_pp
     if symmetric:
-        a = float(vals.abs().max())
+        a = max(abs(vmin), abs(vmax))
         pad = a * (pad_pct/100.0)
         return (-a - pad, a + pad)
-    vmin, vmax = float(vals.min()), float(vals.max())
-    span = vmax - vmin
-    base = max(abs(vmin), abs(vmax), span)
-    pad = base * (pad_pct/100.0)
+    pad = span * (pad_pct/100.0)
     return (vmin - pad, vmax + pad)
 
 # -------------------- Data -----------------------
@@ -102,19 +109,31 @@ with st.sidebar:
     tenors = st.multiselect("Looptijden", TENOR_ORDER, default=default_tenors)
 
     # Periode voor tijdreeks (tweede grafiek)
-    min_d, max_d = all_df["date"].min(), all_df["date"].max()
+    # Gebruik unieke datums om slider te laten werken bij gaten
+    date_series = all_df["date"].dropna().sort_values().unique()
+    if len(date_series) < 2:
+        min_d = max_d = date_series[0]
+    else:
+        min_d, max_d = date_series[0], date_series[-1]
     default_days = 365
-    start_default = max(min_d, max_d - timedelta(days=default_days))
-    rng = st.slider("Periode (tijdreeks)", min_value=min_d, max_value=max_d,
-                    value=(start_default, max_d), format="YYYY-MM-DD")
+    start_default = (max_d - timedelta(days=default_days)) if isinstance(max_d, date_cls) else max_d
+    start_default = max(min_d, start_default)
+    periode = st.slider(
+        "Periode (tijdreeks)", min_value=min_d, max_value=max_d,
+        value=(start_default, max_d), format="YYYY-MM-DD"
+    ) if len(date_series) >= 2 else (min_d, max_d)
 
-    # Peildatum voor yield curve (eerste grafiek) — standaard laatste dag in de range
-    last_in_range = max_d if rng is None else rng[1]
-    curve_date = st.date_input("Peildatum (yield curve)", value=last_in_range,
-                               min_value=min_d, max_value=max_d)
+    # Peildatum voor yield curve (eerste grafiek) — standaard rechter eindpunt van periode
+    last_in_range = periode[1]
+    curve_date = st.date_input(
+        "Peildatum (yield curve)", value=last_in_range,
+        min_value=min_d, max_value=max_d,
+        help="Kies de datum voor de term-structure."
+    )
 
-    # Royale y-assen
-    ypad = st.slider("Y-as marge (royale ruimte, %)", 20, 120, 60, step=5)
+    # Royale y-assen: standaard 60% extra marge
+    ypad = st.slider("Y-as marge (royale ruimte, %)", 20, 120, 60, step=5,
+                     help="Extra witruimte boven/onder de datarange. Min. span 0.30 pp.")
 
 if not regions:
     st.info("Kies minimaal één regio."); st.stop()
@@ -128,41 +147,50 @@ f = f.sort_values(["region","tenor","date"]).reset_index(drop=True)
 
 # -------------------- Grafiek 1: Yield Curve --------------------
 st.subheader("Yield curve (term structure)")
-curve = f[f["date"]==curve_date]
-if curve.empty:
-    # fallback: dichtstbijzijnde datum vóór peildatum binnen dataset
-    prior = f[f["date"]<=curve_date]
-    if not prior.empty:
-        use_d = prior["date"].max()
-        curve = prior[prior["date"]==use_d]
-        st.caption(f"Geen exacte match op {curve_date}; toon {use_d}.")
+
+# Kies dichtstbijzijnde beschikbare datum <= curve_date
+curve_pool = f[f["date"] <= curve_date]
+if curve_pool.empty:
+    # als alles na curve_date ligt: pak eerste datum erna
+    curve_pool = f[f["date"] >= curve_date]
+use_d = curve_pool["date"].max() if not curve_pool.empty else None
 
 fig_curve = go.Figure()
-yvals = []
-for reg in sorted(curve["region"].unique()):
-    sub = curve[curve["region"]==reg].sort_values("tenor")
-    if sub.empty: continue
-    yvals.append(sub["value"]) 
-    fig_curve.add_trace(go.Scatter(
-        x=[nice_tenor(t) for t in sub["tenor"]],
-        y=sub["value"], mode="lines+markers",
-        name=f"{reg}", legendgroup=reg
-    ))
-if yvals:
-    rng_y = axis_range(pd.concat(yvals, ignore_index=True), pad_pct=ypad)
-    if rng_y:
-        fig_curve.update_yaxes(range=list(rng_y))
-fig_curve.update_layout(height=460, margin=dict(l=10,r=10,t=10,b=10), legend_title_text="Regio")
-st.plotly_chart(fig_curve, use_container_width=True)
+if use_d is None:
+    st.info("Geen data rond de gekozen peildatum.")
+else:
+    curve = f[f["date"]==use_d]
+    if curve.empty:
+        st.info("Geen data exact op peildatum.")
+    else:
+        yvals = []
+        for reg in sorted(curve["region"].unique()):
+            sub = curve[curve["region"]==reg].sort_values("tenor")
+            if sub.empty: continue
+            yvals.append(sub["value"]) 
+            fig_curve.add_trace(go.Scatter(
+                x=[nice_tenor(t) for t in sub["tenor"]],
+                y=sub["value"], mode="lines+markers",
+                name=f"{reg}", legendgroup=reg,
+                hovertemplate="%{x}: %{y:.2f}%<extra>"+reg+"</extra>"
+            ))
+        rng_y = axis_range(pd.concat(yvals, ignore_index=True) if yvals else pd.Series(dtype=float), pad_pct=ypad)
+        if rng_y:
+            fig_curve.update_yaxes(range=list(rng_y))
+        fig_curve.update_layout(
+            height=480, margin=dict(l=10,r=10,t=30,b=10), legend_title_text="Regio",
+            title=f"Term-structure op {use_d}"
+        )
+        st.plotly_chart(fig_curve, use_container_width=True)
 
-st.caption("Hint: klik op items in de legenda om lijnen te (de)selecteren.")
+st.caption("Legenda = toggle: klik om US of EU (de)selecteren. Lijnen schalen automatisch met royale marge.")
 
 st.divider()
 
 # -------------------- Grafiek 2: Ontwikkeling per looptijd --------------------
 st.subheader("Ontwikkeling per looptijd (tijdreeks)")
 
-mask = (f["date"]>=rng[0]) & (f["date"]<=rng[1])
+mask = (f["date"]>=periode[0]) & (f["date"]<=periode[1])
 ft = f.loc[mask].copy()
 if ft.empty:
     st.info("Geen data in de gekozen periode.")
@@ -173,21 +201,23 @@ else:
     for i, t in enumerate(tenors, start=1):
         sub = ft[ft["tenor"]==t]
         if sub.empty: continue
-        ybucket = []
+        buckets = []
         for reg in sorted(sub["region"].unique()):
             s2 = sub[sub["region"]==reg].dropna(subset=["value"])
-            ybucket.append(s2["value"]) 
+            buckets.append(s2["value"]) 
             fig_ts.add_trace(
-                go.Scatter(x=s2["date"], y=s2["value"], mode="lines",
-                           name=f"{reg} — {nice_tenor(t)}", legendgroup=reg,
-                           showlegend=(i==1)),
-                row=i, col=1
+                go.Scatter(
+                    x=s2["date"], y=s2["value"], mode="lines",
+                    name=f"{reg} — {nice_tenor(t)}", legendgroup=reg,
+                    showlegend=(i==1), hovertemplate="%{x}<br>%{y:.2f}%<extra>"+reg+"</extra>"
+                ), row=i, col=1
             )
-        rng_y = axis_range(pd.concat(ybucket, ignore_index=True) if ybucket else pd.Series(dtype=float), pad_pct=ypad)
+        rng_y = axis_range(pd.concat(buckets, ignore_index=True) if buckets else pd.Series(dtype=float),
+                           pad_pct=ypad, min_span_pp=0.30)
         if rng_y:
             fig_ts.update_yaxes(range=list(rng_y), row=i, col=1)
 
-    fig_ts.update_layout(height=260*rows+60, margin=dict(l=10,r=10,t=40,b=10))
+    fig_ts.update_layout(height=280*rows+60, margin=dict(l=10,r=10,t=40,b=10))
     st.plotly_chart(fig_ts, use_container_width=True)
 
-st.caption("Legenda = toggle: je kunt per regio/looptijd lijnen verbergen voor snelle vergelijkingen.")
+st.caption("Tip: gebruik de slider links voor de periode. Y‑assen autoscalen royaal; bij vlakke reeksen wordt minimaal 0.30 pp span afgedwongen.")
