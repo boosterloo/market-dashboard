@@ -1,5 +1,5 @@
 # pages/Gold_Analytics.py
-# 🏅 Gold Analytics — Price • TA • Drivers • Correlations • Beta/Scatter • Alerts
+# 🏅 Gold Analytics — Price • TA • Drivers • Correlations • Multi-Scatter/Beta • Tunable Alerts
 
 import streamlit as st
 import pandas as pd
@@ -7,6 +7,7 @@ import numpy as np
 from datetime import timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from google.api_core.exceptions import NotFound, BadRequest, Forbidden
 
 # ---------- BigQuery helpers ----------
 try:
@@ -35,12 +36,18 @@ except Exception:
 
 # ---------- Page config ----------
 st.set_page_config(page_title="🏅 Gold Analytics", layout="wide")
-st.title("🏅 Gold Analytics — Price • TA • Drivers • Correlations • Beta/Scatter • Alerts")
+st.title("🏅 Gold Analytics — Price • TA • Drivers • Correlations • Multi-Scatter/Beta • Alerts")
 
 # ---------- Sources ----------
 TABLES = st.secrets.get("tables", {})
 COM_WIDE_VIEW     = TABLES.get("commodities_wide_view", "nth-pier-468314-p7.marketdata.commodity_prices_wide_v")
 DRIVERS_WIDE_VIEW = TABLES.get("gold_drivers_wide_view", "nth-pier-468314-p7.marketdata.gold_drivers_wide_v")
+
+with st.expander("🔎 Debug: gebruikte bronnen", expanded=False):
+    st.write({
+        "commodities_wide_view": COM_WIDE_VIEW,
+        "gold_drivers_wide_view": DRIVERS_WIDE_VIEW
+    })
 
 # ---------- Health ----------
 try:
@@ -63,30 +70,42 @@ def load_com() -> pd.DataFrame:
     return df
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_drv() -> pd.DataFrame:
-    df = run_query(f"SELECT * FROM `{DRIVERS_WIDE_VIEW}` ORDER BY date")
-    if df.empty: return df
-    df["date"] = pd.to_datetime(df["date"])
-    for c in df.columns:
-        if c != "date": df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+def load_drv_safe() -> pd.DataFrame:
+    """Laad drivers; bij NotFound/Forbidden/BadRequest -> lege DF en waarschuwing."""
+    try:
+        q = f"SELECT * FROM `{DRIVERS_WIDE_VIEW}` ORDER BY date"
+        df = run_query(q)
+        if df.empty: return df
+        df["date"] = pd.to_datetime(df["date"])
+        for c in df.columns:
+            if c != "date": df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df
+    except (NotFound, Forbidden):
+        st.warning(f"Drivers-view niet gevonden of geen rechten: `{DRIVERS_WIDE_VIEW}`. "
+                   f"Door met alleen Gold (zonder overlays/correlaties/scatter).")
+        return pd.DataFrame()
+    except BadRequest:
+        st.warning(f"Drivers-view onleesbaar (BadRequest): `{DRIVERS_WIDE_VIEW}`. "
+                   f"Door met alleen Gold.")
+        return pd.DataFrame()
+    except Exception as e:
+        st.warning(f"Kon drivers niet laden ({type(e).__name__}). Door met alleen Gold.")
+        return pd.DataFrame()
 
 df_com = load_com()
-df_drv = load_drv()
+df_drv = load_drv_safe()
 if df_com.empty:
     st.warning("Geen data in commodities wide view.")
     st.stop()
 
-have = set(df_com.columns) | set(df_drv.columns)
-if "gold_close" not in have:
-    st.error("Vereiste kolom ontbreekt: gold_close")
-    st.stop()
+# Alleen relevante commodity-kolommen
+com_cols = ["date"] + [c for c in df_com.columns if c.startswith("gold_") or c == "silver_close"]
 
-# Merge (outer) & housekeeping
-df = pd.merge(
-    df_com[["date"] + [c for c in df_com.columns if c.startswith("gold_") or c in ["silver_close"]]],
-    df_drv, on="date", how="outer"
-).sort_values("date").drop_duplicates(subset=["date"]).reset_index(drop=True)
+if df_drv.empty:
+    df = df_com[com_cols].sort_values("date").drop_duplicates(subset=["date"]).reset_index(drop=True)
+else:
+    df = pd.merge(df_com[com_cols], df_drv, on="date", how="outer") \
+           .sort_values("date").drop_duplicates(subset=["date"]).reset_index(drop=True)
 
 # ---------- Helpers ----------
 def ema(series: pd.Series, span: int) -> pd.Series:
@@ -103,12 +122,21 @@ def normalize_100(series: pd.Series) -> pd.Series:
     base = s.dropna().iloc[0] if s.notna().any() else np.nan
     return s/base*100.0 if pd.notna(base) and base not in (0, np.nan) else s
 
-def pct_as_str(x):
-    return "—" if pd.isna(x) else f"{x:.2f}%"
+def pct_as_str(x): return "—" if pd.isna(x) else f"{x:.2f}%"
+
+def regress_xy(xv: np.ndarray, yv: np.ndarray):
+    slope, intercept = np.polyfit(xv, yv, 1)
+    y_hat = slope*xv + intercept
+    ss_res = np.sum((yv - y_hat)**2)
+    ss_tot = np.sum((yv - np.mean(yv))**2)
+    r2 = 1 - ss_res/ss_tot if ss_tot != 0 else np.nan
+    corr = np.corrcoef(xv, yv)[0,1] if len(xv) > 1 else np.nan
+    return slope, intercept, r2, corr
 
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("⚙️ Instellingen")
+
     DRIVER_MAP = {
         "BTC (BTCUSD)": "btc_close",
         "DXY (Dollar Index)": "dxy_close",
@@ -121,44 +149,75 @@ with st.sidebar:
     }
     driver_choices = [n for n,c in DRIVER_MAP.items() if c in df.columns and df[c].notna().any()]
 
+    # Overlay & deltas
     view_mode = st.radio("Overlayschaling", ["Genormaliseerd (=100)", "Eigen schaal (2e y-as)"], index=0)
     show_delta = st.checkbox("Δ%-bars tonen (Gold)", value=True)
 
+    # --- Signals (tunable) ---
     st.divider()
-    st.markdown("#### VIX & correlatie")
+    st.markdown("#### 🔔 Signals & thresholds")
+    ema_fast = st.number_input("EMA fast", 5, 100, 20, step=1)
+    ema_mid  = st.number_input("EMA mid", 10, 150, 50, step=1)
+    ema_slow = st.number_input("EMA slow", 50, 400, 200, step=5)
+
+    vix_z_hi = st.slider("VIX z-score (20d) — spike drempel", 0.5, 4.0, 2.0, 0.1)
+    vix_z_lo = st.slider("VIX z-score (20d) — 'laag' drempel", -3.0, -0.5, -1.5, 0.1)
+
+    trend_look = st.slider("Lookback (dagen) voor trend drivers", 5, 60, 20, 1)
+    trend_thr  = st.number_input("Trend drempel (Δ over lookback, units driver)", -5.0, 5.0, 0.0, step=0.1)
+
+    corr_win = st.slider("Rolling corr window (dagen)", 10, 180, 60, 5)
+    corr_neg_dxy = st.slider("Negatieve corr-drempel (Gold–DXY)", -1.0, 0.0, -0.6, 0.05)
+    corr_neg_yld = st.slider("Negatieve corr-drempel (Gold–US10Y)", -1.0, 0.0, -0.5, 0.05)
+
+    # VIX overlay
+    st.divider()
+    st.markdown("#### VIX & plot")
     vix_avail = ("vix_close" in df.columns) and df["vix_close"].notna().any()
     show_vix = st.toggle("VIX overlay in prijs-paneel", value=vix_avail, disabled=not vix_avail)
     vix_as_z = st.checkbox("Plot VIX als z-score (20d)", value=False, disabled=not vix_avail)
-    corr_win = st.slider("Rolling corr window (dagen)", 10, 180, 60, 5)
 
+    # Scatter
     st.divider()
-    st.markdown("#### Beta/Scatter")
-    scatter_driver = st.selectbox("Driver voor scatter", driver_choices, index=driver_choices.index("US 10Y (yield %)") if "US 10Y (yield %)" in driver_choices else 0)
-    scatter_mode = st.radio("Transformatie", ["%-returns vs %-returns", "Levels vs Levels"], index=0, horizontal=False)
-    # hint: voor yields/vol is 'Levels' vaak zinvoller; voor assets '%-returns'
+    st.markdown("#### Scatter/Beta")
+    scatter_mode = st.radio("Transformatie", ["%-returns vs %-returns", "Levels vs Levels"], index=0)
+    scatter_drivers = st.multiselect(
+        "Drivers voor scatter/beta",
+        options=driver_choices,
+        default=[x for x in ["US 10Y (yield %)","DXY (Dollar Index)","BTC (BTCUSD)","VIX"] if x in driver_choices],
+        disabled=(len(driver_choices) == 0)
+    )
 
-# ---------- Periode (bovenaan) ----------
+# ---------- Periode ----------
+if "date" not in df.columns or df["date"].isna().all():
+    st.error("Geen geldige 'date' kolom na merge — check views.")
+    st.stop()
+
 min_d, max_d = df["date"].min().date(), df["date"].max().date()
 default_start = max(max_d - timedelta(days=365), min_d)
 start_d, end_d = st.slider("📅 Periode", min_value=min_d, max_value=max_d,
                            value=(default_start, max_d), step=timedelta(days=1), format="YYYY-MM-DD")
+
 mask = (df["date"].dt.date >= start_d) & (df["date"].dt.date <= end_d)
 d = df.loc[mask].copy()
 if d.empty:
     st.info("Geen data in de gekozen periode."); st.stop()
 
+# ---------- EMAs (bereken indien nodig met ingestelde spans) ----------
+if f"gold_ma{ema_fast}" not in d.columns: d[f"gold_ma{ema_fast}"] = ema(d["gold_close"], ema_fast)
+if f"gold_ma{ema_mid}"  not in d.columns: d[f"gold_ma{ema_mid}"]  = ema(d["gold_close"], ema_mid)
+if f"gold_ma{ema_slow}" not in d.columns: d[f"gold_ma{ema_slow}"] = ema(d["gold_close"], ema_slow)
+
 # ---------- KPI’s ----------
 st.subheader("KPI’s")
-if not {"gold_ma20","gold_ma50","gold_ma200"} <= set(d.columns):
-    d["gold_ma20"] = ema(d["gold_close"], 20)
-    d["gold_ma50"] = ema(d["gold_close"], 50)
-    d["gold_ma200"] = ema(d["gold_close"], 200)
-
 last = d.dropna(subset=["gold_close"]).tail(1)
 gold_last = float(last["gold_close"].iloc[0]) if not last.empty else np.nan
-gold_dpct = (d["gold_delta_pct"].dropna().iloc[-1]*100.0) if ("gold_delta_pct" in d.columns and d["gold_delta_pct"].notna().any()) else ((d["gold_close"].pct_change().dropna().iloc[-1])*100.0 if d["gold_close"].notna().sum()>=2 else np.nan)
+if "gold_delta_pct" in d.columns and d["gold_delta_pct"].notna().any():
+    gold_dpct = d["gold_delta_pct"].dropna().iloc[-1]*100.0
+else:
+    gold_dpct = (d["gold_close"].pct_change().dropna().iloc[-1]*100.0) if d["gold_close"].notna().sum()>=2 else np.nan
 
-def last_val(col): 
+def last_val(col):
     return (float(d[col].dropna().iloc[-1]) if col in d.columns and d[col].notna().any() else np.nan)
 
 k1, k2, k3, k4 = st.columns(4)
@@ -167,54 +226,60 @@ k2.metric("US 10Y", pct_as_str(last_val("us10y")))
 k3.metric("Real 10Y", pct_as_str(last_val("tips10y_real")))
 k4.metric("VIX", f"{last_val('vix_close'):.2f}" if pd.notna(last_val("vix_close")) else "—")
 
-# ---------- Alerts ----------
-st.subheader("📣 Signal Alerts")
+# ---------- Alerts (tunable) ----------
+st.subheader("📣 Signal Alerts (config via sidebar)")
 alerts = []
 
-# Trend regime + crosses
-up_regime   = (d["gold_close"].iloc[-1] > d["gold_ma200"].iloc[-1]) and (d["gold_ma50"].iloc[-1] > d["gold_ma200"].iloc[-1])
-down_regime = (d["gold_close"].iloc[-1] < d["gold_ma200"].iloc[-1]) and (d["gold_ma50"].iloc[-1] < d["gold_ma200"].iloc[-1])
-if up_regime: alerts.append(("green","Bullish regime","Close > EMA200 en EMA50 > EMA200"))
-elif down_regime: alerts.append(("red","Bearish regime","Close < EMA200 en EMA50 < EMA200"))
+maF, maM, maS = d[f"gold_ma{ema_fast}"], d[f"gold_ma{ema_mid}"], d[f"gold_ma{ema_slow}"]
+close_now = d["gold_close"].iloc[-1]
+up_regime   = (close_now > maS.iloc[-1]) and (maM.iloc[-1] > maS.iloc[-1])
+down_regime = (close_now < maS.iloc[-1]) and (maM.iloc[-1] < maS.iloc[-1])
+if up_regime:   alerts.append(("green","Bullish regime", f"Close > EMA{ema_slow} en EMA{ema_mid} > EMA{ema_slow}"))
+elif down_regime: alerts.append(("red","Bearish regime", f"Close < EMA{ema_slow} en EMA{ema_mid} < EMA{ema_slow}"))
 
-if len(d) >= 2:
-    cross_up = (d["gold_ma50"].shift(1).iloc[-1] <= d["gold_ma200"].shift(1).iloc[-1]) and (d["gold_ma50"].iloc[-1] > d["gold_ma200"].iloc[-1])
-    cross_dn = (d["gold_ma50"].shift(1).iloc[-1] >= d["gold_ma200"].shift(1).iloc[-1]) and (d["gold_ma50"].iloc[-1] < d["gold_ma200"].iloc[-1])
-    if cross_up: alerts.append(("green","Golden cross","EMA50 kruist ↑ EMA200"))
-    if cross_dn: alerts.append(("red","Death cross","EMA50 kruist ↓ EMA200"))
+def crossed(a: pd.Series, b: pd.Series, up=True):
+    if len(a) < 2 or len(b) < 2: return False
+    if up:
+        return (a.shift(1).iloc[-1] <= b.shift(1).iloc[-1]) and (a.iloc[-1] > b.iloc[-1])
+    return (a.shift(1).iloc[-1] >= b.shift(1).iloc[-1]) and (a.iloc[-1] < b.iloc[-1])
 
-# Macro drivers: daling yields/DXY ondersteunt goud
-def trend_down(col, look=10, thr=0.0):
+if crossed(maM, maS, up=True):  alerts.append(("green","Golden cross", f"EMA{ema_mid} ↑ EMA{ema_slow}"))
+if crossed(maM, maS, up=False): alerts.append(("red","Death cross",  f"EMA{ema_mid} ↓ EMA{ema_slow}"))
+
+# Macro trends
+def trend_down(col: str, look: int, thr: float) -> bool:
     if col not in d.columns or d[col].notna().sum() < 2: return False
     s = d[col].dropna()
-    return (s.iloc[-1] - s.iloc[max(len(s)-look,0)]) < thr
+    if len(s) < look+1: return False
+    return (s.iloc[-1] - s.iloc[-1-look]) < thr
 
-if trend_down("tips10y_real", look=20, thr=0): alerts.append(("green","Real yield ↓","TIPS 10Y daalt over ~20d"))
-if trend_down("us10y", look=20, thr=0): alerts.append(("green","US 10Y ↓","Nominale 10Y daalt over ~20d"))
-if trend_down("dxy_close", look=20, thr=0): alerts.append(("green","DXY ↓","Dollar index daalt over ~20d"))
+if trend_down("tips10y_real", trend_look, trend_thr):
+    alerts.append(("green","Real yield ↓", f"TIPS10Y Δ{trend_look}d < {trend_thr:.2f}"))
+if trend_down("us10y", trend_look, trend_thr):
+    alerts.append(("green","US 10Y ↓", f"US10Y Δ{trend_look}d < {trend_thr:.2f}"))
+if trend_down("dxy_close", trend_look, trend_thr):
+    alerts.append(("green","DXY ↓", f"DXY Δ{trend_look}d < {trend_thr:.2f}"))
 
-# VIX regime
+# VIX regime (z-score 20d)
 if "vix_close" in d.columns and d["vix_close"].notna().sum() >= 21:
     vz = zscore(d["vix_close"], 20).iloc[-1]
-    if pd.notna(vz) and vz >= 2.0: alerts.append(("orange","VIX-spike","VIX z≥2 (20d)"))
-    elif pd.notna(vz) and vz <= -1.5: alerts.append(("blue","VIX laag","VIX z≤−1.5 (20d)"))
+    if pd.notna(vz) and vz >= vix_z_hi: alerts.append(("orange","VIX spike", f"z≥{vix_z_hi:.1f}"))
+    if pd.notna(vz) and vz <= vix_z_lo: alerts.append(("blue","VIX laag", f"z≤{vix_z_lo:.1f}"))
 
-# Corr regime (Gold vs DXY/US10Y)
-def rolling_corr(a, b, win=60):
-    x = pd.concat([a, b], axis=1).dropna()
+# Corr regimes (returns corr)
+def rolling_corr(a: pd.Series, b: pd.Series, win: int) -> float:
+    x = pd.concat([a.pct_change(), b.pct_change()], axis=1).dropna()
     if len(x) < win: return np.nan
-    return x[a.name].pct_change().rolling(win).corr(x[b.name].pct_change())
+    return x.iloc[-win:, 0].corr(x.iloc[-win:, 1])
 
-if all(c in d.columns for c in ["gold_close","dxy_close"]) and d["gold_close"].notna().sum() > 60 and d["dxy_close"].notna().sum() > 60:
-    c_dxy = rolling_corr(d["gold_close"].rename("g"), d["dxy_close"].rename("dxy"), corr_win).dropna()
-    if len(c_dxy):
-        val = c_dxy.iloc[-1]
-        if val <= -0.6: alerts.append(("green","Sterk neg. corr (Gold–DXY)", f"corr≈{val:.2f}"))
-if all(c in d.columns for c in ["gold_close","us10y"]) and d["us10y"].notna().sum() > 60:
-    c_y = rolling_corr(d["gold_close"].rename("g"), d["us10y"].rename("y"), corr_win).dropna()
-    if len(c_y):
-        val = c_y.iloc[-1]
-        if val <= -0.5: alerts.append(("green","Neg. corr (Gold–US10Y)", f"corr≈{val:.2f}"))
+if all(c in d.columns for c in ["gold_close","dxy_close"]):
+    cD = rolling_corr(d["gold_close"], d["dxy_close"], corr_win)
+    if pd.notna(cD) and cD <= corr_neg_dxy:
+        alerts.append(("green","Sterk negatief Gold–DXY", f"corr≈{cD:.2f} (≤ {corr_neg_dxy:.2f})"))
+if all(c in d.columns for c in ["gold_close","us10y"]):
+    cY = rolling_corr(d["gold_close"], d["us10y"], corr_win)
+    if pd.notna(cY) and cY <= corr_neg_yld:
+        alerts.append(("green","Negatief Gold–US10Y", f"corr≈{cY:.2f} (≤ {corr_neg_yld:.2f})"))
 
 def badge(color, text):
     colors = {"green":"#00A65A","red":"#D55E00","orange":"#E69F00","blue":"#1f77b4","gray":"#6c757d"}
@@ -230,21 +295,23 @@ with st.container():
 st.divider()
 
 # ---------- Paneel 1: Gold + EMA + Drivers overlay ----------
-st.subheader("Gold — Price & MA + Drivers overlay")
+st.subheader("Gold — Price & EMA + Drivers overlay")
 
+driver_choices = driver_choices or []  # safety
 sel = st.multiselect(
     "Kies drivers voor overlay/vergelijking",
     options=driver_choices,
     default=[x for x in ["US 10Y (yield %)","US 10Y Real (TIPS %)","BTC (BTCUSD)","DXY (Dollar Index)"] if x in driver_choices],
-    help="Bij ‘Genormaliseerd (=100)’ delen alle lijnen dezelfde schaal; anders krijgen drivers de 2e y-as."
+    help="Bij ‘Genormaliseerd (=100)’ delen alle lijnen dezelfde schaal; anders krijgen drivers de 2e y-as.",
+    disabled=(len(driver_choices) == 0)
 )
 
 fig = make_subplots(specs=[[{"secondary_y": (view_mode.startswith("Eigen"))}]])
 # Gold base
 fig.add_trace(go.Scatter(x=d["date"], y=d["gold_close"], name="Gold (USD/oz)", line=dict(width=2, color="#111111")))
-fig.add_trace(go.Scatter(x=d["date"], y=d["gold_ma20"],  name="EMA20", line=dict(width=2, color="#E69F00")))
-fig.add_trace(go.Scatter(x=d["date"], y=d["gold_ma50"],  name="EMA50", line=dict(width=2, color="#009E73")))
-fig.add_trace(go.Scatter(x=d["date"], y=d["gold_ma200"], name="EMA200", line=dict(width=2, color="#0072B2")))
+fig.add_trace(go.Scatter(x=d["date"], y=d[f"gold_ma{ema_fast}"],  name=f"EMA{ema_fast}", line=dict(width=2, color="#E69F00")))
+fig.add_trace(go.Scatter(x=d["date"], y=d[f"gold_ma{ema_mid}"],   name=f"EMA{ema_mid}",  line=dict(width=2, color="#009E73")))
+fig.add_trace(go.Scatter(x=d["date"], y=d[f"gold_ma{ema_slow}"],  name=f"EMA{ema_slow}", line=dict(width=2, color="#0072B2")))
 
 palette = ["#6B7280","#9CA3AF","#8B5CF6","#EF4444","#10B981","#A855F7","#F59E0B","#3B82F6"]
 pi = 0
@@ -252,7 +319,6 @@ pi = 0
 def add_overlay(name, series, color, secondary=False):
     if view_mode.startswith("Genormaliseerd"):
         base_gold = normalize_100(d["gold_close"])
-        # teken Gold (=100) eenmalig
         if "Gold (=100)" not in [t.name for t in fig.data]:
             fig.add_trace(go.Scatter(x=d["date"], y=base_gold, name="Gold (=100)",
                                      line=dict(width=1.8, color="#111111", dash="dot")))
@@ -260,16 +326,18 @@ def add_overlay(name, series, color, secondary=False):
     else:
         fig.add_trace(go.Scatter(x=d["date"], y=series, name=name, line=dict(width=2, color=color)), secondary_y=secondary)
 
+# VIX overlay knop werkt ook als je VIX niet selecteert in 'sel'
+if show_vix and ("vix_close" in d.columns) and d["vix_close"].notna().any():
+    vser = d["vix_close"]
+    if vix_as_z: vser = zscore(vser, 20)
+    add_overlay("VIX (z)" if vix_as_z else "VIX", vser, "#A855F7", secondary=True)
+
 for name in sel:
     col = DRIVER_MAP[name]
     if col not in d.columns or d[col].notna().sum() == 0:
         continue
     ser = d[col]
-    if name == "VIX" and show_vix:
-        if vix_as_z: ser = zscore(ser, 20)
-        add_overlay("VIX (z)" if vix_as_z else "VIX", ser, palette[pi % len(palette)], secondary=True)
-    else:
-        add_overlay(name, ser, palette[pi % len(palette)], secondary=True)
+    add_overlay(name, ser, palette[pi % len(palette)], secondary=True)
     pi += 1
 
 yl = "USD/oz" if not view_mode.startswith("Genormaliseerd") else "Index (=100)"
@@ -302,11 +370,14 @@ st.divider()
 
 # ---------- Rolling correlaties ----------
 st.subheader("Rolling correlaties (Gold ↔ drivers)")
-if not driver_choices:
+if len(driver_choices) == 0:
     st.info("Geen drivers beschikbaar in dataset.")
 else:
-    sel_corr = st.multiselect("Kies drivers voor correlatie", options=driver_choices,
-                              default=[x for x in ["US 10Y (yield %)","US 10Y Real (TIPS %)","DXY (Dollar Index)","BTC (BTCUSD)","VIX","Silver (USD/oz)"] if x in driver_choices])
+    sel_corr = st.multiselect(
+        "Kies drivers voor correlatie",
+        options=driver_choices,
+        default=[x for x in ["US 10Y (yield %)","US 10Y Real (TIPS %)","DXY (Dollar Index)","BTC (BTCUSD)","VIX","Silver (USD/oz)"] if x in driver_choices]
+    )
     if sel_corr:
         gold_ret = d["gold_close"].pct_change()
         figc = go.Figure()
@@ -315,7 +386,7 @@ else:
             if col not in d.columns: 
                 continue
             series = d[col]
-            # assets -> returns; yields/vol -> levels
+            # assets -> returns; yields/vol meestal levels
             as_return = name in ["BTC (BTCUSD)", "Silver (USD/oz)"]
             x = series.pct_change() if as_return else series
             corr = pd.concat([gold_ret.rename("g"), x.rename("x")], axis=1).dropna().rolling(corr_win).corr().reset_index()
@@ -334,63 +405,59 @@ else:
 
 st.divider()
 
-# ---------- Beta/Scatter ----------
-st.subheader("β / Scatter — Gold vs geselecteerde driver")
-drv_col = DRIVER_MAP.get(scatter_driver)
-if drv_col not in d.columns or d[drv_col].notna().sum() < 5 or d["gold_close"].notna().sum() < 5:
-    st.info("Onvoldoende data voor scatter.")
+# ---------- Multi-Scatter / Beta ----------
+st.subheader("β / Scatter — Gold vs meerdere drivers")
+if len(scatter_drivers) == 0:
+    st.info("Geen drivers geselecteerd voor scatter/beta.")
 else:
-    if scatter_mode.startswith("%"):
-        y = d["gold_close"].pct_change()*100.0
-        x = d[drv_col].pct_change()*100.0
-        x_label = f"{scatter_driver} Δ%"; y_label = "Gold Δ%"
-    else:
-        y = d["gold_close"]
-        x = d[drv_col]
-        x_label = scatter_driver; y_label = "Gold (USD/oz)"
+    rows = (len(scatter_drivers) + 1) // 2
+    for i, name in enumerate(scatter_drivers):
+        drv_col = DRIVER_MAP.get(name)
+        if drv_col not in d.columns or d[drv_col].notna().sum() < 5 or d["gold_close"].notna().sum() < 5:
+            st.info(f"Onvoldoende data voor scatter: {name}")
+            continue
 
-    scatter_df = pd.concat([x.rename("x"), y.rename("y")], axis=1).dropna()
-    if len(scatter_df) < 10:
-        st.info("Te weinig overlappende punten voor regressie.")
-    else:
+        if scatter_mode.startswith("%"):
+            y = d["gold_close"].pct_change()*100.0
+            x = d[drv_col].pct_change()*100.0
+            x_label = f"{name} Δ%"; y_label = "Gold Δ%"
+        else:
+            y = d["gold_close"]
+            x = d[drv_col]
+            x_label = name; y_label = "Gold (USD/oz)"
+
+        scatter_df = pd.concat([x.rename("x"), y.rename("y")], axis=1).dropna()
+        if len(scatter_df) < 10:
+            st.info(f"Te weinig punten voor regressie: {name}")
+            continue
+
         X = scatter_df["x"].values
         Y = scatter_df["y"].values
-        # Regressie (OLS via polyfit) + stats
-        slope, intercept = np.polyfit(X, Y, 1)
-        y_hat = slope*X + intercept
-        # R^2
-        ss_res = np.sum((Y - y_hat)**2)
-        ss_tot = np.sum((Y - np.mean(Y))**2)
-        r2 = 1 - ss_res/ss_tot if ss_tot != 0 else np.nan
-        # corr
-        corr = np.corrcoef(X, Y)[0,1] if len(scatter_df) > 1 else np.nan
+        slope, intercept, r2, corr = regress_xy(X, Y)
 
-        fig_s = go.Figure()
-        fig_s.add_trace(go.Scatter(x=X, y=Y, mode="markers", name="Waarnemingen", opacity=0.6))
-        # regressielijn
-        x_line = np.linspace(X.min(), X.max(), 100)
-        y_line = slope*x_line + intercept
-        fig_s.add_trace(go.Scatter(x=x_line, y=y_line, mode="lines", name=f"Fit: y = {slope:.3f}x + {intercept:.3f}"))
-
-        fig_s.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10),
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
-        fig_s.update_xaxes(title=x_label); fig_s.update_yaxes(title=y_label)
-        st.plotly_chart(fig_s, use_container_width=True)
-
-        # Metrics-kaartjes
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("β (slope)", f"{slope:.3f}")
-        m2.metric("Intercept", f"{intercept:.3f}")
-        m3.metric("R²", f"{r2:.3f}" if pd.notna(r2) else "—")
-        m4.metric("Corr", f"{corr:.3f}" if pd.notna(corr) else "—")
-        st.caption("Let op: β is het gevoeligheidscoëfficiënt in de gekozen transformatie. Bij %-returns interpreteer je β als %-punt reactie van Gold op 1 %-punt in de driver.")
+        with st.expander(f"Scatter: Gold vs {name} — β={slope:.3f}, R²={r2:.3f}, corr={corr:.3f}", expanded=False):
+            fig_s = go.Figure()
+            fig_s.add_trace(go.Scatter(x=X, y=Y, mode="markers", name="Waarnemingen", opacity=0.6))
+            x_line = np.linspace(X.min(), X.max(), 100)
+            y_line = slope*x_line + intercept
+            fig_s.add_trace(go.Scatter(x=x_line, y=y_line, mode="lines",
+                                       name=f"Fit: y = {slope:.3f}x + {intercept:.3f}"))
+            fig_s.update_layout(height=460, margin=dict(l=10,r=10,t=30,b=10),
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+            fig_s.update_xaxes(title=x_label); fig_s.update_yaxes(title=y_label)
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("β (slope)", f"{slope:.3f}")
+            c2.metric("Intercept", f"{intercept:.3f}")
+            c3.metric("R²", f"{r2:.3f}" if pd.notna(r2) else "—")
+            c4.metric("Corr", f"{corr:.3f}" if pd.notna(corr) else "—")
+            st.plotly_chart(fig_s, use_container_width=True)
 
 st.divider()
 
 # ---------- Tabel (laatste rijen) ----------
 st.subheader("Laatste rijen (gefilterd bereik)")
-show_cols = ["date", "gold_close", "gold_ma20", "gold_ma50", "gold_ma200", "gold_delta_pct",
-             "silver_close", "btc_close", "dxy_close", "eurusd_close", "us10y", "tips10y_real", "vix_close"]
+show_cols = ["date", "gold_close", f"gold_ma{ema_fast}", f"gold_ma{ema_mid}", f"gold_ma{ema_slow}",
+             "gold_delta_pct", "silver_close", "btc_close", "dxy_close", "eurusd_close", "us10y", "tips10y_real", "vix_close"]
 show_cols = [c for c in show_cols if c in d.columns]
 tail = d[show_cols].tail(200).copy()
 if "gold_delta_pct" in tail.columns:
