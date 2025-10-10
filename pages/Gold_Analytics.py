@@ -87,9 +87,7 @@ def load_drv_main() -> pd.DataFrame:
         for c in df.columns:
             if c != "date": df[c] = pd.to_numeric(df[c], errors="coerce")
         return df
-    except (NotFound, Forbidden):
-        return pd.DataFrame()
-    except BadRequest:
+    except (NotFound, Forbidden, BadRequest):
         return pd.DataFrame()
     except Exception:
         return pd.DataFrame()
@@ -108,64 +106,71 @@ def load_vix_fallback() -> pd.DataFrame:
 @st.cache_data(ttl=600, show_spinner=False)
 def load_crypto_fallback() -> pd.DataFrame:
     if not CRYPTO_WIDE_VIEW: return pd.DataFrame()
-    try:
-        q = f"SELECT date, COALESCE(price_btc, price_BTC) AS btc_close FROM `{CRYPTO_WIDE_VIEW}` ORDER BY date"
-        d = run_query(q)
-        if d.empty: return d
-        d["date"] = pd.to_datetime(d["date"]); d["btc_close"] = pd.to_numeric(d["btc_close"], errors="coerce")
-        return d
-    except Exception:
-        return pd.DataFrame()
+    for sql in [
+        f"SELECT date, price_btc AS btc_close FROM `{CRYPTO_WIDE_VIEW}` ORDER BY date",
+        f"SELECT date, price_BTC AS btc_close FROM `{CRYPTO_WIDE_VIEW}` ORDER BY date",
+        f"SELECT date, btc_close FROM `{CRYPTO_WIDE_VIEW}` ORDER BY date",
+    ]:
+        try:
+            d = run_query(sql)
+            if d.empty or "btc_close" not in d.columns: 
+                continue
+            d["date"] = pd.to_datetime(d["date"]); d["btc_close"] = pd.to_numeric(d["btc_close"], errors="coerce")
+            return d
+        except Exception:
+            continue
+    return pd.DataFrame()
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_fx_fallback() -> pd.DataFrame:
     if not FX_WIDE_VIEW: return pd.DataFrame()
+    keep = ["date"]; d_final = None
     try:
-        d = run_query(f"SELECT * FROM `{FX_WIDE_VIEW}` ORDER BY date")
-        if d.empty: return d
-        d["date"] = pd.to_datetime(d["date"])
-        # Alleen meenemen als aanwezig
-        keep = ["date"]
-        for c in ["eurusd_close", "dxy_close"]:
-            if c in d.columns: 
-                d[c] = pd.to_numeric(d[c], errors="coerce"); keep.append(c)
-        return d[keep] if len(keep) > 1 else pd.DataFrame()
+        d = run_query(f"SELECT date, eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date")
+        d["date"] = pd.to_datetime(d["date"]); d["eurusd_close"] = pd.to_numeric(d["eurusd_close"], errors="coerce")
+        d_final = d if d_final is None else pd.merge(d_final, d, on="date", how="outer")
     except Exception:
-        return pd.DataFrame()
+        pass
+    try:
+        d = run_query(f"SELECT date, dxy_close FROM `{FX_WIDE_VIEW}` ORDER BY date")
+        d["date"] = pd.to_datetime(d["date"]); d["dxy_close"] = pd.to_numeric(d["dxy_close"], errors="coerce")
+        d_final = d if d_final is None else pd.merge(d_final, d, on="date", how="outer")
+    except Exception:
+        pass
+    return d_final if d_final is not None else pd.DataFrame()
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_yield_fallback() -> pd.DataFrame:
     if not US_YIELD_VIEW: return pd.DataFrame()
-    try:
-        # Kolommen verschillen per view → kies beste match
-        cols = run_query(f"""
-            SELECT column_name FROM `{US_YIELD_VIEW.rsplit('.',2)[0]}.INFORMATION_SCHEMA.COLUMNS`
-            WHERE table_name = '{US_YIELD_VIEW.rsplit('.',1)[1]}'
-        """)
-        names = set([str(x).lower() for x in cols["column_name"]]) if not cols.empty else set()
-        def pick(*cands):
-            for c in cands:
-                if c.lower() in names: return c
-            return None
-        y10 = pick("y_10y_synth","y_10y","us10y","yield_10y")
-        tips = pick("tips10y_real","real_10y","y_10y_real")
-        if not y10 and not tips:
-            # haal alles op en probeer te vinden
-            d = run_query(f"SELECT * FROM `{US_YIELD_VIEW}` ORDER BY date LIMIT 1")
-            if "y_10y" in d.columns: y10 = "y_10y"
-        if not y10 and not tips: return pd.DataFrame()
-
-        sel = ["date"]
-        if y10:  sel.append(f"{y10} AS us10y")
-        if tips: sel.append(f"{tips} AS tips10y_real")
-        q = f"SELECT {', '.join(sel)} FROM `{US_YIELD_VIEW}` ORDER BY date"
-        d2 = run_query(q)
-        d2["date"] = pd.to_datetime(d2["date"])
-        for c in d2.columns:
-            if c != "date": d2[c] = pd.to_numeric(d2[c], errors="coerce")
-        return d2
-    except Exception:
-        return pd.DataFrame()
+    # Probeer een paar veelvoorkomende varianten zonder INFORMATION_SCHEMA
+    candidates = [
+        f"SELECT date, y_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_10y_synth AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_10y AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_10y_synth AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
+    ]
+    merged = None
+    for sql in candidates:
+        try:
+            d = run_query(sql)
+            if d.empty: 
+                continue
+            d["date"] = pd.to_datetime(d["date"])
+            for c in d.columns:
+                if c != "date": d[c] = pd.to_numeric(d[c], errors="coerce")
+            merged = d if merged is None else pd.merge(merged, d, on="date", how="outer")
+        except Exception:
+            continue
+    # Dedup kolomnamen (kan dubbel komen)
+    if merged is not None:
+        cols = []
+        seen = set()
+        for c in merged.columns:
+            if c == "date" or c not in seen:
+                cols.append(c); seen.add(c)
+        merged = merged[cols]
+    return merged if merged is not None else pd.DataFrame()
 
 # ---------- Load & merge ----------
 df_com = load_com()
@@ -184,9 +189,9 @@ else:
     df = pd.merge(df, drv_main, on="date", how="outer")
 
 # fallbacks
-for fallback_df in [load_vix_fallback(), load_crypto_fallback(), load_fx_fallback(), load_yield_fallback()]:
-    if not fallback_df.empty:
-        df = pd.merge(df, fallback_df, on="date", how="outer")
+for fb in [load_vix_fallback(), load_crypto_fallback(), load_fx_fallback(), load_yield_fallback()]:
+    if fb is not None and not fb.empty:
+        df = pd.merge(df, fb, on="date", how="outer")
 
 df = df.sort_values("date").drop_duplicates(subset=["date"]).reset_index(drop=True)
 
@@ -229,7 +234,8 @@ with st.sidebar:
         "VIX": "vix_close",
         "Silver (USD/oz)": "silver_close",
     }
-    driver_choices = [n for n,c in DRIVER_MAP.items() if c in df.columns and df[c].notna().any()]
+    # 👉 Toon optie als kolom BESTAAT (geen filter meer op notna().any())
+    driver_choices = [n for n,c in DRIVER_MAP.items() if c in df.columns]
 
     view_mode = st.radio("Overlayschaling", ["Genormaliseerd (=100)", "Eigen schaal (2e y-as)"], index=0)
     show_delta = st.checkbox("Δ%-bars tonen (Gold)", value=True)
@@ -250,7 +256,7 @@ with st.sidebar:
     corr_neg_yld = st.slider("Negatieve corr-drempel (Gold–US10Y)", -1.0, 0.0, -0.5, 0.05)
 
     st.divider(); st.markdown("#### VIX & plot")
-    vix_avail = ("vix_close" in df.columns) and df["vix_close"].notna().any()
+    vix_avail = ("vix_close" in df.columns)
     show_vix = st.toggle("VIX overlay in prijs-paneel", value=vix_avail, disabled=not vix_avail)
     vix_as_z = st.checkbox("Plot VIX als z-score (20d)", value=False, disabled=not vix_avail)
 
@@ -259,7 +265,7 @@ with st.sidebar:
     scatter_drivers = st.multiselect(
         "Drivers voor scatter/beta",
         options=driver_choices,
-        default=[x for x in ["US 10Y (yield %)","DXY (Dollar Index)","BTC (BTCUSD)","VIX"] if x in driver_choices],
+        default=[x for x in ["US 10Y (yield %)","DXY (Dollar Index)","BTC (BTCUSD)","VIX","Silver (USD/oz)"] if x in driver_choices],
         disabled=(len(driver_choices) == 0)
     )
 
@@ -276,6 +282,14 @@ mask = (df["date"].dt.date >= start_d) & (df["date"].dt.date <= end_d)
 d = df.loc[mask].copy()
 if d.empty:
     st.info("Geen data in de gekozen periode."); st.stop()
+
+# ---------- Debug: data completeness ----------
+with st.expander("🧪 Debug: driver-kolommen en non-null counts (na merge)", expanded=False):
+    dbg_cols = ["silver_close","btc_close","dxy_close","eurusd_close","us10y","tips10y_real","vix_close"]
+    present = {c: (c in df.columns) for c in dbg_cols}
+    counts_all = {c: (int(df[c].notna().sum()) if c in df.columns else 0) for c in dbg_cols}
+    counts_range = {c: (int(d[c].notna().sum()) if c in d.columns else 0) for c in dbg_cols}
+    st.write({"present(all)": present, "notna_count(all)": counts_all, "notna_count(in_range)": counts_range})
 
 # ---------- EMAs ----------
 for span in [ema_fast, ema_mid, ema_slow]:
@@ -360,11 +374,10 @@ st.divider()
 
 # ---------- Paneel 1: Gold + EMA + Drivers overlay ----------
 st.subheader("Gold — Price & EMA + Drivers overlay")
-
 sel = st.multiselect(
     "Kies drivers voor overlay/vergelijking",
     options=driver_choices,
-    default=[x for x in ["US 10Y (yield %)","US 10Y Real (TIPS %)","BTC (BTCUSD)","DXY (Dollar Index)","Silver (USD/oz)"] if x in driver_choices],
+    default=[x for x in ["US 10Y (yield %)","US 10Y Real (TIPS %)","BTC (BTCUSD)","DXY (Dollar Index)","Silver (USD/oz)","VIX"] if x in driver_choices],
     help="Bij ‘Genormaliseerd (=100)’ delen alle lijnen dezelfde schaal; anders krijgen drivers de 2e y-as.",
     disabled=(len(driver_choices) == 0)
 )
@@ -389,19 +402,21 @@ def add_overlay(name, series, color, secondary=False):
     else:
         fig.add_trace(go.Scatter(x=d["date"], y=series, name=name, line=dict(width=2, color=color)), secondary_y=secondary)
 
-# VIX aparte toggle
-if ("vix_close" in d.columns) and d["vix_close"].notna().any():
-    from_vix_toggle = st.sidebar.session_state.get("vix_overlay_enabled", None)
+# VIX aparte toggle (werkt onafhankelijk van selectie)
+if ("vix_close" in d.columns) and show_vix:
     vseries = d["vix_close"]
-    if vix_as_z: vseries = zscore(vseries, 20)
-    if show_vix:
+    if vseries.notna().any():
+        if vix_as_z: vseries = zscore(vseries, 20)
         add_overlay("VIX (z)" if vix_as_z else "VIX", vseries, "#A855F7", secondary=True)
 
 for name in sel:
     col = DRIVER_MAP[name]
-    if col not in d.columns or d[col].notna().sum() == 0:
+    if col not in d.columns:
         continue
     ser = d[col]
+    if ser.notna().sum() == 0:
+        # laat lijn weg maar optie blijft zichtbaar; geen fout
+        continue
     add_overlay(name, ser, palette[pi % len(palette)], secondary=True)
     pi += 1
 
@@ -414,7 +429,8 @@ fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10),
 st.plotly_chart(fig, use_container_width=True)
 
 # ---------- Δ%-bars ----------
-if show_delta:
+show_delta_panel = show_delta
+if show_delta_panel:
     if "gold_delta_pct" in d.columns and d["gold_delta_pct"].notna().any():
         bars = d[["date","gold_delta_pct"]].dropna().copy()
         bars["pct"] = bars["gold_delta_pct"] * 100.0
@@ -450,6 +466,7 @@ else:
             col = DRIVER_MAP.get(name)
             if not col or col not in d.columns: continue
             series = d[col]
+            # Assets (BTC, Silver) als returns; yields/FX/VIX als levels
             as_return = name in ["BTC (BTCUSD)", "Silver (USD/oz)"]
             x = series.pct_change() if as_return else series
             join = pd.concat([gold_ret.rename("g"), x.rename("x")], axis=1).dropna()
