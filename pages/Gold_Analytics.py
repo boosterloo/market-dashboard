@@ -378,32 +378,55 @@ else:
         options=driver_choices,
         default=[x for x in ["US 10Y (yield %)","US 10Y Real (TIPS %)","DXY (Dollar Index)","BTC (BTCUSD)","VIX","Silver (USD/oz)"] if x in driver_choices]
     )
+
     if sel_corr:
+        # Gold returns (dagelijks)
         gold_ret = d["gold_close"].pct_change()
+
         figc = go.Figure()
+        any_line = False
+
         for name in sel_corr:
-            col = DRIVER_MAP[name]
-            if col not in d.columns: 
+            col = DRIVER_MAP.get(name)
+            if not col or col not in d.columns:
                 continue
+
             series = d[col]
-            # assets -> returns; yields/vol meestal levels
+            # Assets (BTC, Silver) als returns; yields/FX/VIX meestal levels
             as_return = name in ["BTC (BTCUSD)", "Silver (USD/oz)"]
             x = series.pct_change() if as_return else series
-            corr = pd.concat([gold_ret.rename("g"), x.rename("x")], axis=1).dropna().rolling(corr_win).corr().reset_index()
-            corr = corr[corr["level_1"]=="x"][["date","g"]].rename(columns={"g":name})
-            if not corr.empty:
-                figc.add_trace(go.Scatter(x=corr["date"], y=corr[name], mode="lines", name=name))
+
+            # Align en bereken rolling corr robuust (geeft 1-dim Series per driver)
+            join = pd.concat([gold_ret.rename("g"), x.rename("x")], axis=1).dropna()
+            if join.empty or len(join) < max(10, corr_win):
+                continue
+
+            rc = join["g"].rolling(corr_win).corr(join["x"]).dropna()
+            if rc.empty:
+                continue
+
+            figc.add_trace(
+                go.Scatter(x=rc.index, y=rc.values, mode="lines", name=name, line=dict(width=2))
+            )
+            any_line = True
+
         figc.add_hline(y=0.0, line_dash="dot")
         figc.add_hrect(y0=-1, y1=-0.5, fillcolor="rgba(255,0,0,0.06)", line_width=0)
         figc.add_hrect(y0=0.5, y1=1,   fillcolor="rgba(0,128,0,0.06)", line_width=0)
-        figc.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
-                           legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
-        figc.update_yaxes(title_text="Rolling corr", range=[-1,1])
-        st.plotly_chart(figc, use_container_width=True)
+        figc.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=30, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0)
+        )
+        figc.update_yaxes(title_text="Rolling corr", range=[-1, 1])
+
+        if any_line:
+            st.plotly_chart(figc, use_container_width=True)
+        else:
+            st.info("Geen voldoende overlappende data om correlaties te tekenen in de gekozen periode.")
     else:
         st.info("Selecteer minimaal één driver voor correlaties.")
 
-st.divider()
 
 # ---------- Multi-Scatter / Beta ----------
 st.subheader("β / Scatter — Gold vs meerdere drivers")
