@@ -40,12 +40,17 @@ st.title("🏅 Gold Analytics — Price • TA • Drivers • Correlations • 
 
 # ---------- Sources ----------
 TABLES = st.secrets.get("tables", {})
+
+# Basis commodity view (gold/silver)
 COM_WIDE_VIEW      = TABLES.get("commodities_wide_view",   "nth-pier-468314-p7.marketdata.commodity_prices_wide_v")
+# ‘Full’ drivers view (indien je die hebt)
 DRIVERS_WIDE_VIEW  = TABLES.get("gold_drivers_wide_view",  "nth-pier-468314-p7.marketdata.gold_drivers_wide_v")
-AEX_VIEW           = TABLES.get("aex_view",                None)  # fallback voor VIX
-CRYPTO_WIDE_VIEW   = TABLES.get("crypto_daily_wide",       None)  # fallback voor BTC
-FX_WIDE_VIEW       = TABLES.get("fx_wide_view",            None)  # fallback voor EURUSD/DXY
-US_YIELD_VIEW      = TABLES.get("us_yield_view",           None)  # fallback voor US10Y/TIPS
+
+# Fallbacks — hier heb ik NU defaults ingevuld
+AEX_VIEW           = TABLES.get("aex_view",               "nth-pier-468314-p7.marketdata.aex_with_vix_v")          # voor VIX
+CRYPTO_WIDE_VIEW   = TABLES.get("crypto_daily_wide",      "nth-pier-468314-p7.marketdata.crypto_daily_wide_v")     # voor BTC
+FX_WIDE_VIEW       = TABLES.get("fx_wide_view",           "nth-pier-468314-p7.marketdata.fx_daily_wide_v")         # voor DXY/EURUSD
+US_YIELD_VIEW      = TABLES.get("us_yield_view",          "nth-pier-468314-p7.marketdata.us_yields_daily_wide_v")  # voor US10Y/TIPS
 
 with st.expander("🔎 Debug: gebruikte bronnen", expanded=False):
     st.write({
@@ -79,7 +84,6 @@ def load_com() -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_drv_main() -> pd.DataFrame:
-    """Probeer hoofd-drivers view te laden."""
     try:
         df = run_query(f"SELECT * FROM `{DRIVERS_WIDE_VIEW}` ORDER BY date")
         if df.empty: return df
@@ -94,28 +98,29 @@ def load_drv_main() -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_vix_fallback() -> pd.DataFrame:
-    if not AEX_VIEW: return pd.DataFrame()
     try:
         d = run_query(f"SELECT date, vix_close FROM `{AEX_VIEW}` ORDER BY date")
-        if d.empty: return d
-        d["date"] = pd.to_datetime(d["date"]); d["vix_close"] = pd.to_numeric(d["vix_close"], errors="coerce")
+        if d.empty: return pd.DataFrame()
+        d["date"] = pd.to_datetime(d["date"])
+        d["vix_close"] = pd.to_numeric(d["vix_close"], errors="coerce")
         return d
     except Exception:
         return pd.DataFrame()
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_crypto_fallback() -> pd.DataFrame:
-    if not CRYPTO_WIDE_VIEW: return pd.DataFrame()
-    for sql in [
+    candidates = [
         f"SELECT date, price_btc AS btc_close FROM `{CRYPTO_WIDE_VIEW}` ORDER BY date",
         f"SELECT date, price_BTC AS btc_close FROM `{CRYPTO_WIDE_VIEW}` ORDER BY date",
         f"SELECT date, btc_close FROM `{CRYPTO_WIDE_VIEW}` ORDER BY date",
-    ]:
+    ]
+    for sql in candidates:
         try:
             d = run_query(sql)
             if d.empty or "btc_close" not in d.columns: 
                 continue
-            d["date"] = pd.to_datetime(d["date"]); d["btc_close"] = pd.to_numeric(d["btc_close"], errors="coerce")
+            d["date"] = pd.to_datetime(d["date"])
+            d["btc_close"] = pd.to_numeric(d["btc_close"], errors="coerce")
             return d
         except Exception:
             continue
@@ -123,35 +128,13 @@ def load_crypto_fallback() -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_fx_fallback() -> pd.DataFrame:
-    if not FX_WIDE_VIEW: return pd.DataFrame()
-    keep = ["date"]; d_final = None
-    try:
-        d = run_query(f"SELECT date, eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date")
-        d["date"] = pd.to_datetime(d["date"]); d["eurusd_close"] = pd.to_numeric(d["eurusd_close"], errors="coerce")
-        d_final = d if d_final is None else pd.merge(d_final, d, on="date", how="outer")
-    except Exception:
-        pass
-    try:
-        d = run_query(f"SELECT date, dxy_close FROM `{FX_WIDE_VIEW}` ORDER BY date")
-        d["date"] = pd.to_datetime(d["date"]); d["dxy_close"] = pd.to_numeric(d["dxy_close"], errors="coerce")
-        d_final = d if d_final is None else pd.merge(d_final, d, on="date", how="outer")
-    except Exception:
-        pass
-    return d_final if d_final is not None else pd.DataFrame()
-
-@st.cache_data(ttl=600, show_spinner=False)
-def load_yield_fallback() -> pd.DataFrame:
-    if not US_YIELD_VIEW: return pd.DataFrame()
-    # Probeer een paar veelvoorkomende varianten zonder INFORMATION_SCHEMA
-    candidates = [
-        f"SELECT date, y_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_10y_synth AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_10y AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_10y_synth AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
-    ]
     merged = None
-    for sql in candidates:
+    for sql in [
+        f"SELECT date, eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
+        f"SELECT date, dxy_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
+        f"SELECT date, EURUSD AS eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
+        f"SELECT date, DXY AS dxy_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
+    ]:
         try:
             d = run_query(sql)
             if d.empty: 
@@ -162,10 +145,30 @@ def load_yield_fallback() -> pd.DataFrame:
             merged = d if merged is None else pd.merge(merged, d, on="date", how="outer")
         except Exception:
             continue
-    # Dedup kolomnamen (kan dubbel komen)
+    return merged if merged is not None else pd.DataFrame()
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_yield_fallback() -> pd.DataFrame:
+    merged = None
+    for sql in [
+        f"SELECT date, y_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_10y_synth AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_10y AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_10y_synth AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
+    ]:
+        try:
+            d = run_query(sql)
+            if d.empty: 
+                continue
+            d["date"] = pd.to_datetime(d["date"])
+            for c in d.columns:
+                if c != "date": d[c] = pd.to_numeric(d[c], errors="coerce")
+            merged = d if merged is None else pd.merge(merged, d, on="date", how="outer")
+        except Exception:
+            continue
     if merged is not None:
-        cols = []
-        seen = set()
+        cols, seen = [], set()
         for c in merged.columns:
             if c == "date" or c not in seen:
                 cols.append(c); seen.add(c)
@@ -177,18 +180,15 @@ df_com = load_com()
 if df_com.empty:
     st.warning("Geen data in commodities wide view."); st.stop()
 
-# basis: gold & silver uit commodities
 base_cols = ["date"] + [c for c in df_com.columns if c.startswith("gold_") or c == "silver_close"]
 df = df_com[base_cols].copy()
 
-# hoofd-drivers
 drv_main = load_drv_main()
 if drv_main.empty:
     st.warning(f"Drivers-view niet gevonden of geen rechten: `{DRIVERS_WIDE_VIEW}`. Fallback-bronnen ingeschakeld.")
 else:
     df = pd.merge(df, drv_main, on="date", how="outer")
 
-# fallbacks
 for fb in [load_vix_fallback(), load_crypto_fallback(), load_fx_fallback(), load_yield_fallback()]:
     if fb is not None and not fb.empty:
         df = pd.merge(df, fb, on="date", how="outer")
@@ -234,7 +234,7 @@ with st.sidebar:
         "VIX": "vix_close",
         "Silver (USD/oz)": "silver_close",
     }
-    # 👉 Toon optie als kolom BESTAAT (geen filter meer op notna().any())
+    # 👉 Toon optie zodra kolom bestaat (niet filteren op notna())
     driver_choices = [n for n,c in DRIVER_MAP.items() if c in df.columns]
 
     view_mode = st.radio("Overlayschaling", ["Genormaliseerd (=100)", "Eigen schaal (2e y-as)"], index=0)
@@ -283,7 +283,7 @@ d = df.loc[mask].copy()
 if d.empty:
     st.info("Geen data in de gekozen periode."); st.stop()
 
-# ---------- Debug: data completeness ----------
+# ---------- Debug: presence & counts ----------
 with st.expander("🧪 Debug: driver-kolommen en non-null counts (na merge)", expanded=False):
     dbg_cols = ["silver_close","btc_close","dxy_close","eurusd_close","us10y","tips10y_real","vix_close"]
     present = {c: (c in df.columns) for c in dbg_cols}
@@ -402,7 +402,7 @@ def add_overlay(name, series, color, secondary=False):
     else:
         fig.add_trace(go.Scatter(x=d["date"], y=series, name=name, line=dict(width=2, color=color)), secondary_y=secondary)
 
-# VIX aparte toggle (werkt onafhankelijk van selectie)
+# VIX overlay (aparte toggle)
 if ("vix_close" in d.columns) and show_vix:
     vseries = d["vix_close"]
     if vseries.notna().any():
@@ -411,11 +411,10 @@ if ("vix_close" in d.columns) and show_vix:
 
 for name in sel:
     col = DRIVER_MAP[name]
-    if col not in d.columns:
+    if col not in d.columns: 
         continue
     ser = d[col]
     if ser.notna().sum() == 0:
-        # laat lijn weg maar optie blijft zichtbaar; geen fout
         continue
     add_overlay(name, ser, palette[pi % len(palette)], secondary=True)
     pi += 1
@@ -425,12 +424,11 @@ fig.update_yaxes(title_text=yl, secondary_y=False)
 if view_mode.startswith("Eigen"):
     fig.update_yaxes(title_text="Drivers (2e as)", secondary_y=True)
 fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10),
-                  legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+                  legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
 st.plotly_chart(fig, use_container_width=True)
 
 # ---------- Δ%-bars ----------
-show_delta_panel = show_delta
-if show_delta_panel:
+if show_delta:
     if "gold_delta_pct" in d.columns and d["gold_delta_pct"].notna().any():
         bars = d[["date","gold_delta_pct"]].dropna().copy()
         bars["pct"] = bars["gold_delta_pct"] * 100.0
@@ -466,7 +464,6 @@ else:
             col = DRIVER_MAP.get(name)
             if not col or col not in d.columns: continue
             series = d[col]
-            # Assets (BTC, Silver) als returns; yields/FX/VIX als levels
             as_return = name in ["BTC (BTCUSD)", "Silver (USD/oz)"]
             x = series.pct_change() if as_return else series
             join = pd.concat([gold_ret.rename("g"), x.rename("x")], axis=1).dropna()
