@@ -1,6 +1,5 @@
 # pages/3_SPX_Options.py
 # SPX Options Dashboard — skew (points-to-strike), PPD, term structure, strangle helper, margin/payoff, roll-sim
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,7 +9,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from scipy.stats import norm
 
 # ─────────────────────────── Page / Plot config ───────────────────────────
 st.set_page_config(page_title="SPX Options Dashboard", layout="wide")
@@ -20,6 +18,13 @@ PLOTLY_CONFIG = {
     "scrollZoom": True, "doubleClick": "reset", "displaylogo": False,
     "modeBarButtonsToRemove": ["lasso2d", "select2d"]
 }
+
+# ─────────────────────────── Normal CDF zonder SciPy ─────────────────────
+def norm_cdf(x):
+    """Standaardnormale CDF, werkt voor scalars en arrays, zonder SciPy."""
+    z = np.asarray(x, dtype=float) / math.sqrt(2.0)
+    erf_vec = np.vectorize(math.erf, otypes=[float])  # vectorize math.erf
+    return 0.5 * (1.0 + erf_vec(z))
 
 # ─────────────────────────── BigQuery helpers ─────────────────────────────
 def get_bq_client():
@@ -76,7 +81,7 @@ def bs_delta_vectorized(S, K, IV, T_days, r, q, is_call):
     sigma = np.maximum(IV, eps); sqrtT = np.sqrt(np.maximum(T, eps))
     d1 = (np.log(np.maximum(S, eps)/np.maximum(K, eps)) + (r_arr - q_arr + 0.5*sigma**2)*T) / (sigma*sqrtT)
     disc = np.exp(-q_arr*T)
-    return np.where(is_call, disc*norm.cdf(d1), -disc*norm.cdf(-d1)).astype(float)
+    return np.where(is_call, disc*norm_cdf(d1), -disc*norm_cdf(-d1)).astype(float)
 
 def strangle_payoff_at_expiry(S, Kp, Kc, credit_pts, multiplier=100) -> float:
     return (credit_pts - max(Kp - S, 0.0) - max(S - Kc, 0.0)) * multiplier
@@ -135,6 +140,9 @@ if df.empty:
     st.stop()
 
 # Clean
+df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
+if "expiration" in df:
+    df["expiration"] = pd.to_datetime(df["expiration"]).dt.date
 num_cols = ["strike","underlying_price","implied_volatility","days_to_exp","open_interest","volume","last_price","bid","ask","mid_price"]
 for c in num_cols:
     if c in df: df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -219,10 +227,10 @@ with tab2:
     st.plotly_chart(fig_ts, use_container_width=True)
 
     # IV Smile op laatste snapshot
-    exps = sorted(pd.to_datetime(df["expiration"]).dt.date.unique().tolist())
+    exps = sorted(pd.to_datetime(df["expiration"]).tolist()) if "expiration" in df else []
     exp_for_smile = st.selectbox("Expiratie voor IV Smile", options=exps or [None], index=0)
     df_last = df.copy()  # (we zitten al op laatste snapshot)
-    sm = df_last[df_last["expiration"].astype(str) == str(exp_for_smile)]
+    sm = df_last[df_last["expiration"].astype(str) == str(pd.to_datetime(exp_for_smile).date())] if exp_for_smile else pd.DataFrame()
     if sm.empty:
         st.info("Geen data voor gekozen expiratie.")
     else:
@@ -237,15 +245,17 @@ with tab2:
 # ─────────────────────────── PPD & analyses ────────────────────────────
 with tab3:
     st.subheader("Serie door de tijd")
-    # Periodekeuze over historie
+
     @st.cache_data(ttl=600, show_spinner=False)
     def load_bounds():
         q = f"SELECT MIN(CAST(snapshot_date AS DATE)) min_d, MAX(CAST(snapshot_date AS DATE)) max_d FROM `{VIEW}`"
         b = run_query(q)
         return pd.to_datetime(b["min_d"].iloc[0]).date(), pd.to_datetime(b["max_d"].iloc[0]).date()
+
     min_d, max_d = load_bounds()
-    start_date, end_date = st.date_input("Periode (snapshot_date)", value=(max(min_d, max_d - timedelta(days=365)), max_d),
-                                         min_value=min_d, max_value=max_d, format="YYYY-MM-DD")
+    start_date, end_date = st.date_input("Periode (snapshot_date)",
+        value=(max(min_d, max_d - timedelta(days=365)), max_d),
+        min_value=min_d, max_value=max_d, format="YYYY-MM-DD")
     sel_type = st.radio("Type", ["call","put"], index=1, horizontal=True)
     dte_min, dte_max = st.slider("DTE", 0, 365, (0, 60), step=1)
     mny_min, mny_max = st.slider("Moneyness (K/S − 1)", -0.20, 0.20, (-0.10, 0.10), step=0.01)
@@ -269,17 +279,17 @@ with tab3:
         params = {"start": start_date, "end": end_date, "t": sel_type,
                   "dte_min": int(dte_min), "dte_max": int(dte_max),
                   "mny_min": float(mny_min), "mny_max": float(mny_max)}
-        df = run_query(sql, params=params)
-        if df.empty: return df
-        df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
-        df["expiration"] = pd.to_datetime(df["expiration"]).dt.date
+        df2 = run_query(sql, params=params)
+        if df2.empty: return df2
+        df2["snapshot_date"] = pd.to_datetime(df2["snapshot_date"])
+        df2["expiration"] = pd.to_datetime(df2["expiration"]).dt.date
         for c in ["days_to_exp","implied_volatility","open_interest","volume","ppd","strike",
                   "underlying_price","last_price","mid_price","bid","ask","dist_points","moneyness"]:
-            if c in df: df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["moneyness_pct"] = 100 * df["moneyness"]
-        df["abs_dist_pct"] = (np.abs(df["dist_points"]) / df["underlying_price"]) * 100.0
-        df["snap_min"] = df["snapshot_date"].dt.floor("min")
-        return df
+            if c in df2: df2[c] = pd.to_numeric(df2[c], errors="coerce")
+        df2["moneyness_pct"] = 100 * df2["moneyness"]
+        df2["abs_dist_pct"] = (np.abs(df2["dist_points"]) / df2["underlying_price"]) * 100.0
+        df2["snap_min"] = df2["snapshot_date"].dt.floor("min")
+        return df2
 
     dfh = load_filtered(start_date, end_date, sel_type, dte_min, dte_max, mny_min, mny_max)
     if dfh.empty:
@@ -338,7 +348,7 @@ with tab3:
                                          name="PPD", mode="lines+markers", connectgaps=True), secondary_y=False)
             fig_ppd.add_trace(go.Scatter(x=serie["snapshot_date"], y=serie["underlying_price"], name="SP500", mode="lines",
                                          line=dict(dash="dot"), connectgaps=True), secondary_y=True)
-            fig_ppd.update_layout(title=f"{sel_type.UPPER()} {series_strike} — exp {series_exp} | PPD vs SP500", height=420, hovermode="x unified")
+            fig_ppd.update_layout(title=f"{sel_type.upper()} {series_strike} — exp {series_exp} | PPD vs SP500", height=420, hovermode="x unified")
             fig_ppd.update_xaxes(title_text="Meetmoment")
             fig_ppd.update_yaxes(title_text=("PPD (bp/day)" if unit.startswith("bp") else "PPD (points/day)"), secondary_y=False, rangemode="tozero")
             fig_ppd.update_yaxes(title_text="SP500", secondary_y=True)
@@ -413,19 +423,17 @@ with tab3:
 with tab4:
     st.subheader("Matrix — meetmoment × strike (laatste snapshot per minuut)")
     # kies expiratie
-    exps_all = sorted(pd.to_datetime(df["expiration"]).dt.date.unique().tolist())
+    exps_all = sorted(pd.to_datetime(df["expiration"]).dt.date.unique().tolist()) if "expiration" in df else []
     matrix_exp = st.selectbox("Expiratie (matrix)", options=exps_all or [None], index=0)
     matrix_metric = st.radio("Waarde", ["last_price","mid_price","ppd"], horizontal=True, index=0)
     max_rows = st.slider("Max. meetmomenten (recentste)", 50, 500, 200, step=50)
 
-    # slice voor exp (laatste snapshot al geladen: df)
-    mx = df[df["expiration"].astype(str) == str(matrix_exp)].copy()
+    mx = df[df["expiration"].astype(str) == str(matrix_exp)].copy() if matrix_exp else pd.DataFrame()
     if mx.empty:
         st.info("Geen matrix-data voor de gekozen expiratie.")
     else:
         if matrix_metric == "ppd":
-            # ppd is al in view aanwezig; zo niet, kun je mid/dte gebruiken
-            pass
+            pass  # kolom 'ppd' is in de view aanwezig (zo niet: mid/dte gebruiken)
         mx["snap_s"] = pd.to_datetime(mx["snapshot_date"]).dt.strftime("%Y-%m-%d %H:%M")
         pv = (mx.groupby(["snap_s","strike"], as_index=False)[matrix_metric].median()
                 .pivot(index="snap_s", columns="strike", values=matrix_metric)
@@ -443,10 +451,10 @@ with tab4:
 with tab5:
     st.subheader("📊 Vol & Risk (ATM-IV, HV, VRP, IV-Rank, Expected Move)")
     # Daily underlying serie
-    u_daily = (df.assign(dte=df["snapshot_date"])
-                 .sort_values("dte").groupby(df["snapshot_date"].dt.date, as_index=False)
+    u_daily = (df.assign(day=df["snapshot_date"].dt.date)
+                 .groupby("day", as_index=False)
                  .agg(close=("underlying_price","median")))
-    u_daily["ret"] = u_daily["close"].pct_change()
+    u_daily["ret"] = pd.to_numeric(u_daily["close"], errors="coerce").pct_change()
     hv20 = annualize_std(u_daily["ret"].tail(21).dropna())
 
     near_atm = df[(df["days_to_exp"].between(20, 40)) & (df["strike"]/df["underlying_price"] - 1.0).abs().le(0.01)]
@@ -496,8 +504,7 @@ with tab5:
 # ─────────────────────────── Strangle Helper / Margin / Roll ───────────
 with tab6:
     st.subheader("🧠 Strangle Helper (σ- of Δ-doel) + 💳 Margin & Payoff + 🔄 Roll")
-    # Slice kiezen: bestaande df = laatste snapshot; gebruik expiration keuze + strikes
-    exps_all = sorted(pd.to_datetime(df["expiration"]).dt.date.unique().tolist())
+    exps_all = sorted(pd.to_datetime(df["expiration"]).dt.date.unique().tolist()) if "expiration" in df else []
     if not exps_all:
         st.info("Geen expiraties beschikbaar op dit snapshot.")
         st.stop()
@@ -510,7 +517,7 @@ with tab6:
 
     cexp1, cexp2 = st.columns([1.2,1])
     with cexp1:
-        exp_for_str = st.selectbox("Expiratie voor strangle", options=exps_all, index=min(0, len(exps_all)-1))
+        exp_for_str = st.selectbox("Expiratie voor strangle", options=exps_all, index=0)
     with cexp2:
         use_smile_iv = st.checkbox("Gebruik strike-IV (smile) voor Δ", value=False)
 
@@ -574,7 +581,7 @@ with tab6:
 
     # touch-proxy (ruime benadering)
     def p_itm_at_exp(sd: float) -> float:
-        return (1.0 - norm.cdf(sd)) if not np.isnan(sd) else np.nan
+        return (1.0 - norm_cdf(sd)) if not np.isnan(sd) else np.nan
     p_touch_put  = min(1.0, 2.0 * p_itm_at_exp(sd_put))  if not np.isnan(sd_put)  else np.nan
     p_touch_call = min(1.0, 2.0 * p_itm_at_exp(sd_call)) if not np.isnan(sd_call) else np.nan
     p_both_touch = min(1.0, (p_touch_put or 0.0) + (p_touch_call or 0.0))
@@ -683,7 +690,7 @@ with tab6:
                 new_put, new_call = bp, bc
 
             # credits
-            def _val(df_leg, typ, K): 
+            def _val(df_leg, typ, K):
                 row = df_leg[(df_leg["type"]==typ) & (df_leg["strike"]==K)]
                 return float(pd.to_numeric(row[price_source], errors="coerce").median()) if not row.empty else np.nan
             new_put_px, new_call_px = _val(df_new,"put",new_put), _val(df_new,"call",new_call)
@@ -691,7 +698,7 @@ with tab6:
             close_cost = (float(put_px) if not np.isnan(put_px) else 0.0) + (float(call_px) if not np.isnan(call_px) else 0.0)
             net_roll_credit = (new_credit - close_cost) if (not np.isnan(new_credit)) else np.nan
 
-            def sigma_dist(K, sp): 
+            def sigma_dist(K, sp):
                 return abs(K - S_now)/sp if (sp and sp>0 and not np.isnan(sp)) else np.nan
             old_sd_put, old_sd_call = sigma_dist(float(target_put), sigma_pts_new), sigma_dist(float(target_call), sigma_pts_new)
             new_sd_put, new_sd_call = sigma_dist(float(new_put),  sigma_pts_new), sigma_dist(float(new_call),  sigma_pts_new)
