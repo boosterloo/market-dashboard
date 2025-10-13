@@ -10,7 +10,7 @@ from plotly.subplots import make_subplots
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-# —— NIEUW: r/q helpers uit yield-view ——
+# —— r/q helpers uit yield-view ——
 from utils.rates import get_r_curve_for_snapshot, get_q_curve_const
 
 # ─────────────────────────── Convenience ───────────────────────────
@@ -127,7 +127,7 @@ with st.expander("📌 Workflow (kort): van data → strangle-keuze", expanded=F
         """
 1) Kies **periode, type, DTE & moneyness**.  
 2) Bekijk **Serie-selectie** om gevoel te krijgen voor prijs/PPD en liquiditeit.  
-3) Gebruik **PPD vs Afstand** & **PPD vs DTE** om een sweet spot te vinden.  
+3) **PPD vs Afstand** (nu in % *of* punten) & **PPD vs DTE** voor sweet spots.  
 4) Check **Vol & Risk** (IV-Rank/VRP/Expected Move).  
 5) In **Strangle Helper** kies je σ/Δ-doelen of gebruik **Auto-pick**.  
 6) Valideer met **Margin & Payoff** en test een **Roll**.
@@ -148,7 +148,7 @@ with colA:
     start_date, end_date = st.date_input("Periode (snapshot_date)",
         value=(default_start, max_date), min_value=min_date, max_value=max_date, format="YYYY-MM-DD")
 with colB:
-    sel_type = st.radio("Type", ["call", "put"], index=1, horizontal=True)
+    sel_type = st.radio("Type (voor secties A–F, H–L)", ["call", "put"], index=1, horizontal=True)
 with colC:
     dte_range = st.slider("DTE", 0, 365, (0, 60), step=1)
 with colD:
@@ -165,7 +165,7 @@ with colL2:
 with colL3:
     min_per_bin = st.slider("Min punten per bin (aggr)", 1, 10, 3, step=1, help="Voor PPD-aggregaties per afstand/DTE.")
 
-# expirations
+# expirations (voor de gefilterde type-weergaven)
 @st.cache_data(ttl=600, show_spinner=False)
 def load_expirations(start_date: date, end_date: date, sel_type: str):
     df = run_query(f"""
@@ -179,7 +179,7 @@ def load_expirations(start_date: date, end_date: date, sel_type: str):
 
 exps = load_expirations(start_date, end_date, sel_type)
 
-# data
+# data: *met type-filter* (voor de meeste secties)
 @st.cache_data(ttl=600, show_spinner=True)
 def load_filtered(start_date, end_date, sel_type, dte_min, dte_max, mny_min, mny_max):
     sql = f"""
@@ -213,16 +213,57 @@ def load_filtered(start_date, end_date, sel_type, dte_min, dte_max, mny_min, mny
             if c in df: df[c] = pd.to_numeric(df[c], errors="coerce")
         df["moneyness_pct"] = 100 * df["moneyness"]
         df["abs_dist_pct"]  = (np.abs(df["dist_points"]) / df["underlying_price"]) * 100.0
+        df["abs_dist_pts"]  = np.abs(df["dist_points"])
         df["snap_min"] = df["snapshot_date"].dt.floor("min")
     return df
+
+# data: *zonder type-filter* (alleen voor Sentiment/PCR/skew)
+@st.cache_data(ttl=600, show_spinner=False)
+def load_filtered_bothtypes(start_date, end_date, dte_min, dte_max, mny_min, mny_max):
+    sql = f"""
+    WITH base AS (
+      SELECT
+        snapshot_date, contract_symbol, type, expiration, days_to_exp,
+        strike, underlying_price,
+        SAFE_DIVIDE(CAST(strike AS FLOAT64), NULLIF(underlying_price, 0)) - 1.0 AS moneyness,
+        (CAST(strike AS FLOAT64) - CAST(underlying_price AS FLOAT64)) AS dist_points,
+        in_the_money, last_price, bid, ask, mid_price,
+        implied_volatility, open_interest, volume, vix, ppd
+      FROM `{VIEW}`
+      WHERE DATE(snapshot_date) BETWEEN @start AND @end
+        AND days_to_exp BETWEEN @dte_min AND @dte_max
+        AND SAFE_DIVIDE(CAST(strike AS FLOAT64), NULLIF(underlying_price, 0)) - 1.0
+            BETWEEN @mny_min AND @mny_max
+    )
+    SELECT * FROM base
+    """
+    params = {"start": start_date, "end": end_date,
+              "dte_min": int(dte_min), "dte_max": int(dte_max),
+              "mny_min": float(mny_min), "mny_max": float(mny_max)}
+    df2 = run_query(sql, params=params)
+    if not df2.empty:
+        df2["snapshot_date"] = pd.to_datetime(df2["snapshot_date"])
+        df2["expiration"]    = pd.to_datetime(df2["expiration"]).dt.date
+        num_cols = ["days_to_exp","implied_volatility","open_interest","volume","ppd",
+                    "strike","underlying_price","last_price","mid_price","bid","ask","dist_points"]
+        for c in num_cols:
+            if c in df2: df2[c] = pd.to_numeric(df2[c], errors="coerce")
+        df2["moneyness_pct"] = 100 * df2["moneyness"]
+        df2["abs_dist_pct"]  = (np.abs(df2["dist_points"]) / df2["underlying_price"]) * 100.0
+        df2["abs_dist_pts"]  = np.abs(df2["dist_points"])
+        df2["snap_min"] = df2["snapshot_date"].dt.floor("min")
+    return df2
 
 df = load_filtered(start_date, end_date, sel_type, dte_range[0], dte_range[1], mny_range[0], mny_range[1])
 if df.empty:
     st.warning("Geen data voor de huidige filters.")
     st.stop()
 
-# Liquidity mask
+df_both = load_filtered_bothtypes(start_date, end_date, dte_range[0], dte_range[1], mny_range[0], mny_range[1])
+
+# Liquidity masks
 liq_mask = ((df["open_interest"].fillna(0) >= min_oi) | (df["volume"].fillna(0) >= min_vol))
+liq_mask_both = ((df_both["open_interest"].fillna(0) >= min_oi) | (df_both["volume"].fillna(0) >= min_vol))
 
 # KPIs
 c1, c2, c3, c4 = st.columns(4)
@@ -321,8 +362,8 @@ with sent_co2:
 with sent_co3:
     atm_band_skew = st.slider("ATM-band voor term-slope (±%)", 0.5, 5.0, 1.0, step=0.5)
 
-# — Tijdreeks PCR (vol/oi)
-pcr_df = (df.assign(day=df["snapshot_date"].dt.date)
+# — Tijdreeks PCR (vol/oi) uit beide types
+pcr_df = (df_both.assign(day=df_both["snapshot_date"].dt.date)
             .groupby(["day","type"], as_index=False)
             .agg(vol=("volume","sum"), oi=("open_interest","sum")))
 if not pcr_df.empty:
@@ -336,15 +377,16 @@ if not pcr_df.empty:
 else:
     pv = pd.DataFrame(columns=["PCR_vol","PCR_oi"])
 
-# — Delta-gewogen PCR (tijdreeks)
-dg_mask = (df["days_to_exp"].between(7, 45)) & (df["moneyness"].abs() <= 0.20) & liq_mask
-dg = df[dg_mask].copy()
+# — Delta-gewogen PCR (tijdreeks) uit beide types
+dg_mask = (df_both["days_to_exp"].between(7, 45)) & (df_both["moneyness"].abs() <= 0.20) & liq_mask_both
+dg = df_both[dg_mask].copy()
 if not dg.empty:
     T = (pd.to_numeric(dg["days_to_exp"], errors="coerce").fillna(0)/365.0).astype(float)
     S = pd.to_numeric(dg["underlying_price"], errors="coerce").astype(float)
     K = pd.to_numeric(dg["strike"], errors="coerce").astype(float)
     IV = pd.to_numeric(dg["implied_volatility"], errors="coerce").astype(float)
     is_call = (dg["type"].str.lower()=="call").astype(bool)
+    # q-cont per T
     q_arr = np.vectorize(lambda t: float(get_q_curve_const(np.array([t], dtype=float), q_const=q_const_simple, to_continuous=True)[0]))(T.values)
     deltas = np.vectorize(bs_delta)(S.values, K.values, IV.values, T.values, np.zeros_like(T.values), q_arr, is_call.values)
     dg["delta_abs"] = np.abs(deltas)
@@ -366,8 +408,8 @@ if not dg.empty:
 else:
     dgp = pd.DataFrame(columns=["PCR_delta_vol","PCR_delta_oi"])
 
-# — 25Δ Skew (laatste snapshot)
-df_last_sent = df[(df["snap_min"] == default_snapshot) & liq_mask].copy() if default_snapshot is not None else pd.DataFrame()
+# — 25Δ Skew (laatste snapshot) uit beide types
+df_last_sent = df_both[(df_both["snap_min"] == default_snapshot) & liq_mask_both].copy() if default_snapshot is not None else pd.DataFrame()
 
 def compute_25d_skew(df_last, dte_lo:int, dte_hi:int) -> float:
     if df_last.empty: return np.nan
@@ -431,43 +473,24 @@ with k5:
     em_txt = f"±{em_1w_pts:,.0f} pts ({em_1w_pts/underlying_now_sent:.2%})" if (not np.isnan(em_1w_pts) and not np.isnan(underlying_now_sent)) else "—"
     st.metric("Expected Move ~1w", em_txt)
 
-# — Explain-blok (kort & automatisch)
+# — Explain (kort)
 explain_lines = []
 def _fmt(x, pct=False):
     if np.isnan(x): return "—"
     return f"{x:.2%}" if pct else f"{x:.2f}"
-
 if not np.isnan(pcr_v_last) or not np.isnan(pcr_oi_last):
     tilt = "defensief" if ((not np.isnan(pcr_v_last) and pcr_v_last>1.0) or (not np.isnan(pcr_oi_last) and pcr_oi_last>1.0)) else "speculatief of neutraal"
     explain_lines.append(f"PCR wijst op **{tilt}** positioning (Vol={_fmt(pcr_v_last)}, OI={_fmt(pcr_oi_last)}).")
 if not np.isnan(skew_25d):
-    explain_lines.append(f"25Δ-skew {_fmt(skew_25d, pct=True)} → {'puts duurder vs calls (downside-hedgevraag)' if skew_25d>0 else 'vlakkere/omgekeerde skew'} in ~30D.")
+    explain_lines.append(f"25Δ-skew {_fmt(skew_25d, pct=True)} → {'puts duurder vs calls (downside-hedgevraag)' if skew_25d>0 else 'vlakkere/omgekeerde skew'}.")
 if not np.isnan(iv_slope):
-    explain_lines.append(f"Term-slope {_fmt(iv_slope, pct=True)} → korte IV {'boven' if iv_slope>0 else 'onder'} 30–60D (event/near-term stress).")
+    explain_lines.append(f"Term-slope {_fmt(iv_slope, pct=True)} → korte IV {'boven' if iv_slope>0 else 'onder'} 30–60D.")
 if not (np.isnan(underlying_now_sent) or np.isnan(em_1w_pts)):
     explain_lines.append(f"~1w expected move ≈ **±{em_1w_pts:,.0f}** punten (~{em_1w_pts/underlying_now_sent:.2%}).")
-
-# extra: VRP & IV-Rank uit latere sectie gebruiken als context
-u_daily = (df.assign(dte=df["snapshot_date"].dt.date).sort_values(["dte","snapshot_date"])
-             .groupby("dte", as_index=False).agg(close=("underlying_price","last")))
-u_daily["ret"] = u_daily["close"].pct_change()
-hv20 = annualize_std(u_daily["ret"].tail(21).dropna())
-iv_hist = (df.assign(day=df["snapshot_date"].dt.date)
-             .query("days_to_exp>=20 and days_to_exp<=40 and abs(moneyness)<=0.01")
-             .groupby("day", as_index=False)["implied_volatility"].median()
-             .rename(columns={"implied_volatility":"iv"}))
-iv_1y = iv_hist.tail(252)["iv"] if not iv_hist.empty else pd.Series(dtype=float)
-iv_rank = float((iv_1y <= iv_1y.iloc[-1]).mean()) if not iv_1y.empty else np.nan
-near_atm_now = df[(df["snap_min"]==default_snapshot) & (df["days_to_exp"].between(20,40)) & (df["moneyness"].abs()<=0.01)]
-iv_atm_now = float(near_atm_now["implied_volatility"].median()) if not near_atm_now.empty else np.nan
-if not np.isnan(iv_atm_now) and not np.isnan(hv20):
-    vrp = iv_atm_now - hv20
-    explain_lines.append(f"VRP (IV−HV20) = {_fmt(vrp, pct=True)}; IV-Rank ≈ {iv_rank*100:.0f}% → {'premies relatief dik' if (iv_rank>=0.7) else 'premies gematigd/laag'}.")
-
 if explain_lines:
     st.markdown("**Explain (kort):** " + " ".join(explain_lines))
 
-# — Visuals: PCR & Δ-gewogen PCR tijdreeks
+# — Visuals: PCR tijdreeks
 if not pv.empty:
     fig_pcr_ts = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
                                subplot_titles=("Put/Call Ratio — Volume", "Put/Call Ratio — Open Interest"))
@@ -478,6 +501,7 @@ if not pv.empty:
     fig_pcr_ts.update_layout(height=520, title_text="Put/Call Ratio — Ontwikkeling", dragmode="zoom")
     st.plotly_chart(fig_pcr_ts, use_container_width=True, config=PLOTLY_CONFIG)
 
+# — Visuals: Δ-gewogen PCR tijdreeks
 if not dgp.empty:
     fig_dpcr = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
                              subplot_titles=("Delta-gewogen PCR — Volume", "Delta-gewogen PCR — Open Interest"))
@@ -489,30 +513,6 @@ if not dgp.empty:
     st.plotly_chart(fig_dpcr, use_container_width=True, config=PLOTLY_CONFIG)
 
 st.caption("**Interpretatie:** PCR ↑ (zeker Δ-gewogen) wijst op defensievere positioning (meer put-bescherming). Oplopende 25Δ-skew bevestigt hogere downside-premies.")
-
-# — Gamma-exposure (proxy) per strike @ laatste snapshot
-st.subheader("Gamma Exposure (proxy) — laatste snapshot")
-if df_last_sent.empty:
-    st.info("Geen data op het laatste snapshot.")
-else:
-    gdf = df_last_sent.copy()
-    gdf["T"]  = pd.to_numeric(gdf["days_to_exp"], errors="coerce").fillna(0)/365.0
-    gdf["Γ"]  = gdf.apply(lambda r: bs_gamma(
-        float(r["underlying_price"]), float(r["strike"]), float(r["implied_volatility"]),
-        float(r["T"]), 0.0, float(get_q_curve_const(np.array([r["T"]], dtype=float), q_const=q_const_simple, to_continuous=True)[0])
-    ), axis=1)
-    mult = 100.0
-    gdf["gex_raw"] = gdf["Γ"] * pd.to_numeric(gdf["open_interest"], errors="coerce").fillna(0) * mult * (pd.to_numeric(gdf["underlying_price"], errors="coerce")**2)
-    gex = (gdf.groupby("strike", as_index=False)["gex_raw"].sum().sort_values("strike"))
-    if gex.empty:
-        st.info("Geen (liquide) data voor een GEX-profiel.")
-    else:
-        fig_gex = go.Figure(go.Bar(x=gex["strike"], y=gex["gex_raw"], name="Gamma exposure (proxy)"))
-        fig_gex.add_vline(x=underlying_now, line=dict(dash="dot"), annotation_text="Spot")
-        fig_gex.update_layout(height=420, title=f"GEX (proxy) — {pd.to_datetime(default_snapshot).strftime('%Y-%m-%d %H:%M')}",
-                              xaxis_title="Strike", yaxis_title="Exposure (units, relatieve schaal)", dragmode="zoom")
-        st.plotly_chart(fig_gex, use_container_width=True, config=PLOTLY_CONFIG)
-
 st.markdown("---")
 
 # ─────────────────────────── A) Serie-selectie ────────────────────
@@ -536,12 +536,16 @@ else:
     a1, a2 = st.columns(2)
     with a1:
         fig_price = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_price.add_trace(go.Scatter(x=serie["snapshot_date"],
-                                       y=apply_outlier(serie[series_price_col], outlier_mode, pct_clip, z_thr),
-                                       name="Price", mode="lines+markers", connectgaps=True), secondary_y=False)
+        fig_price.add_trace(go.Scatter(
+            x=serie["snapshot_date"],
+            y=apply_outlier(serie[series_price_col], outlier_mode, pct_clip, z_thr),
+            name="Price", mode="lines+markers", connectgaps=True,
+            hovertemplate="Tijd: %{x}<br>Prijs: %{y:.2f}<extra></extra>"
+        ), secondary_y=False)
         if show_underlying:
             fig_price.add_trace(go.Scatter(x=serie["snapshot_date"], y=serie["underlying_price"],
-                                           name="SP500", mode="lines", line=dict(dash="dot"), connectgaps=True), secondary_y=True)
+                                           name="SP500", mode="lines", line=dict(dash="dot"), connectgaps=True,
+                                           hovertemplate="Tijd: %{x}<br>SPX: %{y:.2f}<extra></extra>"), secondary_y=True)
         fig_price.update_layout(title=f"{sel_type.upper()} {series_strike} — exp {series_exp} | Price vs SP500",
                                 height=420, hovermode="x unified", dragmode="zoom")
         fig_price.update_xaxes(title_text="Meetmoment")
@@ -551,12 +555,16 @@ else:
         st.caption("**Interpretatie:** stabiel verloop met smalle bid-ask en voldoende volume/oi wijst op een ‘werkbare’ serie.")
     with a2:
         fig_ppd = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_ppd.add_trace(go.Scatter(x=serie["snapshot_date"],
-                                     y=apply_outlier(ppd_series(serie), outlier_mode, pct_clip, z_thr),
-                                     name="PPD", mode="lines+markers", connectgaps=True), secondary_y=False)
+        fig_ppd.add_trace(go.Scatter(
+            x=serie["snapshot_date"],
+            y=apply_outlier(ppd_series(serie), outlier_mode, pct_clip, z_thr),
+            name="PPD", mode="lines+markers", connectgaps=True,
+            hovertemplate="Tijd: %{x}<br>PPD: %{y:.3f}<extra></extra>"
+        ), secondary_y=False)
         if show_underlying:
             fig_ppd.add_trace(go.Scatter(x=serie["snapshot_date"], y=serie["underlying_price"],
-                                         name="SP500", mode="lines", line=dict(dash="dot"), connectgaps=True), secondary_y=True)
+                                         name="SP500", mode="lines", line=dict(dash="dot"), connectgaps=True,
+                                         hovertemplate="Tijd: %{x}<br>SPX: %{y:.2f}<extra></extra>"), secondary_y=True)
         fig_ppd.update_layout(title=f"{sel_type.upper()} {series_strike} — exp {series_exp} | PPD vs SP500",
                               height=420, hovermode="x unified", dragmode="zoom")
         fig_ppd.update_xaxes(title_text="Meetmoment")
@@ -567,6 +575,11 @@ else:
 
 # ─────────────────────────── B) PPD vs Afstand ────────────────────
 st.subheader("PPD & Afstand tot Uitoefenprijs (ATM→OTM/ITM)")
+
+# 🔧 Keuze: afstandseenheid
+dist_col = st.radio("Afstandseenheid", ["% van spot", "punten (|K−S|)"], index=1, horizontal=True)
+bin_size_pts = st.slider("Bin-grootte (punten)", 10, 200, 25, step=5, disabled=dist_col != "punten (|K−S|)")
+
 default_idx = snapshots_all.index(default_snapshot) if default_snapshot in snapshots_all else len(snapshots_all)-1
 sel_snapshot = st.selectbox("Peildatum (snapshot)", options=snapshots_all, index=max(default_idx,0),
                             format_func=lambda x: pd.to_datetime(x).strftime("%Y-%m-%d %H:%M"))
@@ -575,10 +588,24 @@ df_last = df[(df["snap_min"] == sel_snapshot) & liq_mask].copy()
 if df_last.empty:
     st.info("Geen data op dit snapshot (na liquiditeit-filter).")
 else:
-    df_last["abs_dist_pct"] = ((df_last["dist_points"].abs() / df_last["underlying_price"]) * 100.0)
     df_last = df_last.assign(ppd_u=ppd_series(df_last))
-    bins = np.arange(0, 18.5, 0.5)
-    df_last["dist_bin"] = pd.cut(df_last["abs_dist_pct"], bins=bins, include_lowest=True)
+    # bins naar keuze
+    if dist_col.startswith("%"):
+        x_col = "abs_dist_pct"
+        bins = np.arange(0, 18.5, 0.5)
+        x_title = "Afstand |K−S|/S (%)"
+        cur_dist = (abs(float(series_strike) - underlying_now) / underlying_now) * 100.0 if (not np.isnan(underlying_now) and not np.isnan(series_strike)) else np.nan
+        vline_lbl = f"gekozen strike ≈ {cur_dist:.2f}%"
+    else:
+        x_col = "abs_dist_pts"
+        # Dynamisch bereik op basis van huidige strikes
+        max_pts = float(np.nanpercentile(df_last["abs_dist_pts"], 98)) if df_last["abs_dist_pts"].notna().any() else 400.0
+        bins = np.arange(0, max_pts + bin_size_pts, bin_size_pts)
+        x_title = "Afstand |K−S| (punten)"
+        cur_dist = abs(float(series_strike) - underlying_now) if (not np.isnan(underlying_now) and not np.isnan(series_strike)) else np.nan
+        vline_lbl = f"gekozen strike ≈ {cur_dist:.0f} pts"
+
+    df_last["dist_bin"] = pd.cut(df_last[x_col], bins=bins, include_lowest=True)
     g = (df_last.groupby("dist_bin").agg(ppd=("ppd_u","median"), n=("ppd_u","count")).reset_index())
     g = g[g["n"] >= min_per_bin].copy()
     g["bin_mid"] = g["dist_bin"].apply(lambda iv: iv.mid if pd.notna(iv) else np.nan)
@@ -587,50 +614,66 @@ else:
     best_idx = g["ppd_s"].idxmax() if not g.empty else None
 
     fig_ppd_dist = go.Figure()
-    fig_ppd_dist.add_vrect(x0=-0.5, x1=0.5, fillcolor="lightgrey", opacity=0.25, line_width=0,
+    fig_ppd_dist.add_vrect(x0=-0.5 if dist_col.startswith("%") else -bin_size_pts/2,
+                           x1=0.5 if dist_col.startswith("%") else bin_size_pts/2,
+                           fillcolor="lightgrey", opacity=0.25, line_width=0,
                            annotation_text="ATM-zone", annotation_position="top left")
-    if not np.isnan(underlying_now) and not np.isnan(series_strike):
-        cur_dist = abs(float(series_strike) - underlying_now) / underlying_now * 100.0
+    if not np.isnan(cur_dist):
         fig_ppd_dist.add_vline(x=cur_dist, line=dict(dash="dot"),
-                               annotation_text=f"gekozen strike ≈ {cur_dist:.2f}%", annotation_position="top right")
-    fig_ppd_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd"],   mode="markers", name="PPD (median/bin)", opacity=0.85))
-    fig_ppd_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd_s"], mode="lines",   name="Smoothed"))
-    if best_idx is not None and pd.notna(g.loc[best_idx,"ppd_s"]):
-        x_b, y_b = float(g.loc[best_idx,"bin_mid"]), float(g.loc[best_idx,"ppd_s"])
-        fig_ppd_dist.add_annotation(x=x_b, y=y_b, text=f"sweet spot ≈ {y_b:.2f} @ {x_b:.2f}%", showarrow=True, arrowhead=2)
+                               annotation_text=vline_lbl, annotation_position="top right")
+    fig_ppd_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd"],   mode="markers", name="PPD (median/bin)", opacity=0.85,
+                                      hovertemplate=f"Afstand: %{{x:.2f}}{'%' if dist_col.startswith('%') else ' pts'}<br>PPD: %{{y:.3f}}<br>N: %{{customdata}}<extra></extra>",
+                                      customdata=g["n"]))
+    fig_ppd_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd_s"], mode="lines",   name="Smoothed",
+                                      hovertemplate=f"Afstand: %{{x:.2f}}{'%' if dist_col.startswith('%') else ' pts'}<br>PPD (smooth): %{{y:.3f}}<extra></extra>"))
     fig_ppd_dist.update_layout(title=f"PPD vs Afstand — {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}",
-                               xaxis_title="Afstand |K−S|/S (%)", yaxis_title=ppd_y_label(),
+                               xaxis_title=x_title, yaxis_title=ppd_y_label(),
                                height=420, dragmode="zoom")
     st.plotly_chart(fig_ppd_dist, use_container_width=True, config=PLOTLY_CONFIG)
 
     if best_idx is not None and pd.notna(g.loc[best_idx,"ppd_s"]):
-        st.info(f"**Advies (afstand):** over dit snapshot ligt de **sweet spot** rond **{g.loc[best_idx,'bin_mid']:.1f}%** van ATM "
+        st.info(f"**Advies (afstand):** sweet spot ligt rond **{g.loc[best_idx,'bin_mid']:.1f} {'%' if dist_col.startswith('%') else 'pts'}** "
                 f"met **PPD ≈ {g.loc[best_idx,'ppd_s']:.2f}**. Combineer met DTE-inzicht hieronder.")
 
-# ─────────────────────────── C) Price/PPD vs Exp Date ─────────────
-st.subheader("Ontwikkeling Prijs per Expiratiedatum (laatste snapshot)")
+# ─────────────────────────── C) Prijs/PPD vs DTE (voor gekozen strike) ─────────
+st.subheader("Prijs/PPD vs DTE — term structure voor gekozen strike (laatste snapshot)")
+
 df_last_strike = df_last[df_last["strike"] == series_strike].copy()
 if df_last_strike.empty:
     st.info("Geen data voor deze strike op dit snapshot (na liquiditeit-filter).")
 else:
     exp_curve = (df_last_strike.assign(ppd_u=ppd_series(df_last_strike))
                  .groupby("expiration", as_index=False)
-                 .agg(price=(series_price_col, "median"), ppd=("ppd_u", "median"))
-                 .sort_values("expiration"))
+                 .agg(price=(series_price_col, "median"),
+                      ppd=("ppd_u", "median"),
+                      dte=("days_to_exp","median"))
+                 .sort_values("dte"))
     exp_curve["price_f"] = apply_outlier(exp_curve["price"], outlier_mode, pct_clip, z_thr)
     exp_curve["ppd_f"]   = apply_outlier(exp_curve["ppd"],  outlier_mode, pct_clip, z_thr)
+
     fig_exp = make_subplots(specs=[[{"secondary_y": True}]])
-    fig_exp.add_trace(go.Scatter(x=exp_curve["expiration"], y=exp_curve["price_f"],
-                                 name="Price", mode="lines+markers"), secondary_y=False)
-    fig_exp.add_trace(go.Scatter(x=exp_curve["expiration"], y=exp_curve["ppd_f"],
-                                 name="PPD", mode="lines+markers"), secondary_y=True)
-    fig_exp.update_layout(title=f"{sel_type.upper()} — Strike {series_strike} — peildatum {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}",
-                          height=420, hovermode="x unified", dragmode="zoom")
-    fig_exp.update_xaxes(title_text="Expiratiedatum")
-    fig_exp.update_yaxes(title_text="Price", secondary_y=False, rangemode="tozero")
-    fig_exp.update_yaxes(title_text=ppd_y_label(), secondary_y=True)
+    fig_exp.add_trace(go.Scatter(
+        x=exp_curve["dte"], y=exp_curve["price_f"], name="Price",
+        mode="lines+markers",
+        hovertemplate="Exp: %{customdata}<br>DTE: %{x:.0f}<br>Prijs: %{y:.2f}<extra></extra>",
+        customdata=exp_curve["expiration"].astype(str)
+    ), secondary_y=False)
+    fig_exp.add_trace(go.Scatter(
+        x=exp_curve["dte"], y=exp_curve["ppd_f"], name="PPD",
+        mode="lines+markers",
+        hovertemplate="Exp: %{customdata}<br>DTE: %{x:.0f}<br>PPD: %{y:.3f}<extra></extra>",
+        customdata=exp_curve["expiration"].astype(str)
+    ), secondary_y=True)
+
+    fig_exp.update_layout(
+        title=f"{sel_type.upper()} — Strike {series_strike} — peildatum {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}",
+        height=420, hovermode="x unified", dragmode="zoom"
+    )
+    fig_exp.update_xaxes(title_text="Days to Expiration (DTE)")
+    fig_exp.update_yaxes(title_text="Price (points)", secondary_y=False, rangemode="tozero")
+    fig_exp.update_yaxes(title_text=ppd_y_label(),     secondary_y=True)
     st.plotly_chart(fig_exp, use_container_width=True, config=PLOTLY_CONFIG)
-    st.caption("**Interpretatie:** hogere PPD bij langere DTE = meer time value/dag; spikes per datum zijn vaak events (CPI/Fed) of smile-effecten.")
+    st.caption("**Interpretatie:** bij langere DTE neemt de *time value* toe → prijs en vaak ook PPD lopen op. Spikes per datum kunnen events (CPI/Fed) of smile-effecten zijn.")
 
 # ─────────────────────────── D) PPD vs DTE ────────────────────────
 st.subheader("PPD vs DTE — opbouw van premium per dag")
@@ -669,9 +712,12 @@ else:
         pad = (hi - lo) * 0.10
         y_range = [max(lo - pad, 0.0), hi + pad]
     fig_ppd_dte = go.Figure()
-    fig_ppd_dte.add_trace(go.Scatter(x=ppd_curve["days_to_exp"], y=ppd_curve["ppd"], mode="markers", name="PPD (median)", opacity=0.85))
-    fig_ppd_dte.add_trace(go.Scatter(x=ppd_curve["days_to_exp"], y=ppd_curve["ppd_s"], mode="lines", name="Smoothed"))
-    fig_ppd_dte.update_layout(title="PPD vs Days To Expiration", xaxis_title="Days to Expiration",
+    fig_ppd_dte.add_trace(go.Scatter(x=ppd_curve["days_to_exp"], y=ppd_curve["ppd"], mode="markers", name="PPD (median)", opacity=0.85,
+                                     hovertemplate="DTE: %{x}<br>PPD: %{y:.3f}<br>N: %{customdata}<extra></extra>",
+                                     customdata=ppd_curve["n"]))
+    fig_ppd_dte.add_trace(go.Scatter(x=ppd_curve["days_to_exp"], y=ppd_curve["ppd_s"], mode="lines", name="Smoothed",
+                                     hovertemplate="DTE: %{x}<br>PPD (smooth): %{y:.3f}<extra></extra>"))
+    fig_ppd_dte.update_layout(title="PPD vs Days To Expiration", xaxis_title="Days to Expiration (DTE)",
                               yaxis_title=ppd_y_label(), height=420, dragmode="zoom")
     if y_range: fig_ppd_dte.update_yaxes(range=y_range)
     st.plotly_chart(fig_ppd_dte, use_container_width=True, config=PLOTLY_CONFIG)
@@ -741,7 +787,7 @@ else:
 
 # ─────────────────────────── G) Put/Call-ratio per exp ────────────
 st.subheader("Put/Call-ratio per expiratie")
-p = (df[liq_mask].groupby(["expiration","type"], as_index=False)
+p = (df_both[liq_mask_both].groupby(["expiration","type"], as_index=False)
        .agg(vol=("volume","sum"), oi=("open_interest","sum")))
 if p.empty:
     st.info("Geen data voor PCR.")
@@ -855,7 +901,7 @@ else:
         s_list = sorted(df_str[df_str["type"]==side]["strike"].unique().tolist()) if not df_str.empty else []
         return pick_closest_value(s_list, target_price, fallback=(s_list[len(s_list)//2] if s_list else 6000.0))
 
-    # —— r/q instellingen + fallback —— 
+    # r/q (fallbacks)
     q_const_simple2 = q_const_simple
     _T = np.array([T if not np.isnan(T) else 30/365.0], dtype=float)
     try:
@@ -1130,4 +1176,4 @@ if not vix_vs_iv.empty:
     st.plotly_chart(fig_vix, use_container_width=True, config=PLOTLY_CONFIG)
 
 # ─────────────────────────── Footer ───────────────────────────────
-st.caption("🔍 Navigatie: zoom met scroll/pinch, **double-click** om automatisch te rescalen. Filters voor **OI/Volume** helpen spikes te verwijderen en geven realistischer curves.")
+st.caption("🔍 Navigatie: zoom met scroll/pinch, **double-click** om te rescalen. Met de afstand-toggle (% ↔︎ punten) wordt de interpretatie van sweet spots vaak directer.")
