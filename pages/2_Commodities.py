@@ -315,7 +315,6 @@ with st.container():
         )
     with c2:
         if combo_sel:
-            # Kies standaard de 2e als rechteras (als die er is)
             default_idx = 1 if len(combo_sel) >= 2 else 0
             right_choice = st.selectbox(
                 "Rechter y-as",
@@ -397,12 +396,13 @@ if len(combo_sel) >= 2 and right_choice is not None:
         fig.update_yaxes(title_text=left_title,  autorange=True, secondary_y=False)
         fig.update_yaxes(title_text=right_title, autorange=True, secondary_y=True)
 
+        # >>> Overlap-fix: geen figuurtitel, extra topmarge, legenda iets hoger
         fig.update_layout(
             height=480,
-            margin=dict(l=10, r=10, t=40, b=10),
-            title="Combinatiegrafiek (expliciete rechteras, autoscale)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+            margin=dict(l=10, r=10, t=60, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0)
         )
+
         st.plotly_chart(fig, use_container_width=True)
 
         # Correlatie (toon als er minstens 2 linkeras-series zijn)
