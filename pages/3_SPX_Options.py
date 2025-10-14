@@ -705,253 +705,142 @@ else:
     st.plotly_chart(fig_exp, use_container_width=True, config=PLOTLY_CONFIG)
     st.caption("**Interpretatie:** bij langere DTE neemt de *time value* toe → prijs en vaak ook PPD lopen op. Spikes per datum kunnen events (CPI/Fed) of smile-effecten zijn.")
 
-# ─────────────────────────── D) PPD vs DTE ────────────────────────
+# ─────────────────────────── D) PPD vs DTE — opbouw van premium per dag ───────────────────────────
 st.subheader("PPD vs DTE — opbouw van premium per dag")
 
-m1, m2, m3, m4, m5 = st.columns([1.25, 1.0, 1.0, 1.0, 1.0])
-with m1:
-    ppd_mode = st.radio("Bereik", ["ATM-band (moneyness)", "Rond gekozen strike (meerdere afstanden)"], index=1)
-with m2:
-    price_for_margin = st.radio("Prijsbron (margin)", ["mid_price", "last_price"], index=0, horizontal=True)
-with m3:
-    multiplier_ppd = st.number_input("Contract multiplier", min_value=10, max_value=500, value=100, step=10)
-with m4:
-    use_last_snap = st.checkbox("Alleen laatste snapshot", value=False)
-with m5:
-    robust_scale = st.checkbox("Robust scale (95e pct)", value=True)
+d_c1, d_c2, d_c3, d_c4, d_c5 = st.columns([1.2, 1, 1, 1, 1])
+with d_c1:
+    d_ppd_mode = st.radio("Bereik", ["ATM-band (moneyness)", "Rond gekozen strike"],
+                          index=0, key="d_ppd_mode_key")
+with d_c2:
+    d_atm_band = st.slider("ATM-band (± moneyness %)", 0.01, 0.10, 0.02, step=0.01,
+                           key="d_atm_band_key")
+with d_c3:
+    d_strike_window = st.slider("Strike-venster rond gekozen strike (punten)", 10, 500, 50, step=10,
+                                key="d_strike_window_key")
+with d_c4:
+    d_use_last_snap = st.checkbox("Alleen laatste snapshot", value=True, key="d_use_last_snap_key")
+with d_c5:
+    d_robust_scale = st.checkbox("Robust scale (95e pct)", value=True, key="d_robust_scale_key")
 
-# basisdata + liquiditeit
-base_df = (df_last if use_last_snap else df).copy()
-base_df = base_df[((base_df["open_interest"].fillna(0) >= min_oi) | (base_df["volume"].fillna(0) >= min_vol))]
+d_base = (df_last if d_use_last_snap else df).copy()
+d_base = d_base[liq_mask]
 
-# helper: Reg-T benadering voor ÉÉN korte optie (call/put)
-def regt_short_margin(S, K, typ: str, opt_price_pts: float, multiplier: int = 100) -> float:
-    if np.isnan(S) or np.isnan(K) or np.isnan(opt_price_pts) or S <= 0:
-        return np.nan
-    otm = max(K - S, 0.0) if typ == "call" else max(S - K, 0.0)
-    base = max(0.20 * S - otm, 0.10 * S)  # CBOE/FINRA-achtige vuistregel
-    return float((opt_price_pts + base) * multiplier)
-
-if ppd_mode.startswith("ATM"):
-    # ATM-band modus (ongewijzigd, maar laat staan voor de volledigheid)
-    atm_band = st.slider("ATM-band (± moneyness %)", 0.01, 0.20, 0.02, step=0.01)
-    df_ppd = base_df[np.abs(base_df["moneyness"]) <= atm_band].copy()
-    if df_ppd.empty:
-        st.info("Geen data voor PPD vs DTE met deze instellingen.")
-    else:
-        df_ppd = df_ppd.assign(ppd_u=ppd_series(df_ppd))
-        ppd_curve = (df_ppd.groupby("days_to_exp", as_index=False)
-                            .agg(ppd=("ppd_u","median"), n=("ppd_u","count"))
-                            .query("n >= @min_per_bin")
-                            .sort_values("days_to_exp"))
-        ppd_curve["ppd_s"] = smooth_series(ppd_curve["ppd"], window=3)
-
-        y_range = None
-        if robust_scale and ppd_curve["ppd"].notna().any():
-            hi = float(np.nanpercentile(ppd_curve["ppd"], 95))
-            lo = float(np.nanpercentile(ppd_curve["ppd"], 5))
-            pad = (hi - lo) * 0.10
-            y_range = [max(lo - pad, 0.0), hi + pad]
-
-        fig_ppd_dte = go.Figure()
-        fig_ppd_dte.add_trace(go.Scatter(x=ppd_curve["days_to_exp"], y=ppd_curve["ppd"], mode="markers",
-                                         name="PPD (median)", opacity=0.85,
-                                         customdata=ppd_curve["n"],
-                                         hovertemplate="DTE: %{x}<br>PPD: %{y:.3f}<br>N: %{customdata}<extra></extra>"))
-        fig_ppd_dte.add_trace(go.Scatter(x=ppd_curve["days_to_exp"], y=ppd_curve["ppd_s"], mode="lines",
-                                         name="Smoothed",
-                                         hovertemplate="DTE: %{x}<br>PPD(s): %{y:.3f}<extra></extra>"))
-        fig_ppd_dte.update_layout(title="PPD vs Days To Expiration (ATM-band)",
-                                  xaxis_title="Days to Expiration (DTE)",
-                                  yaxis_title=ppd_y_label(), height=420, dragmode="zoom")
-        if y_range: fig_ppd_dte.update_yaxes(range=y_range)
-        st.plotly_chart(fig_ppd_dte, use_container_width=True, config=PLOTLY_CONFIG)
+if d_ppd_mode.startswith("ATM"):
+    d_df = d_base[np.abs(d_base["moneyness"]) <= d_atm_band].copy()
 else:
-    # MULTI-AFSTAND (ringen rond de gekozen strike)
-    c1, c2 = st.columns([1.2, 1.0])
-    with c1:
-        distances = st.multiselect("Afstanden |K−S_strike| (punten)",
-                                   options=[100, 200, 300, 400, 500, 600, 800, 1000],
-                                   default=[200, 400, 600, 800])
-    with c2:
-        tol_pts = st.slider("Tolerantie (± punten rondom afstand)", 10, 250, 50, step=10)
+    d_df = d_base[(d_base["strike"] >= series_strike - d_strike_window)
+                  & (d_base["strike"] <= series_strike + d_strike_window)].copy()
 
-    if not distances:
-        st.info("Kies minstens één afstand (bijv. 200/400/600).")
-    else:
-        fig_ppd_multi = go.Figure()
-        fig_ppm_multi = go.Figure()  # PPD per Margin
+if d_df.empty:
+    st.info("Geen data voor PPD vs DTE met deze instellingen.")
+else:
+    d_df = d_df.assign(ppd_u=ppd_series(d_df))
+    d_curve = (d_df.groupby("days_to_exp", as_index=False)
+                  .agg(ppd=("ppd_u","median"), n=("ppd_u","count"))
+                  .query("n >= @min_per_bin")
+                  .sort_values("days_to_exp"))
+    d_curve["ppd_s"] = smooth_series(d_curve["ppd"], window=3)
 
-        all_y_ppd = []
-        all_y_ppm = []
+    y_range = None
+    if d_robust_scale and d_curve["ppd"].notna().any():
+        d_hi = float(np.nanpercentile(d_curve["ppd"], 95))
+        d_lo = float(np.nanpercentile(d_curve["ppd"], 5))
+        d_pad = (d_hi - d_lo) * 0.10
+        y_range = [max(d_lo - d_pad, 0.0), d_hi + d_pad]
 
-        for d in distances:
-            ring_mask = (np.abs(np.abs(base_df["strike"] - series_strike) - d) <= tol_pts)
-            sub = base_df[ring_mask].copy()
-            if sub.empty:
-                continue
+    fig_ppd_dte = go.Figure()
+    fig_ppd_dte.add_trace(go.Scatter(
+        x=d_curve["days_to_exp"], y=d_curve["ppd"], mode="markers", name="PPD (median)", opacity=0.85,
+        hovertemplate="DTE: %{x}<br>PPD: %{y:.3f}<br>N: %{customdata}<extra></extra>",
+        customdata=d_curve["n"]
+    ))
+    fig_ppd_dte.add_trace(go.Scatter(
+        x=d_curve["days_to_exp"], y=d_curve["ppd_s"], mode="lines", name="Smoothed",
+        hovertemplate="DTE: %{x}<br>PPD (smooth): %{y:.3f}<extra></extra>"
+    ))
+    fig_ppd_dte.update_layout(title="PPD vs Days To Expiration",
+                              xaxis_title="Days to Expiration (DTE)",
+                              yaxis_title=ppd_y_label(), height=420, dragmode="zoom")
+    if y_range: fig_ppd_dte.update_yaxes(range=y_range)
+    st.plotly_chart(fig_ppd_dte, use_container_width=True, config=PLOTLY_CONFIG)
 
-            # PPD (points/day)
-            sub = sub.assign(ppd_u=ppd_series(sub))
-            curve = (sub.groupby("days_to_exp", as_index=False)
-                           .agg(ppd=("ppd_u","median"), n=("ppd_u","count"))
-                           .query("n >= @min_per_bin")
-                           .sort_values("days_to_exp"))
-            if not curve.empty:
-                curve["ppd_s"] = smooth_series(curve["ppd"], window=3)
-                legend = f"|K−S| ≈ {d}±{tol_pts} pts"
-                all_y_ppd.extend([curve["ppd"], curve["ppd_s"]])
+    d_sweet = d_curve.loc[d_curve["ppd_s"].idxmax()] if not d_curve.empty else None
+    if d_sweet is not None and pd.notna(d_sweet["ppd_s"]):
+        st.info(f"**Advies (DTE):** de PPD-sweet spot ligt rond **{int(d_sweet['days_to_exp'])} dagen** "
+                f"met **PPD ≈ {d_sweet['ppd_s']:.2f}**. Combineer dit met de afstand-sweet spot hierboven.")
 
-                fig_ppd_multi.add_trace(go.Scatter(
-                    x=curve["days_to_exp"], y=curve["ppd"], mode="markers",
-                    name=f"{legend} (median)", opacity=0.65, customdata=curve["n"],
-                    hovertemplate="DTE: %{x}<br>PPD: %{y:.3f}<br>N: %{customdata}<extra></extra>"
-                ))
-                fig_ppd_multi.add_trace(go.Scatter(
-                    x=curve["days_to_exp"], y=curve["ppd_s"], mode="lines",
-                    name=f"{legend} (smooth)",
-                    hovertemplate="DTE: %{x}<br>PPD(s): %{y:.3f}<extra></extra>"
-                ))
 
-            # PPD per margin (cash/day ÷ margin)
-            # — bereken rij-voor-rij margin voor ÉÉN korte optie (huidig 'sel_type')
-            tmp = sub.copy()
-            typ = sel_type.lower()
-            # kies prijs voor margin
-            px = pd.to_numeric(tmp.get(price_for_margin, np.nan), errors="coerce")
-            px = px.where(px.notna(), pd.to_numeric(tmp.get("mid_price", np.nan), errors="coerce"))
-            # margin ruw
-            tmp["est_margin"] = np.vectorize(regt_short_margin)(
-                pd.to_numeric(tmp["underlying_price"], errors="coerce"),
-                pd.to_numeric(tmp["strike"], errors="coerce"),
-                typ,
-                px,
-                multiplier_ppd
-            )
-            # cash per dag
-            tmp["cash_per_day"] = tmp["ppd_u"].astype(float) * float(multiplier_ppd)
-            tmp["ppd_per_margin"] = tmp["cash_per_day"] / tmp["est_margin"]
-            tmp = tmp.replace([np.inf, -np.inf], np.nan).dropna(subset=["ppd_per_margin", "days_to_exp"])
-
-            curve_m = (tmp.groupby("days_to_exp", as_index=False)
-                          .agg(ppm=("ppd_per_margin","median"), n=("ppd_per_margin","count"))
-                          .query("n >= @min_per_bin")
-                          .sort_values("days_to_exp"))
-            if not curve_m.empty:
-                curve_m["ppm_s"] = smooth_series(curve_m["ppm"], window=3)
-                all_y_ppm.extend([curve_m["ppm"], curve_m["ppm_s"]])
-
-                fig_ppm_multi.add_trace(go.Scatter(
-                    x=curve_m["days_to_exp"], y=curve_m["ppm"], mode="markers",
-                    name=f"{legend} (median)", opacity=0.65, customdata=curve_m["n"],
-                    hovertemplate="DTE: %{x}<br>PPD/Margin: %{y:.5f}<br>N: %{customdata}<extra></extra>"
-                ))
-                fig_ppm_multi.add_trace(go.Scatter(
-                    x=curve_m["days_to_exp"], y=curve_m["ppm_s"], mode="lines",
-                    name=f"{legend} (smooth)",
-                    hovertemplate="DTE: %{x}<br>PPD/Margin(s): %{y:.5f}<extra></extra>"
-                ))
-
-        # schaal robuust zetten
-        if all_y_ppd:
-            if robust_scale:
-                concat_y = pd.concat(all_y_ppd).astype(float)
-                hi = float(np.nanpercentile(concat_y, 95)); lo = float(np.nanpercentile(concat_y, 5)); pad = (hi-lo)*0.10
-                fig_ppd_multi.update_yaxes(range=[max(lo - pad, 0.0), hi + pad])
-            fig_ppd_multi.update_layout(
-                title=f"PPD vs DTE — rond strike {series_strike} (meerdere afstanden)",
-                xaxis_title="Days to Expiration (DTE)", yaxis_title=ppd_y_label(),
-                height=440, dragmode="zoom",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
-            )
-            st.plotly_chart(fig_ppd_multi, use_container_width=True, config=PLOTLY_CONFIG)
-        else:
-            st.info("Geen PPD-data binnen de gekozen ringen/tolerantie.")
-
-        if all_y_ppm:
-            if robust_scale:
-                concat_y2 = pd.concat(all_y_ppm).astype(float)
-                hi2 = float(np.nanpercentile(concat_y2, 95)); lo2 = float(np.nanpercentile(concat_y2, 5)); pad2 = (hi2-lo2)*0.10
-                fig_ppm_multi.update_yaxes(range=[max(lo2 - pad2, 0.0), hi2 + pad2])
-            fig_ppm_multi.update_layout(
-                title=f"PPD per Margin vs DTE — {sel_type.upper()} rond strike {series_strike}",
-                xaxis_title="Days to Expiration (DTE)", yaxis_title="PPD / Margin (per 1x)",
-                height=440, dragmode="zoom",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
-            )
-            st.plotly_chart(fig_ppm_multi, use_container_width=True, config=PLOTLY_CONFIG)
-        else:
-            st.info("Geen PPD/Margin-data binnen de gekozen ringen/tolerantie.")
-
-st.markdown("---")
-
-# ─────────────────────────── D+) PPD per Margin — Strangles ───────────────────
+# ─────────────────────────── D+) PPD per Margin — Strangles (meerdere afstanden) ───────────────────────────
 st.subheader("PPD per Margin — Strangles (meerdere afstanden)")
 
 s1, s2, s3 = st.columns([1.2, 1.0, 1.0])
 with s1:
     str_dists = st.multiselect("Afstanden t.o.v. onderliggende |S−K| (punten)",
                                options=[100, 200, 300, 400, 500, 600, 800, 1000],
-                               default=[200, 400, 600, 800])
+                               default=[200, 400, 600, 800], key="str_dists_multi")
 with s2:
-    str_tol = st.slider("Tolerantie (± punten rondom doelstrike)", 10, 300, 50, step=10)
+    str_tol = st.slider("Tolerantie (± punten rondom doelstrike)", 10, 300, 50, step=10,
+                        key="str_tol_slider")
 with s3:
-    str_price_col = st.radio("Prijsbron", ["mid_price", "last_price"], index=0, horizontal=True)
+    str_price_col = st.radio("Prijsbron", ["mid_price", "last_price"], index=0,
+                             horizontal=True, key="str_price_src")
 
 t1, t2, t3, t4 = st.columns([1.0, 1.0, 1.0, 1.0])
 with t1:
-    str_multiplier = st.number_input("Contract multiplier", 10, 500, 100, step=10)
+    str_multiplier = st.number_input("Contract multiplier", 10, 500, 100, step=10,
+                                     key="str_multiplier_num")
 with t2:
-    str_use_last = st.checkbox("Alleen laatste snapshot", value=True)
+    str_use_last = st.checkbox("Alleen laatste snapshot", value=True, key="str_last_only")
 with t3:
-    str_margin_model = st.radio("Margin model", ["SPAN-like stress", "Reg-T approx"], index=1, horizontal=True)
+    str_margin_model = st.radio("Margin model", ["SPAN-like stress", "Reg-T approx"], index=1,
+                                horizontal=True, key="str_margin_model")
 with t4:
-    str_robust = st.checkbox("Robust scale (95e pct)", value=True)
+    str_robust = st.checkbox("Robust scale (95e pct)", value=True, key="str_robust_scale")
 
 if str_margin_model.startswith("SPAN"):
     u1, u2 = st.columns([1, 1])
     with u1:
-        stress_down = st.slider("SPAN down-shock (%)", 5, 30, 15, step=1)
+        stress_down = st.slider("SPAN down-shock (%)", 5, 30, 15, step=1, key="str_span_down")
     with u2:
-        stress_up   = st.slider("SPAN up-shock (%)",   5, 30, 10, step=1)
+        stress_up   = st.slider("SPAN up-shock (%)",   5, 30, 10, step=1, key="str_span_up")
 
 # brondata (beide types) + liquiditeit
-src = (df_both.copy() if not str_use_last else df_both[df_both["snap_min"] == default_snapshot].copy())
+src = df_both.copy() if not str_use_last else df_both[df_both["snap_min"] == default_snapshot].copy()
 src = src[((src["open_interest"].fillna(0) >= min_oi) | (src["volume"].fillna(0) >= min_vol))]
 
 def _nearest(rows: pd.DataFrame, target: float, tol: float) -> pd.DataFrame:
-    """Pak rijen waarvan strike binnen tol van target ligt; kies dichtstbijzijnde als er meerdere zijn."""
+    """Rijen waarvan strike binnen tol van target ligt; dichtstbij per snapshot/expiratie."""
     r = rows.loc[(rows["strike"] - target).abs() <= tol].copy()
-    if r.empty: 
+    if r.empty:
         return r
-    # neem per snapshot/expiration de dichtstbijzijnde
-    r["dist"] = (r["strike"] - target).abs()
-    return r.sort_values("dist").groupby(["snapshot_date","expiration"], as_index=False).first()
+    r["dist_px"] = (r["strike"] - target).abs()
+    return r.sort_values("dist_px").groupby(["snapshot_date","expiration"], as_index=False).first()
 
 def _ppd_per_margin_curve(distance_pts: int) -> pd.DataFrame:
     if src.empty or np.isnan(underlying_now):
         return pd.DataFrame()
     out = []
-    # werk per expiratie
     for exp, g in src.groupby("expiration"):
         dte = float(pd.to_numeric(g["days_to_exp"], errors="coerce").median())
-        if not (dte and dte > 0): 
+        if not (dte and dte > 0):
             continue
         S_med = float(pd.to_numeric(g["underlying_price"], errors="coerce").median())
-        # doelstrikes rond onderliggende S
         Kp_tgt = S_med - distance_pts
         Kc_tgt = S_med + distance_pts
+
         gp = _nearest(g[g["type"].str.lower()=="put"],  Kp_tgt, str_tol)
         gc = _nearest(g[g["type"].str.lower()=="call"], Kc_tgt, str_tol)
         if gp.empty or gc.empty:
             continue
-        # mediane prijzen per been
+
         put_px  = float(pd.to_numeric(gp[str_price_col], errors="coerce").median())
         call_px = float(pd.to_numeric(gc[str_price_col], errors="coerce").median())
-        if any(np.isnan([put_px, call_px])): 
+        if any(np.isnan([put_px, call_px])):
             continue
+
         credit_pts = put_px + call_px
-        # margin schatting
+
         if str_margin_model.startswith("SPAN"):
             est_margin = span_like_margin(S_med, Kp_tgt, Kc_tgt, credit_pts,
                                           down=stress_down/100.0, up=stress_up/100.0,
@@ -959,28 +848,31 @@ def _ppd_per_margin_curve(distance_pts: int) -> pd.DataFrame:
         else:
             est_margin = regt_strangle_margin(S_med, Kp_tgt, Kc_tgt, put_px, call_px,
                                               multiplier=int(str_multiplier))
+
         if not (est_margin and est_margin > 0):
             continue
-        # PPD total (points/day) en ratio
-        ppd_total_pts = credit_pts / dte
-        ppm = (ppd_total_pts * float(str_multiplier)) / float(est_margin)
-        out.append({"distance": distance_pts, "expiration": exp, "dte": dte,
-                    "ppd_total": ppd_total_pts, "ppm": ppm, "S": S_med,
-                    "Kp": Kp_tgt, "Kc": Kc_tgt, "credit_pts": credit_pts, "margin": est_margin})
+
+        ppd_total_pts = credit_pts / dte                         # punten per dag (totaal)
+        ppm = (ppd_total_pts * float(str_multiplier)) / float(est_margin)  # PPD per margin
+
+        out.append({
+            "distance": distance_pts, "expiration": exp, "dte": dte,
+            "ppd_total": ppd_total_pts, "ppm": ppm, "S": S_med,
+            "Kp": Kp_tgt, "Kc": Kc_tgt, "credit_pts": credit_pts, "margin": est_margin
+        })
     return pd.DataFrame(out).sort_values("dte")
 
-# curves bouwen
 curves = {d: _ppd_per_margin_curve(d) for d in str_dists}
 any_data = any((not df_.empty) for df_ in curves.values())
 
 if not any_data:
     st.info("Geen voldoende data binnen gekozen afstanden/tolerantie. Vergroot tolerantie of kies extra afstanden.")
 else:
-    # Plot 1: PPD (totale punten/dag) per DTE — strangle
+    # Plot 1: PPD (totaal) vs DTE
     fig_ppd_str = go.Figure()
     all_ppd_vals = []
     for d, dfc in curves.items():
-        if dfc.empty: 
+        if dfc.empty:
             continue
         all_ppd_vals.append(dfc["ppd_total"])
         fig_ppd_str.add_trace(go.Scatter(
@@ -990,8 +882,8 @@ else:
         ))
     if all_ppd_vals and str_robust:
         y = pd.concat(all_ppd_vals).astype(float)
-        lo, hi = np.nanpercentile(y, [5,95]); pad = (hi-lo)*0.10
-        fig_ppd_str.update_yaxes(range=[max(lo-pad,0.0), hi+pad])
+        lo, hi = np.nanpercentile(y, [5, 95]); pad = (hi - lo) * 0.10
+        fig_ppd_str.update_yaxes(range=[max(lo - pad, 0.0), hi + pad])
     fig_ppd_str.update_layout(
         title="Strangle — PPD (points/day) vs DTE",
         xaxis_title="Days to Expiration (DTE)", yaxis_title="PPD (points/day)",
@@ -999,11 +891,11 @@ else:
     )
     st.plotly_chart(fig_ppd_str, use_container_width=True, config=PLOTLY_CONFIG)
 
-    # Plot 2: PPD per Margin vs DTE — strangle
+    # Plot 2: PPD per Margin vs DTE
     fig_ppm = go.Figure()
     all_ppm_vals = []
     for d, dfc in curves.items():
-        if dfc.empty: 
+        if dfc.empty:
             continue
         all_ppm_vals.append(dfc["ppm"])
         fig_ppm.add_trace(go.Scatter(
@@ -1013,8 +905,8 @@ else:
         ))
     if all_ppm_vals and str_robust:
         y2 = pd.concat(all_ppm_vals).astype(float)
-        lo2, hi2 = np.nanpercentile(y2, [5,95]); pad2 = (hi2-lo2)*0.10
-        fig_ppm.update_yaxes(range=[max(lo2-pad2,0.0), hi2+pad2])
+        lo2, hi2 = np.nanpercentile(y2, [5, 95]); pad2 = (hi2 - lo2) * 0.10
+        fig_ppm.update_yaxes(range=[max(lo2 - pad2, 0.0), hi2 + pad2])
     fig_ppm.update_layout(
         title=f"Strangle — PPD per Margin vs DTE ({str_margin_model})",
         xaxis_title="Days to Expiration (DTE)", yaxis_title="PPD / Margin (per 1x)",
@@ -1022,7 +914,7 @@ else:
     )
     st.plotly_chart(fig_ppm, use_container_width=True, config=PLOTLY_CONFIG)
 
-    # korte samenvatting (laatste punt per afstand)
+    # samenvatting (laatste punt per afstand)
     rows = []
     for d, dfc in curves.items():
         if dfc.empty: 
@@ -1031,9 +923,10 @@ else:
         rows.append((d, int(round(last["dte"])), float(last["ppd_total"]), float(last["ppm"])))
     if rows:
         rows = sorted(rows, key=lambda r: r[3], reverse=True)
-        top = rows[0]
-        st.info(f"**Beste ratio bij huidige instellingen:** afstand ≈ **{top[0]} pts** → "
-                f"DTE ~ **{top[1]}** | PPD ≈ **{top[2]:.2f}** | **PPD/Margin ≈ {top[3]:.5f}**.")
+        best = rows[0]
+        st.info(f"**Beste ratio bij huidige instellingen:** afstand ≈ **{best[0]} pts** → "
+                f"DTE ~ **{best[1]}** | PPD ≈ **{best[2]:.2f}** | **PPD/Margin ≈ {best[3]:.5f}**.")
+
 
 # ─────────────────────────── E) Matrix — meetmoment × strike ──────
 st.subheader("Matrix — meetmoment × strike")
