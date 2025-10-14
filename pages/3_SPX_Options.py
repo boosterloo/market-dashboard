@@ -377,36 +377,76 @@ if not pcr_df.empty:
 else:
     pv = pd.DataFrame(columns=["PCR_vol","PCR_oi"])
 
-# — Delta-gewogen PCR (tijdreeks) uit beide types
-dg_mask = (df_both["days_to_exp"].between(7, 45)) & (df_both["moneyness"].abs() <= 0.20) & liq_mask_both
+# — Delta-gewogen PCR (tijdreeks) uit beide types  ─────────────────
+dg_mask = (
+    df_both["days_to_exp"].between(7, 45)
+    & (df_both["moneyness"].abs() <= 0.20)
+    & liq_mask_both
+)
 dg = df_both[dg_mask].copy()
+
 if not dg.empty:
-    T = (pd.to_numeric(dg["days_to_exp"], errors="coerce").fillna(0)/365.0).astype(float)
-    S = pd.to_numeric(dg["underlying_price"], errors="coerce").astype(float)
-    K = pd.to_numeric(dg["strike"], errors="coerce").astype(float)
+    # Inputs voor delta
+    T  = pd.to_numeric(dg["days_to_exp"], errors="coerce").fillna(0).astype(float) / 365.0
+    S  = pd.to_numeric(dg["underlying_price"], errors="coerce").astype(float)
+    K  = pd.to_numeric(dg["strike"], errors="coerce").astype(float)
     IV = pd.to_numeric(dg["implied_volatility"], errors="coerce").astype(float)
-    is_call = (dg["type"].str.lower()=="call").astype(bool)
-    # q-cont per T
-    q_arr = np.vectorize(lambda t: float(get_q_curve_const(np.array([t], dtype=float), q_const=q_const_simple, to_continuous=True)[0]))(T.values)
-    deltas = np.vectorize(bs_delta)(S.values, K.values, IV.values, T.values, np.zeros_like(T.values), q_arr, is_call.values)
+    is_call = dg["type"].str.lower().eq("call").astype(bool)
+
+    # q-continuous per T (r op 0 als fallback)
+    q_arr = np.array([float(get_q_curve_const(np.array([t], dtype=float),
+                                              q_const=q_const_simple,
+                                              to_continuous=True)[0]) for t in T], dtype=float)
+
+    deltas = np.vectorize(bs_delta)(
+        S.values, K.values, IV.values, T.values,
+        np.zeros_like(T.values), q_arr, is_call.values
+    )
     dg["delta_abs"] = np.abs(deltas)
-    dg["dw_vol"] = dg["delta_abs"] * pd.to_numeric(dg["volume"], errors="coerce").fillna(0)
-    dg["dw_oi"]  = dg["delta_abs"] * pd.to_numeric(dg["open_interest"], errors="coerce").fillna(0)
-    dgt = (dg.assign(day=dg["snapshot_date"].dt.date)
-             .groupby(["day","type"], as_index=False)
-             .agg(dw_vol=("dw_vol","sum"), dw_oi=("dw_oi","sum")))
-    dgp = (dgt.pivot_table(index="day", columns="type", values=["dw_vol","dw_oi"], aggfunc="sum")
-               .sort_index().sort_index(axis=1)).fillna(0.0)
-    if ("dw_vol_put" in dgp.columns) and ("dw_vol_call" in dgp.columns):
-        dgp["PCR_delta_vol"] = dgp["dw_vol_put"] / dgp["dw_vol_call"].replace(0, np.nan)
-    else:
-        dgp["PCR_delta_vol"] = np.nan
-    if ("dw_oi_put" in dgp.columns) and ("dw_oi_call" in dgp.columns):
-        dgp["PCR_delta_oi"] = dgp["dw_oi_put"] / dgp["dw_oi_call"].replace(0, np.nan)
-    else:
-        dgp["PCR_delta_oi"] = np.nan
+    dg["dw_vol"] = dg["delta_abs"] * pd.to_numeric(dg["volume"], errors="coerce").fillna(0.0)
+    dg["dw_oi"]  = dg["delta_abs"] * pd.to_numeric(dg["open_interest"], errors="coerce").fillna(0.0)
+
+    dgt = (
+        dg.assign(day=dg["snapshot_date"].dt.date)
+          .groupby(["day", "type"], as_index=False)
+          .agg(dw_vol=("dw_vol", "sum"), dw_oi=("dw_oi", "sum"))
+    )
+
+    # Pivot + kolommen flatten
+    dgp = (
+        dgt.pivot_table(index="day", columns="type", values=["dw_vol", "dw_oi"], aggfunc="sum")
+           .sort_index().sort_index(axis=1)
+           .fillna(0.0)
+    )
+    dgp.columns = [f"{a}_{b}" for a, b in dgp.columns.to_flat_index()]
+
+    # Zorg dat verwachte kolommen bestaan
+    for col in ["dw_vol_put","dw_vol_call","dw_oi_put","dw_oi_call"]:
+        if col not in dgp.columns:
+            dgp[col] = np.nan
+
+    # PCR’s
+    dgp["PCR_delta_vol"] = dgp["dw_vol_put"] / dgp["dw_vol_call"].replace({0: np.nan})
+    dgp["PCR_delta_oi"]  = dgp["dw_oi_put"]  / dgp["dw_oi_call"].replace({0: np.nan})
+    dgp = dgp.replace([np.inf, -np.inf], np.nan)[["PCR_delta_vol","PCR_delta_oi"]].dropna(how="all")
 else:
     dgp = pd.DataFrame(columns=["PCR_delta_vol","PCR_delta_oi"])
+
+# Plot
+if not dgp.empty:
+    fig_dpcr = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        subplot_titles=("Delta-gewogen PCR — Volume", "Delta-gewogen PCR — Open Interest")
+    )
+    fig_dpcr.add_trace(go.Scatter(x=dgp.index, y=dgp["PCR_delta_vol"], mode="lines", name="Δ-PCR (Vol)"), row=1, col=1)
+    fig_dpcr.add_hline(y=1.0, line=dict(dash="dot"), row=1, col=1)
+    fig_dpcr.add_trace(go.Scatter(x=dgp.index, y=dgp["PCR_delta_oi"],  mode="lines", name="Δ-PCR (OI)"),  row=2, col=1)
+    fig_dpcr.add_hline(y=1.0, line=dict(dash="dot"), row=2, col=1)
+    fig_dpcr.update_layout(height=520, title_text="Delta-gewogen Put/Call Ratio — Ontwikkeling", dragmode="zoom")
+    st.plotly_chart(fig_dpcr, use_container_width=True, config=PLOTLY_CONFIG)
+else:
+    st.info("Geen Δ-gewogen PCR te berekenen voor de huidige filters (probeer lagere min OI/volume of ruimere DTE/moneyness).")
+
 
 # — 25Δ Skew (laatste snapshot) uit beide types
 df_last_sent = df_both[(df_both["snap_min"] == default_snapshot) & liq_mask_both].copy() if default_snapshot is not None else pd.DataFrame()
