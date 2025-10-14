@@ -125,32 +125,32 @@ def arrow_and_color(x: float) -> tuple[str, str]:
         return ("▼", "red")
     return ("■", "default")
 
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.header("⚙️ Instellingen")
+# =======================
+#   TOP CONTROLS (MAIN)
+# =======================
+min_d, max_d = df_wide["date"].min(), df_wide["date"].max()
+default_start = max(max_d - timedelta(days=365), min_d)
 
-    min_d, max_d = df_wide["date"].min(), df_wide["date"].max()
-    default_start = max(max_d - timedelta(days=365), min_d)
-
+with st.container():
+    st.markdown("#### 📅 Periode")
     date_range = st.slider(
-        "📅 Periode",
+        label="Periode",
         min_value=min_d, max_value=max_d,
         value=(default_start, max_d),
         step=timedelta(days=1),
         format="YYYY-MM-DD",
+        help="Sleep om de periode te kiezen. Deze schuiver staat bewust bovenaan voor meer precisie."
     )
-    avg_mode   = st.radio("Gemiddelde", ["EMA", "SMA"], index=0, horizontal=True)
-    show_delta = st.checkbox("Δ%-grafieken tonen", value=True)
-    show_combos = st.checkbox("Combinatiegrafieken tonen (Energy & Metals)", value=True)
-    collapse   = st.checkbox("Secties inklapbaar maken", value=False)
 
-    selected = st.multiselect(
-        "Instrumenten",
-        options=ordered_all,
-        default=ordered_all[:6] if len(ordered_all) >= 6 else ordered_all,
-        format_func=label_of,
-        help="Selecteer welke instrumenten je onderaan in detail wilt zien."
-    )
+# ---------- Sidebar (overige instellingen) ----------
+with st.sidebar:
+    st.header("⚙️ Instellingen")
+    avg_mode     = st.radio("Gemiddelde", ["EMA", "SMA"], index=0, horizontal=True)
+    show_delta   = st.checkbox("Δ%-grafieken tonen (onder prijs)", value=True)
+    collapse     = st.checkbox("Per-instrument secties inklapbaar", value=False)
+    st.markdown("---")
+    st.caption("De instrumentkiezer staat bij de combinatiegrafiek. "
+               "De detailgrafieken hieronder blijven altijd zichtbaar.")
 
 # ---------- Filter ----------
 start, end = date_range
@@ -174,15 +174,14 @@ def latest_row_for(pfx: str) -> tuple[float, float]:
 
 # Kies KPI's die bijna altijd beschikbaar zijn:
 kpi_list = [p for p in ["wti", "brent", "gold", "silver", "natgas", "copper"] if p in prefixes_all]
-cols = st.columns(len(kpi_list) + 1)  # +1 voor marktbreedte
+cols_kpi = st.columns(len(kpi_list) + 1)  # +1 voor marktbreedte
 
 for i, p in enumerate(kpi_list):
     close, d_pct = latest_row_for(p)
     arrow, color = arrow_and_color(d_pct)
     label = label_of(p)
     delta_str = f"{arrow} {pct_as_str(d_pct)}"
-    # Streamlit metric: value (close), delta (%)
-    cols[i].metric(label=label, value=("—" if pd.isna(close) else f"{close:,.2f}"), delta=delta_str)
+    cols_kpi[i].metric(label=label, value=("—" if pd.isna(close) else f"{close:,.2f}"), delta=delta_str)
 
 # Marktbreedte (laatste dag in filter)
 try:
@@ -200,11 +199,11 @@ try:
     breadth = f"↑{adv} / ↓{dec}"
 except Exception:
     breadth = "—"
-cols[-1].metric(label="Marktbreedte (laatste dag)", value=breadth)
+cols_kpi[-1].metric(label="Marktbreedte (laatste dag)", value=breadth)
 
 st.divider()
 
-# ---------- Per instrument (detail) ----------
+# ---------- Per instrument (detail — altijd zichtbaar) ----------
 st.subheader("Per instrument")
 
 # Kleuren (Okabe–Ito)
@@ -214,11 +213,6 @@ COLOR_MA50    = "#009E73"  # green
 COLOR_MA200   = "#0072B2"  # blue
 COLOR_BAR_POS = "#009E73"  # green bars
 COLOR_BAR_NEG = "#D55E00"  # red bars
-COLOR_GOLD    = "#E69F00"
-COLOR_SILVER  = "#56B4E9"
-COLOR_WTI     = "#111111"
-COLOR_BRENT   = "#0072B2"
-COLOR_GAS     = "#009E73"
 
 def plot_price_and_ma(df_in: pd.DataFrame, pfx: str):
     c = cols_for(pfx)
@@ -285,17 +279,14 @@ def plot_delta_bars(df_in: pd.DataFrame, pfx: str):
     )
     return fig
 
-# Render detail secties voor selectie
-for pfx in [p for p in ordered_all if p in selected]:
+# Render ALLE detail secties (altijd zichtbaar)
+for pfx in ordered_all:
     name = label_of(pfx)
-    # Container keuze: expander indien collapse True
-    header = f"## {name}"
-    container = st.expander(header) if collapse else st.container()
+    container = st.expander(f"## {name}") if collapse else st.container()
     with container:
         if not collapse:
-            st.markdown(header)
+            st.markdown(f"## {name}")
 
-        # Price + MA
         fig_price = plot_price_and_ma(df, pfx)
         if fig_price:
             st.plotly_chart(fig_price, use_container_width=True)
@@ -304,7 +295,6 @@ for pfx in [p for p in ordered_all if p in selected]:
             st.markdown("---")
             continue
 
-        # Δ%-bars
         if show_delta:
             fig_delta = plot_delta_bars(df, pfx)
             if fig_delta:
@@ -312,58 +302,103 @@ for pfx in [p for p in ordered_all if p in selected]:
 
         st.markdown("---")
 
-# ---------- Combo-grafieken ----------
-if show_combos:
-    st.subheader("Combinatiegrafieken")
+# ---------- Combinatiegrafiek (flexibel, met instrumentkiezer) ----------
+st.subheader("Combinatiegrafiek — kies instrumenten")
 
-    # Energy: WTI & Brent (links) + Natural Gas (rechts)
-    need_e = ["wti_close", "brent_close", "natgas_close"]
-    if all(n in df.columns for n in need_e):
-        e = df[["date"] + need_e].dropna(how="all").copy()
-        if not e.empty:
-            e["wti_close"]    = _f(e["wti_close"])
-            e["brent_close"]  = _f(e["brent_close"])
-            e["natgas_close"] = _f(e["natgas_close"])
+# Kiezer staat HIER (niet in de sidebar)
+with st.container():
+    col_a, col_b = st.columns([2, 1])
+    with col_a:
+        combo_sel = st.multiselect(
+            "Instrumenten voor combinatiegrafiek (kies 2–3):",
+            options=ordered_all,
+            default=[p for p in ["wti", "brent", "natgas"] if p in ordered_all][:3] or ordered_all[:3],
+            format_func=label_of,
+            help="Eerste twee instrumenten → linkeras, derde (optioneel) → rechteras."
+        )
+    with col_b:
+        normalize = st.checkbox("Normaliseer naar =100 (start)", value=False)
+        show_corr  = st.checkbox("Toon correlatie (linkeras)", value=True)
 
-            fig_eng = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_eng.add_trace(go.Scatter(x=e["date"], y=e["wti_close"], name="WTI (USD/bbl)",
-                                         line=dict(width=2, color=COLOR_WTI)), secondary_y=False)
-            fig_eng.add_trace(go.Scatter(x=e["date"], y=e["brent_close"], name="Brent (USD/bbl)",
-                                         line=dict(width=2, color=COLOR_BRENT)), secondary_y=False)
-            fig_eng.add_trace(go.Scatter(x=e["date"], y=e["natgas_close"], name="NatGas (USD/MMBtu)",
-                                         line=dict(width=2, color=COLOR_GAS)), secondary_y=True)
-            fig_eng.update_yaxes(title_text="Oil price (USD/bbl)", secondary_y=False)
-            fig_eng.update_yaxes(title_text="Natural Gas (USD/MMBtu)", secondary_y=True)
-            fig_eng.update_layout(height=460, margin=dict(l=10, r=10, t=40, b=10),
-                                  title="WTI & Brent vs Natural Gas",
-                                  legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
-            st.plotly_chart(fig_eng, use_container_width=True)
+# Bouw de combo-figuur
+def _norm_to_100(s: pd.Series) -> pd.Series:
+    s = _f(s)
+    if s.dropna().empty:
+        return s
+    base = s.dropna().iloc[0]
+    return (s / base) * 100.0 if base and np.isfinite(base) else s
+
+if len(combo_sel) >= 2:
+    need = [cols_for(p)["close"] for p in combo_sel if cols_for(p)["close"] in df.columns]
+    combo_df = df[["date"] + need].dropna(how="all").copy()
+
+    if not combo_df.empty:
+        # Normalisatie (optioneel)
+        if normalize:
+            for p in combo_sel:
+                c = cols_for(p)["close"]
+                if c in combo_df.columns:
+                    combo_df[c] = _norm_to_100(combo_df[c])
+        else:
+            for p in combo_sel:
+                c = cols_for(p)["close"]
+                if c in combo_df.columns:
+                    combo_df[c] = _f(combo_df[c])
+
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        # Linkeras: eerste twee
+        left_set = combo_sel[:2]
+        for p in left_set:
+            c = cols_for(p)["close"]
+            if c in combo_df.columns:
+                fig.add_trace(
+                    go.Scatter(x=combo_df["date"], y=combo_df[c], name=label_of(p), line=dict(width=2)),
+                    secondary_y=False
+                )
+        # Rechteras: derde (optioneel)
+        if len(combo_sel) >= 3:
+            p3 = combo_sel[2]
+            c3 = cols_for(p3)["close"]
+            if c3 in combo_df.columns:
+                fig.add_trace(
+                    go.Scatter(x=combo_df["date"], y=combo_df[c3], name=f"{label_of(p3)} (rechteras)", line=dict(width=2, dash="dot")),
+                    secondary_y=True
+                )
+
+        # As-titels
+        if normalize:
+            fig.update_yaxes(title_text="Index (=100)", secondary_y=False)
+            fig.update_yaxes(title_text="Index (=100)", secondary_y=True)
+        else:
+            fig.update_yaxes(title_text=", ".join(label_of(p) for p in left_set), secondary_y=False)
+            if len(combo_sel) >= 3:
+                fig.update_yaxes(title_text=label_of(combo_sel[2]), secondary_y=True)
+
+        fig.update_layout(
+            height=480,
+            margin=dict(l=10, r=10, t=40, b=10),
+            title="Combinatiegrafiek",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Correlatie (alleen linkeras, niet genormaliseerd noodzakelijk)
+        if show_corr:
+            # Bereken correlatie over de twee linkeras-series (op gefilterd bereik)
+            try:
+                left_cols = [cols_for(p)["close"] for p in left_set if cols_for(p)["close"] in combo_df.columns]
+                df_corr = combo_df[left_cols].dropna()
+                if df_corr.shape[1] == 2 and len(df_corr) >= 5:
+                    rho = float(df_corr.corr().iloc[0, 1])
+                    st.caption(f"**Correlatie (linkeras)** {label_of(left_set[0])} ↔ {label_of(left_set[1])}: **{rho:.2f}**")
+                else:
+                    st.caption("Correlatie: onvoldoende data voor beide linkeras-series.")
+            except Exception:
+                st.caption("Correlatieberekening niet gelukt (onvoldoende/ongeldige data).")
     else:
-        miss = [n for n in need_e if n not in df.columns]
-        st.info(f"Energy-combo: ontbrekende kolommen: {', '.join(miss)}")
-
-    # Metals: Gold (links) & Silver (rechts)
-    need_m = ["gold_close", "silver_close"]
-    if all(n in df.columns for n in need_m):
-        m = df[["date"] + need_m].dropna(how="all").copy()
-        if not m.empty:
-            m["gold_close"]   = _f(m["gold_close"])
-            m["silver_close"] = _f(m["silver_close"])
-
-            fig_met = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_met.add_trace(go.Scatter(x=m["date"], y=m["gold_close"], name="Gold (USD/oz)",
-                                         line=dict(width=2, color=COLOR_GOLD)), secondary_y=False)
-            fig_met.add_trace(go.Scatter(x=m["date"], y=m["silver_close"], name="Silver (USD/oz)",
-                                         line=dict(width=2, color=COLOR_SILVER)), secondary_y=True)
-            fig_met.update_yaxes(title_text="Gold (USD/oz)", secondary_y=False)
-            fig_met.update_yaxes(title_text="Silver (USD/oz)", secondary_y=True)
-            fig_met.update_layout(height=460, margin=dict(l=10, r=10, t=40, b=10),
-                                  title="Gold vs Silver",
-                                  legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
-            st.plotly_chart(fig_met, use_container_width=True)
-    else:
-        miss = [n for n in need_m if n not in df.columns]
-        st.info(f"Metals-combo: ontbrekende kolommen: {', '.join(miss)}")
+        st.info("Geen data gevonden voor de gekozen instrumenten in de geselecteerde periode.")
+else:
+    st.info("Kies minimaal 2 instrumenten voor de combinatiegrafiek.")
 
 # ---------- Tabel ----------
 st.subheader("Laatste rijen (gefilterd bereik)")
@@ -373,7 +408,6 @@ for pfx in ordered_all:
     show_cols += [cc["close"], cc["d_abs"], cc["d_pct"], cc["ma20"], cc["ma50"], cc["ma200"]]
 show_cols = [c for c in show_cols if c in df.columns]
 
-# Kleine prettige formatting: Δ% als %
 df_tail = df[show_cols].tail(200).copy()
 for c in [c for c in df_tail.columns if c.endswith("_delta_pct")]:
     df_tail[c] = (df_tail[c] * 100).round(2)
