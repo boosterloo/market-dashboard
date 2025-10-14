@@ -542,15 +542,7 @@ if not pv.empty:
     st.plotly_chart(fig_pcr_ts, use_container_width=True, config=PLOTLY_CONFIG)
 
 # — Visuals: Δ-gewogen PCR tijdreeks
-if not dgp.empty:
-    fig_dpcr = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                             subplot_titles=("Delta-gewogen PCR — Volume", "Delta-gewogen PCR — Open Interest"))
-    fig_dpcr.add_trace(go.Scatter(x=dgp.index, y=dgp.get("PCR_delta_vol"), mode="lines", name="Δ-PCR (Vol)"), row=1, col=1)
-    fig_dpcr.add_hline(y=1.0, line=dict(dash="dot"), row=1, col=1)
-    fig_dpcr.add_trace(go.Scatter(x=dgp.index, y=dgp.get("PCR_delta_oi"),  mode="lines", name="Δ-PCR (OI)"),  row=2, col=1)
-    fig_dpcr.add_hline(y=1.0, line=dict(dash="dot"), row=2, col=1)
-    fig_dpcr.update_layout(height=520, title_text="Delta-gewogen Put/Call Ratio — Ontwikkeling", dragmode="zoom")
-    st.plotly_chart(fig_dpcr, use_container_width=True, config=PLOTLY_CONFIG)
+
 
 
 # ─────────────────────────── A) Serie-selectie ────────────────────
