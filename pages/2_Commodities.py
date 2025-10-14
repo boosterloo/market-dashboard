@@ -172,9 +172,8 @@ def latest_row_for(pfx: str) -> tuple[float, float]:
     last_pct = float(sub[c["d_pct"]].iloc[0] * 100.0) if c["d_pct"] in sub and not pd.isna(sub[c["d_pct"]].iloc[0]) else np.nan
     return (last_close, last_pct)
 
-# Kies KPI's die bijna altijd beschikbaar zijn:
 kpi_list = [p for p in ["wti", "brent", "gold", "silver", "natgas", "copper"] if p in prefixes_all]
-cols_kpi = st.columns(len(kpi_list) + 1)  # +1 voor marktbreedte
+cols_kpi = st.columns(len(kpi_list) + 1)
 
 for i, p in enumerate(kpi_list):
     close, d_pct = latest_row_for(p)
@@ -183,12 +182,11 @@ for i, p in enumerate(kpi_list):
     delta_str = f"{arrow} {pct_as_str(d_pct)}"
     cols_kpi[i].metric(label=label, value=("—" if pd.isna(close) else f"{close:,.2f}"), delta=delta_str)
 
-# Marktbreedte (laatste dag in filter)
+# Marktbreedte
 try:
     last_day = df["date"].max()
     df_last = df.loc[df["date"] == last_day]
-    adv = 0
-    dec = 0
+    adv = 0; dec = 0
     for p in prefixes_all:
         c = cols_for(p)
         if c["d_pct"] in df_last.columns:
@@ -206,13 +204,12 @@ st.divider()
 # ---------- Per instrument (detail — altijd zichtbaar) ----------
 st.subheader("Per instrument")
 
-# Kleuren (Okabe–Ito)
-COLOR_PRICE   = "#111111"  # near-black
-COLOR_MA20    = "#E69F00"  # orange
-COLOR_MA50    = "#009E73"  # green
-COLOR_MA200   = "#0072B2"  # blue
-COLOR_BAR_POS = "#009E73"  # green bars
-COLOR_BAR_NEG = "#D55E00"  # red bars
+COLOR_PRICE   = "#111111"
+COLOR_MA20    = "#E69F00"
+COLOR_MA50    = "#009E73"
+COLOR_MA200   = "#0072B2"
+COLOR_BAR_POS = "#009E73"
+COLOR_BAR_NEG = "#D55E00"
 
 def plot_price_and_ma(df_in: pd.DataFrame, pfx: str):
     c = cols_for(pfx)
@@ -248,7 +245,6 @@ def plot_price_and_ma(df_in: pd.DataFrame, pfx: str):
 
 def plot_delta_bars(df_in: pd.DataFrame, pfx: str):
     c = cols_for(pfx)
-    # Gebruik _d_pct indien aanwezig, anders on-the-fly
     if c["d_pct"] in df_in.columns and df_in[c["d_pct"]].notna().any():
         bars = df_in[["date", c["d_pct"]]].dropna().copy()
         if bars.empty:
@@ -279,7 +275,6 @@ def plot_delta_bars(df_in: pd.DataFrame, pfx: str):
     )
     return fig
 
-# Render ALLE detail secties (altijd zichtbaar)
 for pfx in ordered_all:
     name = label_of(pfx)
     container = st.expander(f"## {name}") if collapse else st.container()
@@ -305,7 +300,6 @@ for pfx in ordered_all:
 # ---------- Combinatiegrafiek (flexibel, met instrumentkiezer) ----------
 st.subheader("Combinatiegrafiek — kies instrumenten")
 
-# Kiezer staat HIER (niet in de sidebar)
 with st.container():
     col_a, col_b = st.columns([2, 1])
     with col_a:
@@ -314,13 +308,12 @@ with st.container():
             options=ordered_all,
             default=[p for p in ["wti", "brent", "natgas"] if p in ordered_all][:3] or ordered_all[:3],
             format_func=label_of,
-            help="Eerste twee instrumenten → linkeras, derde (optioneel) → rechteras."
+            help="Bij 2 instrumenten: 1e links, 2e rechts. Bij 3: 1e/2e links, 3e rechts."
         )
     with col_b:
         normalize = st.checkbox("Normaliseer naar =100 (start)", value=False)
         show_corr  = st.checkbox("Toon correlatie (linkeras)", value=True)
 
-# Bouw de combo-figuur
 def _norm_to_100(s: pd.Series) -> pd.Series:
     s = _f(s)
     if s.dropna().empty:
@@ -345,54 +338,69 @@ if len(combo_sel) >= 2:
                 if c in combo_df.columns:
                     combo_df[c] = _f(combo_df[c])
 
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        # Linkeras: eerste twee
-        left_set = combo_sel[:2]
+        # --- Belangrijk: tweede y-as actief + autoscaling op beide ---
+        fig = make_subplots(specs=[[{"secondary_y": True}]])  # activeer rechteras
+
+        # Mapping:
+        # 2 instrumenten: [0] -> links, [1] -> rechts
+        # 3 instrumenten: [0],[1] -> links, [2] -> rechts
+        if len(combo_sel) == 2:
+            left_set = [combo_sel[0]]
+            right_set = [combo_sel[1]]
+        else:
+            left_set = combo_sel[:2]
+            right_set = combo_sel[2:3]
+
+        # Linkeras traces
         for p in left_set:
             c = cols_for(p)["close"]
             if c in combo_df.columns:
                 fig.add_trace(
-                    go.Scatter(x=combo_df["date"], y=combo_df[c], name=label_of(p), line=dict(width=2)),
+                    go.Scatter(x=combo_df["date"], y=combo_df[c],
+                               name=label_of(p), line=dict(width=2)),
                     secondary_y=False
                 )
-        # Rechteras: derde (optioneel)
-        if len(combo_sel) >= 3:
-            p3 = combo_sel[2]
-            c3 = cols_for(p3)["close"]
-            if c3 in combo_df.columns:
+
+        # Rechteras traces
+        for p in right_set:
+            c = cols_for(p)["close"]
+            if c in combo_df.columns:
                 fig.add_trace(
-                    go.Scatter(x=combo_df["date"], y=combo_df[c3], name=f"{label_of(p3)} (rechteras)", line=dict(width=2, dash="dot")),
+                    go.Scatter(x=combo_df["date"], y=combo_df[c],
+                               name=f"{label_of(p)} (rechteras)",
+                               line=dict(width=2, dash="dot")),
                     secondary_y=True
                 )
 
-        # As-titels
+        # Y-as titels + AUTORANGE aan voor beide
         if normalize:
-            fig.update_yaxes(title_text="Index (=100)", secondary_y=False)
-            fig.update_yaxes(title_text="Index (=100)", secondary_y=True)
+            left_title = "Index (=100)"
+            right_title = "Index (=100)"
         else:
-            fig.update_yaxes(title_text=", ".join(label_of(p) for p in left_set), secondary_y=False)
-            if len(combo_sel) >= 3:
-                fig.update_yaxes(title_text=label_of(combo_sel[2]), secondary_y=True)
+            left_title = ", ".join(label_of(p) for p in left_set) if left_set else ""
+            right_title = ", ".join(label_of(p) for p in right_set) if right_set else ""
+
+        fig.update_yaxes(title_text=left_title,  autorange=True, secondary_y=False)
+        fig.update_yaxes(title_text=right_title, autorange=True, secondary_y=True)
 
         fig.update_layout(
             height=480,
             margin=dict(l=10, r=10, t=40, b=10),
-            title="Combinatiegrafiek",
+            title="Combinatiegrafiek (autoscale links & rechts)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Correlatie (alleen linkeras, niet genormaliseerd noodzakelijk)
+        # Correlatie (alleen linkeras, als daar 2 reeksen op staan)
         if show_corr:
-            # Bereken correlatie over de twee linkeras-series (op gefilterd bereik)
             try:
                 left_cols = [cols_for(p)["close"] for p in left_set if cols_for(p)["close"] in combo_df.columns]
                 df_corr = combo_df[left_cols].dropna()
                 if df_corr.shape[1] == 2 and len(df_corr) >= 5:
                     rho = float(df_corr.corr().iloc[0, 1])
                     st.caption(f"**Correlatie (linkeras)** {label_of(left_set[0])} ↔ {label_of(left_set[1])}: **{rho:.2f}**")
-                else:
-                    st.caption("Correlatie: onvoldoende data voor beide linkeras-series.")
+                elif df_corr.shape[1] < 2:
+                    st.caption("Correlatie: minstens 2 linkeras-series nodig.")
             except Exception:
                 st.caption("Correlatieberekening niet gelukt (onvoldoende/ongeldige data).")
     else:
