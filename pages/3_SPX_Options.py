@@ -552,8 +552,6 @@ if not dgp.empty:
     fig_dpcr.update_layout(height=520, title_text="Delta-gewogen Put/Call Ratio — Ontwikkeling", dragmode="zoom")
     st.plotly_chart(fig_dpcr, use_container_width=True, config=PLOTLY_CONFIG)
 
-st.caption("**Interpretatie:** PCR ↑ (zeker Δ-gewogen) wijst op defensievere positioning (meer put-bescherming). Oplopende 25Δ-skew bevestigt hogere downside-premies.")
-st.markdown("---")
 
 # ─────────────────────────── A) Serie-selectie ────────────────────
 st.subheader("Serie-selectie — volg één optiereeks door de tijd")
