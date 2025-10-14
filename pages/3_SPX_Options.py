@@ -13,10 +13,24 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 
 # ------------------------------------------
-# Eigen cumulatieve normaal (geen scipy)
+# Eigen cumulatieve normaal (zonder SciPy) – vectorized
 # ------------------------------------------
-def norm_cdf(z: float) -> float:
-    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+def norm_cdf(x):
+    """
+    Standaardnormale CDF; accepteert scalar of array.
+    Gebruikt numpy.special.erf als die aanwezig is, anders valt terug op math.erf via vectorize.
+    """
+    import math
+    import numpy as np
+    z = np.asarray(x, dtype=float) / math.sqrt(2.0)
+    # Probeer vectorized erf uit NumPy; anders fallback naar math.erf met vectorize
+    try:
+        erf = np.erf  # meestal beschikbaar als ufunc
+    except AttributeError:  # zeer zeldzaam
+        from math import erf as _erf
+        erf = np.vectorize(_erf, otypes=[float])
+    return 0.5 * (1.0 + erf(z))
+
 
 # ------------------------------------------
 # Black–Scholes Delta
