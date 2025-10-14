@@ -204,6 +204,7 @@ st.divider()
 # ---------- Per instrument (detail — altijd zichtbaar) ----------
 st.subheader("Per instrument")
 
+# Kleuren (Okabe–Ito)
 COLOR_PRICE   = "#111111"
 COLOR_MA20    = "#E69F00"
 COLOR_MA50    = "#009E73"
@@ -275,6 +276,7 @@ def plot_delta_bars(df_in: pd.DataFrame, pfx: str):
     )
     return fig
 
+# Render ALLE detail secties (altijd zichtbaar)
 for pfx in ordered_all:
     name = label_of(pfx)
     container = st.expander(f"## {name}") if collapse else st.container()
@@ -297,22 +299,34 @@ for pfx in ordered_all:
 
         st.markdown("---")
 
-# ---------- Combinatiegrafiek (flexibel, met instrumentkiezer) ----------
+# ---------- Combinatiegrafiek (flexibel, met expliciete rechteras-keuze) ----------
 st.subheader("Combinatiegrafiek — kies instrumenten")
 
 with st.container():
     col_a, col_b = st.columns([2, 1])
     with col_a:
         combo_sel = st.multiselect(
-            "Instrumenten voor combinatiegrafiek (kies 2–3):",
+            "Instrumenten voor combinatiegrafiek (minimaal 2):",
             options=ordered_all,
             default=[p for p in ["wti", "brent", "natgas"] if p in ordered_all][:3] or ordered_all[:3],
             format_func=label_of,
-            help="Bij 2 instrumenten: 1e links, 2e rechts. Bij 3: 1e/2e links, 3e rechts."
+            help="Je kunt 2 of 3 instrumenten kiezen."
         )
     with col_b:
         normalize = st.checkbox("Normaliseer naar =100 (start)", value=False)
         show_corr  = st.checkbox("Toon correlatie (linkeras)", value=True)
+
+# Kies welke serie op de rechteras komt (alle overige komen links)
+right_choice = None
+if len(combo_sel) >= 2:
+    default_right = combo_sel[1] if len(combo_sel) >= 2 else combo_sel[0]
+    right_choice = st.selectbox(
+        "Serie op **rechter y-as**:",
+        options=combo_sel,
+        index=max(combo_sel.index(default_right), 0),
+        format_func=label_of,
+        help="Kies welke serie op de rechteras wordt geplot; de rest komt op de linkeras."
+    )
 
 def _norm_to_100(s: pd.Series) -> pd.Series:
     s = _f(s)
@@ -321,7 +335,7 @@ def _norm_to_100(s: pd.Series) -> pd.Series:
     base = s.dropna().iloc[0]
     return (s / base) * 100.0 if base and np.isfinite(base) else s
 
-if len(combo_sel) >= 2:
+if len(combo_sel) >= 2 and right_choice is not None:
     need = [cols_for(p)["close"] for p in combo_sel if cols_for(p)["close"] in df.columns]
     combo_df = df[["date"] + need].dropna(how="all").copy()
 
@@ -338,18 +352,11 @@ if len(combo_sel) >= 2:
                 if c in combo_df.columns:
                     combo_df[c] = _f(combo_df[c])
 
-        # --- Belangrijk: tweede y-as actief + autoscaling op beide ---
-        fig = make_subplots(specs=[[{"secondary_y": True}]])  # activeer rechteras
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-        # Mapping:
-        # 2 instrumenten: [0] -> links, [1] -> rechts
-        # 3 instrumenten: [0],[1] -> links, [2] -> rechts
-        if len(combo_sel) == 2:
-            left_set = [combo_sel[0]]
-            right_set = [combo_sel[1]]
-        else:
-            left_set = combo_sel[:2]
-            right_set = combo_sel[2:3]
+        # Verdeel naar links/rechts
+        left_set  = [p for p in combo_sel if p != right_choice]
+        right_set = [right_choice]
 
         # Linkeras traces
         for p in left_set:
@@ -361,7 +368,7 @@ if len(combo_sel) >= 2:
                     secondary_y=False
                 )
 
-        # Rechteras traces
+        # Rechteras trace(s) — normaliter 1, maar future-proof gelaten
         for p in right_set:
             c = cols_for(p)["close"]
             if c in combo_df.columns:
@@ -372,13 +379,13 @@ if len(combo_sel) >= 2:
                     secondary_y=True
                 )
 
-        # Y-as titels + AUTORANGE aan voor beide
+        # Titels + autoscaling
         if normalize:
             left_title = "Index (=100)"
             right_title = "Index (=100)"
         else:
-            left_title = ", ".join(label_of(p) for p in left_set) if left_set else ""
-            right_title = ", ".join(label_of(p) for p in right_set) if right_set else ""
+            left_title = ", ".join(label_of(p) for p in left_set) if left_set else label_of(right_set[0])
+            right_title = ", ".join(label_of(p) for p in right_set)
 
         fig.update_yaxes(title_text=left_title,  autorange=True, secondary_y=False)
         fig.update_yaxes(title_text=right_title, autorange=True, secondary_y=True)
@@ -386,18 +393,19 @@ if len(combo_sel) >= 2:
         fig.update_layout(
             height=480,
             margin=dict(l=10, r=10, t=40, b=10),
-            title="Combinatiegrafiek (autoscale links & rechts)",
+            title="Combinatiegrafiek (expliciete rechteras-keuze, autoscale links & rechts)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Correlatie (alleen linkeras, als daar 2 reeksen op staan)
+        # Correlatie (toon alleen als er minstens 2 linkeras-series zijn)
         if show_corr:
             try:
                 left_cols = [cols_for(p)["close"] for p in left_set if cols_for(p)["close"] in combo_df.columns]
                 df_corr = combo_df[left_cols].dropna()
-                if df_corr.shape[1] == 2 and len(df_corr) >= 5:
-                    rho = float(df_corr.corr().iloc[0, 1])
+                if df_corr.shape[1] >= 2 and len(df_corr) >= 5:
+                    # Pak eerste twee voor een snelle indicatie
+                    rho = float(df_corr.iloc[:, :2].corr().iloc[0, 1])
                     st.caption(f"**Correlatie (linkeras)** {label_of(left_set[0])} ↔ {label_of(left_set[1])}: **{rho:.2f}**")
                 elif df_corr.shape[1] < 2:
                     st.caption("Correlatie: minstens 2 linkeras-series nodig.")
@@ -406,7 +414,7 @@ if len(combo_sel) >= 2:
     else:
         st.info("Geen data gevonden voor de gekozen instrumenten in de geselecteerde periode.")
 else:
-    st.info("Kies minimaal 2 instrumenten voor de combinatiegrafiek.")
+    st.info("Kies minimaal 2 instrumenten en selecteer een rechteras-serie voor de combinatiegrafiek.")
 
 # ---------- Tabel ----------
 st.subheader("Laatste rijen (gefilterd bereik)")
