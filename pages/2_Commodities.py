@@ -299,34 +299,41 @@ for pfx in ordered_all:
 
         st.markdown("---")
 
-# ---------- Combinatiegrafiek (flexibel, met expliciete rechteras-keuze) ----------
+# ---------- Combinatiegrafiek (flexibel, compacte UI + expliciete rechteras) ----------
 st.subheader("Combinatiegrafiek — kies instrumenten")
 
+# Compacte en uitgelijnde keuzerij (gelijke breedtes, niet te breed)
 with st.container():
-    col_a, col_b = st.columns([2, 1])
-    with col_a:
+    c1, c2, c3, c4 = st.columns([1.6, 1.6, 0.9, 0.9])
+    with c1:
         combo_sel = st.multiselect(
-            "Instrumenten voor combinatiegrafiek (minimaal 2):",
+            "Instrumenten (min. 2)",
             options=ordered_all,
             default=[p for p in ["wti", "brent", "natgas"] if p in ordered_all][:3] or ordered_all[:3],
             format_func=label_of,
-            help="Je kunt 2 of 3 instrumenten kiezen."
+            help="Kies 2 of meer instrumenten om te combineren."
         )
-    with col_b:
-        normalize = st.checkbox("Normaliseer naar =100 (start)", value=False)
-        show_corr  = st.checkbox("Toon correlatie (linkeras)", value=True)
+    with c2:
+        if combo_sel:
+            # Kies standaard de 2e als rechteras (als die er is)
+            default_idx = 1 if len(combo_sel) >= 2 else 0
+            right_choice = st.selectbox(
+                "Rechter y-as",
+                options=combo_sel,
+                index=default_idx,
+                format_func=label_of,
+                help="Kies welke serie op de rechteras komt."
+            )
+        else:
+            right_choice = None
+    with c3:
+        normalize = st.checkbox("=100", value=False, help="Normaliseer naar startwaarde 100")
+    with c4:
+        show_corr = st.checkbox("Corr.", value=True, help="Correlatie links tonen")
 
-# Kies welke serie op de rechteras komt (alle overige komen links)
-right_choice = None
-if len(combo_sel) >= 2:
-    default_right = combo_sel[1] if len(combo_sel) >= 2 else combo_sel[0]
-    right_choice = st.selectbox(
-        "Serie op **rechter y-as**:",
-        options=combo_sel,
-        index=max(combo_sel.index(default_right), 0),
-        format_func=label_of,
-        help="Kies welke serie op de rechteras wordt geplot; de rest komt op de linkeras."
-    )
+# Safety: zorg dat right_choice geldig blijft als gebruiker combo_sel wijzigt
+if right_choice is not None and right_choice not in combo_sel and len(combo_sel) >= 1:
+    right_choice = combo_sel[-1]
 
 def _norm_to_100(s: pd.Series) -> pd.Series:
     s = _f(s)
@@ -368,7 +375,7 @@ if len(combo_sel) >= 2 and right_choice is not None:
                     secondary_y=False
                 )
 
-        # Rechteras trace(s) — normaliter 1, maar future-proof gelaten
+        # Rechteras trace(s)
         for p in right_set:
             c = cols_for(p)["close"]
             if c in combo_df.columns:
@@ -393,18 +400,17 @@ if len(combo_sel) >= 2 and right_choice is not None:
         fig.update_layout(
             height=480,
             margin=dict(l=10, r=10, t=40, b=10),
-            title="Combinatiegrafiek (expliciete rechteras-keuze, autoscale links & rechts)",
+            title="Combinatiegrafiek (expliciete rechteras, autoscale)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Correlatie (toon alleen als er minstens 2 linkeras-series zijn)
+        # Correlatie (toon als er minstens 2 linkeras-series zijn)
         if show_corr:
             try:
                 left_cols = [cols_for(p)["close"] for p in left_set if cols_for(p)["close"] in combo_df.columns]
                 df_corr = combo_df[left_cols].dropna()
                 if df_corr.shape[1] >= 2 and len(df_corr) >= 5:
-                    # Pak eerste twee voor een snelle indicatie
                     rho = float(df_corr.iloc[:, :2].corr().iloc[0, 1])
                     st.caption(f"**Correlatie (linkeras)** {label_of(left_set[0])} ↔ {label_of(left_set[1])}: **{rho:.2f}**")
                 elif df_corr.shape[1] < 2:
