@@ -851,9 +851,11 @@ u_daily = (df.assign(dte=df["snapshot_date"].dt.date).sort_values(["dte","snapsh
 u_daily["ret"] = u_daily["close"].pct_change()
 hv20 = annualize_std(u_daily["ret"].tail(21).dropna())
 
-# ATM-IV (30–40D rond ATM, laatste snapshot)
+# ATM-IV (30–40D rond ATM, laatste snapshot) + robuuste fallback
 near_atm = term_src[(term_src["days_to_exp"].between(20, 40)) & (term_src["moneyness"].abs() <= 0.01)]
-iv_atm = float(near_atm["implied_volatility"].median()) if not near_atm.empty else float(term_src["implied_volatility"].median())
+iv_atm = float(pd.to_numeric(near_atm["implied_volatility"], errors="coerce").median()) if not near_atm.empty else np.nan
+if np.isnan(iv_atm):
+    iv_atm = float(pd.to_numeric(term_src["implied_volatility"], errors="coerce").median()) if not term_src.empty else np.nan
 
 # IV-Rank (1y)
 iv_hist = (df.assign(day=df["snapshot_date"].dt.date)
@@ -863,11 +865,24 @@ iv_hist = (df.assign(day=df["snapshot_date"].dt.date)
 iv_1y = iv_hist.tail(252)["iv"] if not iv_hist.empty else pd.Series(dtype=float)
 iv_rank = float((iv_1y <= iv_1y.iloc[-1]).mean()) if not iv_1y.empty else np.nan
 
-# Expected Move (σ) op basis van ATM IV en gekozen expiratie
-dte_selected = int(pd.to_numeric(term_src[term_src["expiration"]==exp_for_smile]["days_to_exp"], errors="coerce").median()) \
-               if (exp_for_smile and not term_src.empty) else 30
-em_sigma = (underlying_now * iv_atm * math.sqrt(max(dte_selected,1)/365.0)) \
-            if (not np.isnan(underlying_now) and not np.isnan(iv_atm)) else np.nan
+# Helper: veilige median→int met default
+def _safe_int_median(series: pd.Series, default_val: int = 30) -> int:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return default_val
+    m = float(s.median())
+    return int(m) if not np.isnan(m) else default_val
+
+# Expected Move (σ) op basis van ATM IV en gekozen expiratie (robuust)
+if exp_for_smile and not term_src.empty and (term_src["expiration"] == exp_for_smile).any():
+    dte_selected = _safe_int_median(term_src.loc[term_src["expiration"] == exp_for_smile, "days_to_exp"], 30)
+else:
+    dte_selected = _safe_int_median(term_src["days_to_exp"] if not term_src.empty else pd.Series(dtype=float), 30)
+
+if (not np.isnan(underlying_now)) and (not np.isnan(iv_atm)) and (dte_selected is not None):
+    em_sigma = underlying_now * iv_atm * math.sqrt(max(int(dte_selected), 1) / 365.0)
+else:
+    em_sigma = np.nan
 
 cv1, cv2, cv3, cv4, cv5 = st.columns(5)
 with cv1: st.metric("ATM-IV (~30D)", f"{iv_atm:.2%}" if not np.isnan(iv_atm) else "—")
@@ -875,8 +890,11 @@ with cv2: st.metric("HV20", f"{hv20:.2%}" if not np.isnan(hv20) else "—")
 with cv3: st.metric("VRP (IV−HV)", f"{(iv_atm-hv20):.2%}" if (not np.isnan(iv_atm) and not np.isnan(hv20)) else "—")
 with cv4: st.metric("IV-Rank (1y)", f"{iv_rank*100:.0f}%" if not np.isnan(iv_rank) else "—")
 with cv5:
-    em_txt = f"±{em_sigma:,.0f} pts ({em_sigma/underlying_now:.2%})" if (not np.isnan(em_sigma) and not np.isnan(underlying_now)) else "—"
+    em_txt = "—"
+    if (not np.isnan(em_sigma)) and (not np.isnan(underlying_now)) and (underlying_now != 0):
+        em_txt = f"±{em_sigma:,.0f} pts ({em_sigma/underlying_now:.2%})"
     st.metric("Expected Move (σ)", em_txt)
+
 st.caption("**VRP** > 0: IV boven gerealiseerde vol → gunstiger voor **short vol**. **IV-Rank** hoog → premie dikker (events checken).")
 
 # ─────────────────────────── L) VIX vs IV ───────────────────────────
