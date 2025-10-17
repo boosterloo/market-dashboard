@@ -351,7 +351,36 @@ exps_all = exps
 target_exp = date.today() + timedelta(days=14)
 default_series_exp = pick_first_on_or_after(exps_all, target_exp) or (pick_closest_date(exps_all, target_exp) if exps_all else None)
 
-# ─────────────────────────── 🧭 Sentiment & Positioning ───────────
+# ─────────────────────────── 🧭 Sentiment & Positioning (vervanging) ───────────
+
+# ── Plot-styling helpers (self-contained) ─────────────────────────
+AXIS_FONT_MULT = 3              # ~3× groter
+_BASE = 12
+AXIS_FONT_SIZE = int(_BASE * AXIS_FONT_MULT)
+
+def amplify_axes(fig):
+    """Maak assen/legend/titels fors groter en consistent."""
+    fig.update_xaxes(tickfont=dict(size=AXIS_FONT_SIZE),
+                     title_font=dict(size=AXIS_FONT_SIZE))
+    fig.update_yaxes(tickfont=dict(size=AXIS_FONT_SIZE),
+                     title_font=dict(size=AXIS_FONT_SIZE))
+    fig.update_layout(
+        legend=dict(font=dict(size=max(AXIS_FONT_SIZE - 4, 12))),
+        title=dict(font=dict(size=AXIS_FONT_SIZE))
+    )
+    return fig
+
+def annotate_pcr_midline(fig, row:int, col:int):
+    """Voeg 1.0-middellijn + labels 'Defensief/Offensief' toe in PCR-plots."""
+    fig.add_hline(y=1.0, line=dict(dash="dot"), row=row, col=col)
+    yref = f"y{row}" if row > 1 else "y"
+    fig.add_annotation(xref="paper", yref=yref, x=0.01, y=1.02,
+                       text="Defensief (>1)", showarrow=False,
+                       font=dict(size=int(AXIS_FONT_SIZE*0.8)))
+    fig.add_annotation(xref="paper", yref=yref, x=0.99, y=0.98, xanchor="right",
+                       text="Offensief (<1)", showarrow=False,
+                       font=dict(size=int(AXIS_FONT_SIZE*0.8)))
+
 st.header("🧭 Sentiment & Positioning")
 
 sent_co1, sent_co2, sent_co3 = st.columns([1.1, 1, 1])
@@ -362,7 +391,7 @@ with sent_co2:
 with sent_co3:
     atm_band_skew = st.slider("ATM-band voor term-slope (±%)", 0.5, 5.0, 1.0, step=0.5)
 
-# — Tijdreeks PCR (vol/oi) uit beide types
+# — PCR (vol/oi) tijdreeks uit beide types
 pcr_df = (df_both.assign(day=df_both["snapshot_date"].dt.date)
             .groupby(["day","type"], as_index=False)
             .agg(vol=("volume","sum"), oi=("open_interest","sum")))
@@ -376,6 +405,151 @@ if not pcr_df.empty:
     pv["PCR_oi"]  = pv["oi_put"]  / pv["oi_call"].replace(0, np.nan)
 else:
     pv = pd.DataFrame(columns=["PCR_vol","PCR_oi"])
+
+# — Δ-gewogen PCR (tijdreeks)
+dg_mask = (
+    df_both["days_to_exp"].between(7, 45)
+    & (df_both["moneyness"].abs() <= 0.20)
+    & liq_mask_both
+)
+dg = df_both[dg_mask].copy()
+if not dg.empty:
+    T  = pd.to_numeric(dg["days_to_exp"], errors="coerce").fillna(0).astype(float) / 365.0
+    S  = pd.to_numeric(dg["underlying_price"], errors="coerce").astype(float)
+    K  = pd.to_numeric(dg["strike"], errors="coerce").astype(float)
+    IV = pd.to_numeric(dg["implied_volatility"], errors="coerce").astype(float)
+    is_call = dg["type"].str.lower().eq("call").astype(bool)
+    q_arr = np.array([float(get_q_curve_const(np.array([t], dtype=float),
+                                              q_const=q_const_simple,
+                                              to_continuous=True)[0]) for t in T], dtype=float)
+    deltas = np.vectorize(bs_delta)(S.values, K.values, IV.values, T.values,
+                                    np.zeros_like(T.values), q_arr, is_call.values)
+    dg["delta_abs"] = np.abs(deltas)
+    dg["dw_vol"] = dg["delta_abs"] * pd.to_numeric(dg["volume"], errors="coerce").fillna(0.0)
+    dg["dw_oi"]  = dg["delta_abs"] * pd.to_numeric(dg["open_interest"], errors="coerce").fillna(0.0)
+    dgt = (dg.assign(day=dg["snapshot_date"].dt.date)
+             .groupby(["day", "type"], as_index=False)
+             .agg(dw_vol=("dw_vol", "sum"), dw_oi=("dw_oi", "sum")))
+    dgp = (dgt.pivot_table(index="day", columns="type", values=["dw_vol","dw_oi"], aggfunc="sum")
+              .sort_index().sort_index(axis=1).fillna(0.0))
+    dgp.columns = [f"{a}_{b}" for a,b in dgp.columns.to_flat_index()]
+    for col in ["dw_vol_put","dw_vol_call","dw_oi_put","dw_oi_call"]:
+        if col not in dgp.columns: dgp[col] = np.nan
+    dgp["PCR_delta_vol"] = dgp["dw_vol_put"] / dgp["dw_vol_call"].replace({0: np.nan})
+    dgp["PCR_delta_oi"]  = dgp["dw_oi_put"]  / dgp["dw_oi_call"].replace({0: np.nan})
+    dgp = dgp.replace([np.inf, -np.inf], np.nan)[["PCR_delta_vol","PCR_delta_oi"]].dropna(how="all")
+else:
+    dgp = pd.DataFrame(columns=["PCR_delta_vol","PCR_delta_oi"])
+
+# — Laatste snapshot voor skew/term-slope/EM
+df_last_sent = df_both[(df_both["snap_min"] == default_snapshot) & liq_mask_both].copy() if default_snapshot is not None else pd.DataFrame()
+
+def compute_25d_skew(df_last, dte_lo:int, dte_hi:int) -> float:
+    if df_last.empty: return np.nan
+    z = df_last[df_last["days_to_exp"].between(dte_lo, dte_hi)].copy()
+    if z.empty: return np.nan
+    z["T"] = pd.to_numeric(z["days_to_exp"], errors="coerce").fillna(0)/365.0
+    z["delta"] = z.apply(lambda r: bs_delta(
+        float(r["underlying_price"]), float(r["strike"]),
+        float(r["implied_volatility"]), float(r["T"]),
+        0.0, float(get_q_curve_const(np.array([r["T"]], dtype=float), q_const=q_const_simple, to_continuous=True)[0]),
+        is_call=(str(r["type"]).lower()=="call")), axis=1)
+    if z["delta"].isna().all(): return np.nan
+    rows = []
+    for _, g in z.groupby("expiration"):
+        gp = g[g["type"].str.lower()=="put"].copy()
+        gc = g[g["type"].str.lower()=="call"].copy()
+        if gp.empty or gc.empty:
+            continue
+        gp["dist"] = (gp["delta"] + 0.25).abs()
+        gc["dist"] = (gc["delta"] - 0.25).abs()
+        rowp = gp.loc[gp["dist"].idxmin()] if not gp["dist"].isna().all() else None
+        rowc = gc.loc[gc["dist"].idxmin()] if not gc["dist"].isna().all() else None
+        if rowp is not None and rowc is not None:
+            rows.append(float(rowp["implied_volatility"]) - float(rowc["implied_volatility"]))
+    return float(np.nanmedian(rows)) if rows else np.nan
+
+skew_25d = compute_25d_skew(df_last_sent, dte_for_skew[0], dte_for_skew[1])
+
+def iv_term_slope(df_scope, band_pct: float) -> float:
+    if df_scope.empty: return np.nan
+    a = df_scope[(df_scope["moneyness"].abs() <= band_pct/100.0)]
+    short = a[a["days_to_exp"].between(7, 15)]["implied_volatility"].median()
+    mid   = a[a["days_to_exp"].between(30, 60)]["implied_volatility"].median()
+    if np.isnan(short) or np.isnan(mid): return np.nan
+    return float(short - mid)
+
+iv_slope = iv_term_slope(df_last_sent, atm_band_skew)
+underlying_now_sent = float(df_last_sent["underlying_price"].median()) if not df_last_sent.empty else np.nan
+iv_1w = float(df_last_sent[df_last_sent["days_to_exp"].between(5,10)]["implied_volatility"].median()) if not df_last_sent.empty else np.nan
+em_1w_pts = (underlying_now_sent * iv_1w * math.sqrt(7/365.0)) if (not np.isnan(underlying_now_sent) and not np.isnan(iv_1w)) else np.nan
+
+# — KPI-kaarten + Explain
+def last_and_delta(series: pd.Series, lookback:int=20):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty: return np.nan, None
+    last = float(s.iloc[-1])
+    ref  = float(s.tail(lookback).mean()) if len(s) >= lookback else float(s.mean())
+    return last, last - ref
+
+k1, k2, k3, k4, k5 = st.columns(5)
+pcr_v_last, pcr_v_delta = last_and_delta(pv["PCR_vol"] if "PCR_vol" in pv else pd.Series(dtype=float))
+pcr_oi_last, pcr_oi_delta = last_and_delta(pv["PCR_oi"] if "PCR_oi" in pv else pd.Series(dtype=float))
+with k1: st.metric("PCR (Volume)", f"{pcr_v_last:.2f}" if not np.isnan(pcr_v_last) else "—",
+                   delta=(f"{pcr_v_delta:+.2f} vs 20d" if pcr_v_delta is not None else None))
+with k2: st.metric("PCR (OI)", f"{pcr_oi_last:.2f}" if not np.isnan(pcr_oi_last) else "—",
+                   delta=(f"{pcr_oi_delta:+.2f} vs 20d" if pcr_oi_delta is not None else None))
+with k3: st.metric("25Δ Skew (put−call)", f"{skew_25d:.2%}" if not np.isnan(skew_25d) else "—")
+with k4: st.metric("IV Term Slope (7–15d − 30–60d)", f"{iv_slope:.2%}" if not np.isnan(iv_slope) else "—")
+with k5:
+    em_txt = f"±{em_1w_pts:,.0f} pts ({em_1w_pts/underlying_now_sent:.2%})" if (not np.isnan(em_1w_pts) and not np.isnan(underlying_now_sent)) else "—"
+    st.metric("Expected Move ~1w", em_txt)
+
+# — Explain (kort)
+explain_lines = []
+def _fmt(x, pct=False):
+    if np.isnan(x): return "—"
+    return f"{x:.2%}" if pct else f"{x:.2f}"
+if not np.isnan(pcr_v_last) or not np.isnan(pcr_oi_last):
+    tilt = "defensief" if ((not np.isnan(pcr_v_last) and pcr_v_last>1.0) or (not np.isnan(pcr_oi_last) and pcr_oi_last>1.0)) else "speculatief of neutraal"
+    explain_lines.append(f"PCR wijst op **{tilt}** positioning (Vol={_fmt(pcr_v_last)}, OI={_fmt(pcr_oi_last)}).")
+if not np.isnan(skew_25d):
+    explain_lines.append(f"25Δ-skew {_fmt(skew_25d, pct=True)} → {'puts duurder vs calls (downside-hedgevraag)' if skew_25d>0 else 'vlakkere/omgekeerde skew'}.")
+if not np.isnan(iv_slope):
+    explain_lines.append(f"Term-slope {_fmt(iv_slope, pct=True)} → korte IV {'boven' if iv_slope>0 else 'onder'} 30–60D.")
+if not (np.isnan(underlying_now_sent) or np.isnan(em_1w_pts)):
+    explain_lines.append(f"~1w expected move ≈ **±{em_1w_pts:,.0f}** punten (~{em_1w_pts/underlying_now_sent:.2%}).")
+if explain_lines:
+    st.markdown("**Explain (kort):** " + " ".join(explain_lines))
+
+# — PCR tijdreeks (standaard)
+if not pv.empty:
+    fig_pcr_ts = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                               subplot_titles=("Put/Call Ratio — Volume", "Put/Call Ratio — Open Interest"))
+    fig_pcr_ts.add_trace(go.Scatter(x=pv.index, y=pv["PCR_vol"], mode="lines", name="PCR (Vol)"), row=1, col=1)
+    annotate_pcr_midline(fig_pcr_ts, row=1, col=1)
+    fig_pcr_ts.add_trace(go.Scatter(x=pv.index, y=pv["PCR_oi"],  mode="lines", name="PCR (OI)"),  row=2, col=1)
+    annotate_pcr_midline(fig_pcr_ts, row=2, col=1)
+    fig_pcr_ts.update_layout(height=520, title_text="Put/Call Ratio — Ontwikkeling", dragmode="zoom")
+    amplify_axes(fig_pcr_ts)
+    st.plotly_chart(fig_pcr_ts, use_container_width=True, config=PLOTLY_CONFIG)
+    st.caption("ℹ️ **Interpretatie:** PCR>1 = defensief (puts>calls), PCR<1 = offensief. Combineer met skew en term-slope.")
+
+# — Δ-gewogen PCR tijdreeks
+if not dgp.empty:
+    fig_dpcr = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                             subplot_titles=("Delta-gewogen PCR — Volume", "Delta-gewogen PCR — Open Interest"))
+    fig_dpcr.add_trace(go.Scatter(x=dgp.index, y=dgp["PCR_delta_vol"], mode="lines", name="Δ-PCR (Vol)"), row=1, col=1)
+    annotate_pcr_midline(fig_dpcr, row=1, col=1)
+    fig_dpcr.add_trace(go.Scatter(x=dgp.index, y=dgp["PCR_delta_oi"],  mode="lines", name="Δ-PCR (OI)"),  row=2, col=1)
+    annotate_pcr_midline(fig_dpcr, row=2, col=1)
+    fig_dpcr.update_layout(height=520, title_text="Delta-gewogen Put/Call Ratio — Ontwikkeling", dragmode="zoom")
+    amplify_axes(fig_dpcr)
+    st.plotly_chart(fig_dpcr, use_container_width=True, config=PLOTLY_CONFIG)
+    st.caption("ℹ️ **Uitleg:** Δ-gewogen PCR corrigeert voor moneyness (exposure). Boven 1 = defensief; onder 1 = offensief.")
+else:
+    st.info("Geen Δ-gewogen PCR te berekenen voor de huidige filters (probeer lagere min OI/volume of ruimere DTE/moneyness).")
+# ─────────────────────── EINDE Sentiment & Positioning ───────────────────────
 
 # — Delta-gewogen PCR (tijdreeks) uit beide types  ─────────────────
 dg_mask = (
