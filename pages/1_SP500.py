@@ -1,10 +1,37 @@
+# pages/1_SPX_Signals_Backtest.py
+# 📈 S&P 500 — Signals & Backtest (ATR/TP + EMA toggle)
+# Volledige versie inclusief TradingView-achtige RSI (Wilder/RMA) en dynamische zones.
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from utils.bq import run_query, bq_ping
+
+# ---------- BigQuery helpers ----------
+try:
+    from utils.bq import run_query, bq_ping
+except Exception:
+    import google.cloud.bigquery as bq
+    from google.oauth2 import service_account
+
+    @st.cache_resource(show_spinner=False)
+    def _bq_client_from_secrets():
+        creds = st.secrets["gcp_service_account"]
+        credentials = service_account.Credentials.from_service_account_info(creds)
+        return bq.Client(credentials=credentials, project=creds["project_id"])
+
+    def run_query(sql: str) -> pd.DataFrame:
+        client = _bq_client_from_secrets()
+        return client.query(sql).to_dataframe()
+
+    def bq_ping() -> bool:
+        try:
+            _ = run_query("SELECT 1 AS ok")
+            return True
+        except Exception:
+            return False
 
 # =========================
 # App setup
@@ -57,6 +84,7 @@ DEFAULTS = {
     "rsi_os": 30,
     "vix_high": 25,
     "vix_low": 15,
+    "rsi_dyn_win": 252,  # ~1 handelsjaar voor dynamische percentielen
 }
 
 def ema(s: pd.Series, span: int):
@@ -131,15 +159,24 @@ def adx(df_: pd.DataFrame, length: int = 14):
     adx = dx.ewm(alpha=1/length, adjust=False).mean()
     return plus_di, minus_di, adx
 
-def rsi(series: pd.Series, period: int = 14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+# ---- TradingView-achtige RSI (Wilder/RMA) ----
+def rma(x: pd.Series, length: int):
+    return x.ewm(alpha=1/length, adjust=False).mean()
+
+def rsi_wilder(close: pd.Series, length: int = 14):
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = rma(up, length)
+    roll_down = rma(down, length)
+    rs = roll_up / roll_down.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-def crossed_up(s, level=0):   return (s.shift(1) <= level) & (s > level)
-def crossed_down(s, level=0): return (s.shift(1) >= level) & (s < level)
+def rolling_percentile(s: pd.Series, q: float, win: int = 252):
+    return s.rolling(win, min_periods=int(win*0.6)).quantile(q)
+
+def crossed_up(s: pd.Series, level=0):   return (s.shift(1) <= level) & (s > level)
+def crossed_down(s: pd.Series, level=0): return (s.shift(1) >= level) & (s < level)
 
 def ytd_return_full(full_df: pd.DataFrame):
     max_d = full_df["date"].max(); start = pd.Timestamp(date(max_d.year, 1, 1))
@@ -149,10 +186,8 @@ def ytd_return_full(full_df: pd.DataFrame):
 def pytd_return_full(full_df: pd.DataFrame):
     max_d = full_df["date"].max(); prev_year = max_d.year-1
     start = pd.Timestamp(date(prev_year,1,1))
-    try:
-        end = max_d.replace(year=prev_year)
-    except ValueError:
-        end = pd.Timestamp(date(prev_year,12,31))
+    try:    end = max_d.replace(year=prev_year)
+    except: end = pd.Timestamp(date(prev_year,12,31))
     sub = full_df[(full_df["date"]>=start)&(full_df["date"]<=end)].dropna(subset=["close"])
     return (sub["close"].iloc[-1]/sub["close"].iloc[0]-1)*100 if len(sub)>=2 else None
 
@@ -161,18 +196,30 @@ def pytd_return_full(full_df: pd.DataFrame):
 # =========================
 @st.cache_data(ttl=1800)
 def compute_indicators(full_df):
-    for span in DEFAULTS["ema_spans"]:
+    full_df = full_df.copy()
+    for span in DEFAULTS["ema_spans"]:\
+
         full_df[f"ema{span}"] = ema(full_df["close"], span)
     dc_high, dc_low = donchian(full_df, DEFAULTS["donchian_n"])
     full_df["dc_high"], full_df["dc_low"] = dc_high, dc_low
+
     ha = heikin_ashi(full_df)
     full_df[["ha_open","ha_high","ha_low","ha_close"]] = ha[["ha_open","ha_high","ha_low","ha_close"]]
+
     st_df = supertrend_on_ha(ha, **DEFAULTS["supertrend"])
     full_df["st_line"], full_df["st_trend"] = st_df["st_line"], st_df["trend"]
+
     full_df["macd_line"], full_df["macd_signal"], full_df["macd_hist"] = macd(full_df["close"], *DEFAULTS["macd"])
     full_df["di_plus"], full_df["di_minus"], full_df["adx14"] = adx(full_df, DEFAULTS["adx_length"])
-    full_df["rsi14"] = rsi(full_df["close"], DEFAULTS["rsi_period"])
+
+    # Wilder-RSI + dynamische zones
+    full_df["rsi14"] = rsi_wilder(full_df["close"], DEFAULTS["rsi_period"])
+    full_df["rsi14_s"] = full_df["rsi14"].ewm(span=5, adjust=False).mean()
+    full_df["rsi_dyn_hi"] = rolling_percentile(full_df["rsi14"], 0.80, DEFAULTS["rsi_dyn_win"])
+    full_df["rsi_dyn_lo"] = rolling_percentile(full_df["rsi14"], 0.20, DEFAULTS["rsi_dyn_win"])
+
     full_df["atr14"] = atr_rma(full_df["high"], full_df["low"], full_df["close"], 14)
+
     if "delta_abs" not in full_df or full_df["delta_abs"].isna().all():
         full_df["delta_abs"] = full_df["close"].diff().fillna(0)
     if "delta_pct" not in full_df or full_df["delta_pct"].isna().all():
@@ -253,29 +300,6 @@ with st.sidebar:
 d = df[(df["date"].dt.date >= start_date) & (df["date"].dt.date <= end_date)].reset_index(drop=True).copy()
 
 # =========================
-# Signalen
-# =========================
-if SIG_MODE == "Advanced":
-    up_regime   = (d["close"] > d["ema200"]) & (d["ema50"] > d["ema200"])
-    down_regime = (d["close"] < d["ema200"]) & (d["ema50"] < d["ema200"])
-    strong_trend = d["adx14"] > DEFAULTS["adx_threshold"]
-
-    d["buy_sig"]   = up_regime & strong_trend & crossed_up(d["macd_hist"]) & (d["close"] > d["ema20"]) & (d["rsi14"] > 45)
-    d["sell_sig"]  = ((d["close"] < d["ema20"]) | crossed_down(d["macd_hist"])) & strong_trend
-    d["short_sig"] = down_regime & strong_trend & crossed_down(d["macd_hist"]) & (d["close"] < d["ema20"]) & (d["rsi14"] < 55)
-else:
-    d["ema_fast_custom"] = ema(d["close"], EMA_FAST)
-    d["ema_slow_custom"] = ema(d["close"], EMA_SLOW)
-    cross_up   = (d["ema_fast_custom"].shift(1) <= d["ema_slow_custom"].shift(1)) & (d["ema_fast_custom"] > d["ema_slow_custom"])
-    cross_down = (d["ema_fast_custom"].shift(1) >= d["ema_slow_custom"].shift(1)) & (d["ema_fast_custom"] < d["ema_slow_custom"])
-    d["buy_sig"]  = cross_up
-    d["sell_sig"] = cross_down
-    d["short_sig"]= cross_down if ALLOW_SHORT_EMA else False
-
-for c in ["buy_sig","sell_sig","short_sig"]:
-    d[c] = d[c].fillna(False)
-
-# =========================
 # Event windows (gele balken)
 # =========================
 def _windows_from_bool(mask: pd.Series, min_len=3, pad=0):
@@ -288,16 +312,14 @@ def _windows_from_bool(mask: pd.Series, min_len=3, pad=0):
         if v and not in_win:
             starts.append(i); in_win = True
         if in_win and (not v or i == len(mask)-1):
-            ends.append(i if not v else i)  # inclusive index
+            ends.append(i if not v else i)
             in_win = False
-    # filter minimum lengte
     windows = []
     for s_idx, e_idx in zip(starts, ends):
         if e_idx - s_idx + 1 >= min_len:
             windows.append((d.loc[s_idx, "date"], d.loc[e_idx, "date"]))
     return windows
 
-# regels
 vix_ma = d["vix_close"].rolling(20, min_periods=20).mean()
 vix_sd = d["vix_close"].rolling(20, min_periods=20).std()
 vix_zscore = (d["vix_close"] - vix_ma) / vix_sd
@@ -318,8 +340,7 @@ else:
     union_mask = (mask_vix | mask_flip | mask_dc_break)
     win_list = _windows_from_bool(union_mask, min_len=min_len, pad=flip_pad)
 
-# helper: snel check in-window
-def in_any_window(ts):
+def in_any_window(_):
     if not win_list: return pd.Series(False, index=d.index)
     m = pd.Series(False, index=d.index)
     for s, e in win_list:
@@ -327,6 +348,44 @@ def in_any_window(ts):
     return m
 
 in_window = in_any_window(d["date"])
+
+# =========================
+# Signalen (TradingView-achtige RSI logica)
+# =========================
+if SIG_MODE == "Advanced":
+    up_regime   = (d["close"] > d["ema200"]) & (d["ema50"] > d["ema200"])
+    down_regime = (d["close"] < d["ema200"]) & (d["ema50"] < d["ema200"])
+    strong_trend = d["adx14"] > DEFAULTS["adx_threshold"]
+
+    # Midline-crosses (Wilder-RSI smoothed)
+    rsi_cross_up   = crossed_up(d["rsi14_s"], level=50)
+    rsi_cross_down = crossed_down(d["rsi14_s"], level=50)
+
+    # Exhaustion flags
+    rsi_exhaust_long  = d["rsi14_s"] >= d["rsi_dyn_hi"]
+    rsi_exhaust_short = d["rsi14_s"] <= d["rsi_dyn_lo"]
+
+    # Entries: trend + RSI-midline + basale prijs/momentumfilter
+    d["buy_sig"]   = up_regime & strong_trend & rsi_cross_up & (d["close"] > d["ema20"]) & (d["macd_hist"] > 0)
+    d["short_sig"] = down_regime & strong_trend & rsi_cross_down & (d["close"] < d["ema20"]) & (d["macd_hist"] < 0)
+
+    # Exits: momentum draait of regime klapt om of exhaustion
+    d["sell_sig"] = (
+        (d["buy_sig"].shift(1)) & (rsi_cross_down | (d["macd_hist"] < 0) | rsi_exhaust_long)
+    ) | (
+        (d["short_sig"].shift(1)) & (rsi_cross_up | (d["macd_hist"] > 0) | rsi_exhaust_short)
+    )
+else:
+    d["ema_fast_custom"] = ema(d["close"], EMA_FAST)
+    d["ema_slow_custom"] = ema(d["close"], EMA_SLOW)
+    cross_up   = (d["ema_fast_custom"].shift(1) <= d["ema_slow_custom"].shift(1)) & (d["ema_fast_custom"] > d["ema_slow_custom"])
+    cross_down = (d["ema_fast_custom"].shift(1) >= d["ema_slow_custom"].shift(1)) & (d["ema_fast_custom"] < d["ema_slow_custom"])
+    d["buy_sig"]  = cross_up
+    d["sell_sig"] = cross_down
+    d["short_sig"]= cross_down if ALLOW_SHORT_EMA else False
+
+for c in ["buy_sig","sell_sig","short_sig"]:
+    d[c] = d[c].fillna(False)
 
 # =========================
 # Backtest engine (ATR/TP, sizing, fees/slip)
@@ -353,7 +412,7 @@ def run_backtest(df_, start_capital, atr_mult, fee_bps, slip_bps, risk_pct,
         if pos == 1:
             equity_curve.append(cash + shares*close)
         elif pos == -1:
-            equity_curve.append(cash + shares*(entry_px - close))  # short PnL benadering
+            equity_curve.append(cash + shares*(entry_px - close))
         else:
             equity_curve.append(cash)
 
@@ -365,9 +424,9 @@ def run_backtest(df_, start_capital, atr_mult, fee_bps, slip_bps, risk_pct,
 
         # trailing stop
         if pos == 1:
-            stop = max(stop, close - atr_mult*atr_next)
+            stop = max(stop, close - atr_mult*atr_next) if not np.isnan(stop) else (close - atr_mult*atr_next)
         elif pos == -1:
-            stop = min(stop, close + atr_mult*atr_next)
+            stop = min(stop, close + atr_mult*atr_next) if not np.isnan(stop) else (close + atr_mult*atr_next)
 
         # R-now
         if pos == 1 and not np.isnan(stop):
@@ -479,12 +538,12 @@ eq_short, _ = run_backtest(
     tp1_r=TP1_R, tp2_r=TP2_R, tp1_part=TP1_PART, move_be=MOVE_BE
 )
 
-# Buy & Hold (equity) — ROBUUST
+# Buy & Hold (equity) — gefixt (geen spelfout ddfx)
 def buyhold_equity(df_: pd.DataFrame, start_cap: float) -> pd.Series:
     dfx = df_.copy().reset_index(drop=True)
     dfx["date"] = pd.to_datetime(dfx["date"])
     if len(dfx) < 2:
-        s = pd.Series([start_cap], index=ddfx["date"])
+        s = pd.Series([start_cap], index=dfx["date"])
         s.name = "bh_equity"
         return s
     buy_px = float(dfx.loc[1, "open"])  # start op eerstvolgende open
@@ -502,7 +561,7 @@ eq_long.index     = pd.to_datetime(eq_long.index)
 eq_short.index    = pd.to_datetime(eq_short.index)
 bh_equity.index   = pd.to_datetime(bh_equity.index)
 
-# ----- metrics (ROBUUST) -----
+# ----- metrics -----
 def perf_metrics(eq: pd.Series, trading_days_per_year: int = 252):
     eq = eq.dropna()
     if len(eq) < 2:
@@ -571,11 +630,13 @@ if up_regime_now and (last["adx14"] > DEFAULTS["adx_threshold"]):
 elif down_regime_now and (last["adx14"] > DEFAULTS["adx_threshold"]):
     alerts.append(("red","Trend ↓ (sterk)", f"ADX {last['adx14']:.1f}"))
 elif last["adx14"] <= DEFAULTS["adx_threshold"]:
-    alerts.append(("gray","Trend zwak", f"ADX {last['adx14']:.1f}"))
-if crossed_up(d["macd_hist"]).iloc[-1]:
-    alerts.append(("green","Momentum draait ↑","MACD-hist cross ↑ 0"))
-elif crossed_down(d["macd_hist"]).iloc[-1]:
-    alerts.append(("red","Momentum draait ↓","MACD-hist cross ↓ 0"))
+
+    alerts.append(("gray","Trend zwak", f"ADX {last['adx14']:.1.1f}"))
+# RSI-momentum switch (midline)
+if crossed_up(d["rsi14_s"], 50).iloc[-1]:
+    alerts.append(("green","RSI ↑50","RSI smoothed kruist boven 50"))
+elif crossed_down(d["rsi14_s"], 50).iloc[-1]:
+    alerts.append(("red","RSI ↓50","RSI smoothed kruist onder 50"))
 
 def badge(color, text):
     colors = {"green":"#00A65A","red":"#D55E00","orange":"#E69F00","blue":"#1f77b4","gray":"#6c757d"}
@@ -661,7 +722,7 @@ fig2 = make_subplots(
         "Close + EMA(20/50/200) — regime, buy/sell",
         "MACD(12,26,9) — lijn/signal/hist",
         f"ADX(14) + DI± — drempel={DEFAULTS['adx_threshold']}",
-        "RSI(14) — >70 overbought, <30 oversold"
+        "RSI(14) Wilder — dynamische zones + midline"
     ],
     row_heights=[0.18, 0.32, 0.2, 0.2, 0.18],
     vertical_spacing=0.06
@@ -676,6 +737,24 @@ fig2.add_trace(go.Scatter(x=d["date"], y=d["close"], mode="lines", name="Close",
 fig2.add_trace(go.Scatter(x=d["date"], y=d["ema20"], mode="lines", name="EMA20", line=dict(width=2)), row=2, col=1)
 fig2.add_trace(go.Scatter(x=d["date"], y=d["ema50"], mode="lines", name="EMA50", line=dict(width=2)), row=2, col=1)
 fig2.add_trace(go.Scatter(x=d["date"], y=d["ema200"], mode="lines", name="EMA200", line=dict(width=2)), row=2, col=1)
+
+# regime shading (optioneel, prettig voor context)
+bull_mask = (d["ema50"] > d["ema200"])
+bear_mask = (d["ema50"] < d["ema200"])
+def _add_spans(mask, color):
+    spans = []
+    on = False
+    s = None
+    for i, m in enumerate(mask.fillna(False).values):
+        if m and not on: on=True; s=d["date"].iloc[i]
+        if on and (not m or i==len(mask)-1):
+            e = d["date"].iloc[i]
+            spans.append((s, e))
+            on=False
+    for (s,e) in spans:
+        fig2.add_vrect(x0=s, x1=e, fillcolor=color, line_width=0, row=2, col=1)
+_add_spans(bull_mask, "rgba(0,128,0,0.05)")
+_add_spans(bear_mask, "rgba(255,0,0,0.04)")
 
 buys  = d.loc[d["buy_sig"]]
 sells = d.loc[d["sell_sig"]]
@@ -707,10 +786,28 @@ fig2.add_trace(go.Scatter(x=d["date"], y=d["di_plus"], mode="lines", name="+DI",
 fig2.add_trace(go.Scatter(x=d["date"], y=d["di_minus"],mode="lines", name="−DI", line=dict(width=2)),     row=4, col=1)
 fig2.add_hline(y=DEFAULTS["adx_threshold"], line_dash="dot", row=4, col=1)
 
-# (5) RSI
-fig2.add_trace(go.Scatter(x=d["date"], y=d["rsi14"], mode="lines", name="RSI(14)", line=dict(width=2)), row=5, col=1)
+# (5) RSI — Wilder + dynamische zones + midline en markers
+fig2.add_trace(go.Scatter(x=d["date"], y=d["rsi14_s"], mode="lines",
+                          name="RSI(14) Wilder (smoothed)", line=dict(width=2)), row=5, col=1)
 fig2.add_hline(y=DEFAULTS["rsi_ob"], line_dash="dash", line_color="red", row=5, col=1)
+fig2.add_hline(y=50,                    line_dash="dot",  row=5, col=1)
 fig2.add_hline(y=DEFAULTS["rsi_os"], line_dash="dash", line_color="green", row=5, col=1)
+fig2.add_trace(go.Scatter(x=d["date"], y=d["rsi_dyn_hi"], mode="lines",
+                          name="RSI dyn-high (80p)", line=dict(width=1, dash="dot")), row=5, col=1)
+fig2.add_trace(go.Scatter(x=d["date"], y=d["rsi_dyn_lo"], mode="lines",
+                          name="RSI dyn-low (20p)", line=dict(width=1, dash="dot")), row=5, col=1)
+fig2.add_hrect(y0=70, y1=100, fillcolor="rgba(255,0,0,0.05)", line_width=0, row=5, col=1)
+fig2.add_hrect(y0=0,  y1=30,  fillcolor="rgba(0,128,0,0.06)", line_width=0, row=5, col=1)
+
+# markers op midline-crosses (bereken hier lokaal voor scope-zekerheid)
+_rsi_cross_up   = crossed_up(d["rsi14_s"], 50)
+_rsi_cross_down = crossed_down(d["rsi14_s"], 50)
+fig2.add_trace(go.Scatter(x=d.loc[_rsi_cross_up,"date"], y=d.loc[_rsi_cross_up,"rsi14_s"], mode="markers",
+                          name="RSI cross ↑50", marker=dict(symbol="triangle-up", size=10)),
+               row=5, col=1)
+fig2.add_trace(go.Scatter(x=d.loc[_rsi_cross_down,"date"], y=d.loc[_rsi_cross_down,"rsi14_s"], mode="markers",
+                          name="RSI cross ↓50", marker=dict(symbol="triangle-down", size=10)),
+               row=5, col=1)
 
 # Leesbaarheid
 fig2.update_layout(height=1550, margin=dict(l=60, r=60, t=70, b=50),
@@ -745,7 +842,7 @@ fig3.update_layout(
 st.plotly_chart(fig3, use_container_width=True)
 
 # =========================
-# Metrics tabel
+# Performance-metrics
 # =========================
 st.subheader("Performance-metrics")
 show = pd.DataFrame({
@@ -777,67 +874,61 @@ fig_corr.update_layout(height=400, margin=dict(l=60,r=60,t=50,b=40),
 st.plotly_chart(fig_corr, use_container_width=True)
 
 # =========================
-# Heatmap
+# Maand/jaar-heatmap van Δ
 # =========================
-heat_on = True if 'heat_on' not in globals() else heat_on  # safeguard
-if heat_on:
-    st.subheader("Maand/jaar-heatmap van Δ")
-    t = d.copy().set_index("date")
-    if delta_mode == "Δ %":
-        monthly = t["delta_pct"].groupby(pd.Grouper(freq="M")).apply(
-            lambda g: (np.prod((g.dropna()/100.0 + 1.0)) - 1.0) * 100.0 if len(g.dropna()) else np.nan
-        )
-        value_title = "Δ% (maand, compounded)"
-    else:
-        monthly = t["delta_abs"].groupby(pd.Grouper(freq="M")).sum(min_count=1)
-        value_title = "Δ punten (maand, som)"
+st.subheader("Maand/jaar-heatmap van Δ")
+t = d.copy().set_index("date")
+if delta_mode == "Δ %":
+    monthly = t["delta_pct"].groupby(pd.Grouper(freq="M")).apply(
+        lambda g: (np.prod((g.dropna()/100.0 + 1.0)) - 1.0) * 100.0 if len(g.dropna()) else np.nan
+    )
+    value_title = "Δ% (maand, compounded)"
+else:
+    monthly = t["delta_abs"].groupby(pd.Grouper(freq="M")).sum(min_count=1)
+    value_title = "Δ punten (maand, som)"
 
-    hm = pd.DataFrame({"year": monthly.index.year, "month": monthly.index.month, "value": monthly.values}).dropna()
-    month_names = {1:"jan",2:"feb",3:"mrt",4:"apr",5:"mei",6:"jun",7:"jul",8:"aug",9:"sep",10:"okt",11:"nov",12:"dec"}
-    hm["mname"] = hm["month"].map(month_names)
-    pivot = hm.pivot_table(index="year", columns="mname", values="value", aggfunc="first")
-    pivot = pivot.reindex(columns=[month_names[m] for m in range(1,13)])
+hm = pd.DataFrame({"year": monthly.index.year, "month": monthly.index.month, "value": monthly.values}).dropna()
+month_names = {1:"jan",2:"feb",3:"mrt",4:"apr",5:"mei",6:"jun",7:"jul",8:"aug",9:"sep",10:"okt",11:"nov",12:"dec"}
+hm["mname"] = hm["month"].map(month_names)
+pivot = hm.pivot_table(index="year", columns="mname", values="value", aggfunc="first")
+pivot = pivot.reindex(columns=[month_names[m] for m in range(1,13)])
 
-    z = pivot.values
-    heat = go.Figure(data=go.Heatmap(z=z, x=pivot.columns, y=pivot.index,
-                                     coloraxis="coloraxis",
-                                     hovertemplate="Jaar %{y} — %{x}: %{z:.2f}<extra></extra>"))
-    heat.update_layout(height=480, margin=dict(l=60, r=60, t=50, b=50),
-                       coloraxis=dict(colorscale="RdBu", cauto=True, colorbar_title=value_title),
-                       xaxis=dict(title="Maand", tickfont=dict(size=13)),
-                       yaxis=dict(title="Jaar", tickfont=dict(size=13)))
-    st.plotly_chart(heat, use_container_width=True)
+z = pivot.values
+heat = go.Figure(data=go.Heatmap(z=z, x=pivot.columns, y=pivot.index,
+                                 coloraxis="coloraxis",
+                                 hovertemplate="Jaar %{y} — %{x}: %{z:.2f}<extra></extra>"))
+heat.update_layout(height=480, margin=dict(l=60, r=60, t=50, b=50),
+                   coloraxis=dict(colorscale="RdBu", cauto=True, colorbar_title=value_title),
+                   xaxis=dict(title="Maand", tickfont=dict(size=13)),
+                   yaxis=dict(title="Jaar", tickfont=dict(size=13)))
+st.plotly_chart(heat, use_container_width=True)
 
 # =========================
 # Histogrammen
 # =========================
-if 'hist_on' not in globals():
-    hist_on = True
-if hist_on:
-    st.subheader("Histogram dagrendementen")
-    col_a, col_b = st.columns(2)
-    hist_df = d.dropna(subset=["delta_abs","delta_pct"]).copy()
-    with col_a:
-        fig_abs = go.Figure([go.Histogram(x=hist_df["delta_abs"], nbinsx=60)])
-        fig_abs.update_layout(title="Δ abs (punten)", height=420, bargap=0.02,
-                              margin=dict(l=50,r=50,t=60,b=50),
-                              xaxis=dict(tickfont=dict(size=13)),
-                              yaxis=dict(tickfont=dict(size=13)))
-        st.plotly_chart(fig_abs, use_container_width=True)
-    with col_b:
-        fig_pct = go.Figure([go.Histogram(x=hist_df["delta_pct"], nbinsx=60)])
-        fig_pct.update_layout(title="Δ %", height=420, bargap=0.02,
-                              margin=dict(l=50,r=50,t=60,b=50),
-                              xaxis=dict(tickfont=dict(size=13)),
-                              yaxis=dict(tickfont=dict(size=13)))
-        st.plotly_chart(fig_pct, use_container_width=True)
+st.subheader("Histogram dagrendementen")
+col_a, col_b = st.columns(2)
+hist_df = d.dropna(subset=["delta_abs","delta_pct"]).copy()
+with col_a:
+    fig_abs = go.Figure([go.Histogram(x=hist_df["delta_abs"], nbinsx=60)])
+    fig_abs.update_layout(title="Δ abs (punten)", height=420, bargap=0.02,
+                          margin=dict(l=50,r=50,t=60,b=50),
+                          xaxis=dict(tickfont=dict(size=13)),
+                          yaxis=dict(tickfont=dict(size=13)))
+    st.plotly_chart(fig_abs, use_container_width=True)
+with col_b:
+    fig_pct = go.Figure([go.Histogram(x=hist_df["delta_pct"], nbinsx=60)])
+    fig_pct.update_layout(title="Δ %", height=420, bargap=0.02,
+                          margin=dict(l=50,r=50,t=60,b=50),
+                          xaxis=dict(tickfont=dict(size=13)),
+                          yaxis=dict(tickfont=dict(size=13)))
+    st.plotly_chart(fig_pct, use_container_width=True)
 
 # =========================
 # Options-proxy (dagelijks) — windows vs outside
 # =========================
 st.subheader("Options-proxy — PnL (windows vs outside)")
 
-# Per dag volgende close: |Δ| en ATR
 d["next_close"] = d["close"].shift(-1)
 valid = d.dropna(subset=["next_close","atr14"]).copy()
 valid["abs_move"] = (valid["next_close"] - valid["open"]).abs()
@@ -846,7 +937,6 @@ valid["abs_move"] = (valid["next_close"] - valid["open"]).abs()
 valid["straddle_pnl"] = valid["abs_move"] - (straddle_cost_atr * valid["atr14"])
 
 # Short Strangle proxy:
-# PnL = premium×ATR − max(0, |Δ| − width×ATR)
 overflow = (valid["abs_move"] - strangle_width_atr * valid["atr14"]).clip(lower=0.0)
 valid["strangle_pnl"] = (strangle_prem_atr * valid["atr14"]) - overflow
 
@@ -868,7 +958,6 @@ sum_win = pd.concat([
     _sumstats(valid[~valid["in_window"]], "strangle_pnl").rename("Strangle (outside)")
 ], axis=1).T
 
-# Netjes tonen
 def _fmt(x, pct=False):
     if pd.isna(x): return "—"
     return f"{x:,.2f}%" if pct else f"{x:,.2f}"
