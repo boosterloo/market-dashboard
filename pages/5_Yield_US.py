@@ -1,4 +1,4 @@
-# pages/Yield_US.py — 🇺🇸 US-only Yield: Curve, Real, Breakeven (robust)
+# pages/Yield_US.py — 🇺🇸 US-only Yield: Curve, Real, Breakeven (interactief & robuust)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -18,17 +18,16 @@ st.title("🇺🇸 US Yield — Curve, Real & Breakeven")
 SECRETS_SA = st.secrets.get("gcp_service_account", None)
 TABLES     = st.secrets.get("tables", {})
 
-# Hoofdview voor US yields (en afgeleiden indien samengevoegd)
 PROJECT_ID = (SECRETS_SA or {}).get("project_id") or st.secrets.get("project_id") or ""
 US_VIEW = TABLES.get("us_yield_view", f"{PROJECT_ID}.marketdata.us_yield_curve_enriched_v")
 
-# Optionele views (alleen gebruikt als aanwezig in secrets)
-US_TIPS_VIEW = TABLES.get("us_tips_view", None)          # bv. real_10y / breakeven_10y / breakeven_5y
-US_ACM_VIEW  = TABLES.get("us_acm_tp_view", None)        # bv. acm_term_premium_10y
-US_FWD_VIEW  = TABLES.get("us_forward_view", None)       # bv. ntfs / 18m fwd 3m
+# Optionele views (worden automatisch samengevoegd als aanwezig)
+US_TIPS_VIEW = TABLES.get("us_tips_view", None)     # bevat real_10y / breakeven_10y / breakeven_5y
+US_ACM_VIEW  = TABLES.get("us_acm_tp_view", None)   # bevat acm_term_premium_10y
+US_FWD_VIEW  = TABLES.get("us_forward_view", None)  # bevat ntfs / 18m fwd 3m
 
 # ─────────────────────────────────────────────────────────
-# BQ client
+# BQ client & helpers
 # ─────────────────────────────────────────────────────────
 def make_bq_client():
     if SECRETS_SA:
@@ -42,9 +41,7 @@ CLIENT = make_bq_client()
 def query_df(sql: str, params: dict | None = None) -> pd.DataFrame:
     cfg = bigquery.QueryJobConfig()
     if params:
-        cfg.query_parameters = [
-            bigquery.ScalarQueryParameter(k, "STRING", v) for k, v in params.items()
-        ]
+        cfg.query_parameters = [bigquery.ScalarQueryParameter(k, "STRING", v) for k, v in params.items()]
     return CLIENT.query(sql, job_config=cfg).to_dataframe()
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -83,21 +80,21 @@ def load_us_view(fqtn: str) -> pd.DataFrame:
     # Spreads
     for s in ["spread_10_2","spread_30_10"]:
         if s in cols: sel.append(f"SAFE_CAST({s} AS FLOAT64) AS {s}")
-    # Reëel & Breakeven (indien aanwezig in dezelfde view)
+    # Reëel & Breakeven (indien in dezelfde view)
     for r in ["real_10y", "breakeven_10y", "breakeven_5y"]:
         if r in cols: sel.append(f"SAFE_CAST({r} AS FLOAT64) AS {r}")
-    # Near-term forward spread of equivalent
+    # NTFS (aliasen naar ntfs)
     for f in ["ntfs", "fwd_18m_3m_minus_3m", "near_term_forward_spread"]:
         if f in cols: sel.append(f"SAFE_CAST({f} AS FLOAT64) AS ntfs")
     # ACM term premium
     for a in ["acm_term_premium_10y", "acm_tp_10y"]:
         if a in cols: sel.append(f"SAFE_CAST({a} AS FLOAT64) AS acm_term_premium_10y")
     # Deltas (bp/pp)
-    for base in ["y_3m","y_2y","y_5y","y_10y","y_30y","spread_10_2","spread_30_10"]:
+    bases = ["y_3m","y_2y","y_5y","y_10y","y_30y","spread_10_2","spread_30_10"]
+    for base in bases:
         if f"{base}_d1_bp" in cols: sel.append(f"SAFE_CAST({base}_d1_bp AS FLOAT64) AS {base}_d1_bp")
         if f"{base}_d7"    in cols: sel.append(f"SAFE_CAST({base}_d7    AS FLOAT64) AS {base}_d7")
         if f"{base}_d30"   in cols: sel.append(f"SAFE_CAST({base}_d30   AS FLOAT64) AS {base}_d30")
-
     if "snapshot_date" in cols: sel.append("snapshot_date")
 
     sql = f"SELECT {', '.join(sel)} FROM `{fqtn}` ORDER BY date"
@@ -126,11 +123,10 @@ def load_optional_view(fqtn: str | None, cols_wanted: list[str], rename_map: dic
     return df
 
 # ─────────────────────────────────────────────────────────
-# Data laden
+# Data laden & mergen
 # ─────────────────────────────────────────────────────────
 with st.spinner("US data laden uit BigQuery…"):
     US = load_us_view(US_VIEW)
-    # Optionele extra’s samenvoegen als je die in losse views opslaat
     TIPS = load_optional_view(US_TIPS_VIEW, ["real_10y","breakeven_10y","breakeven_5y"],
                               {"real_10y":"real_10y","breakeven_10y":"breakeven_10y","breakeven_5y":"breakeven_5y"})
     FWD  = load_optional_view(US_FWD_VIEW, ["ntfs","fwd_18m_3m_minus_3m","near_term_forward_spread"],
@@ -138,7 +134,6 @@ with st.spinner("US data laden uit BigQuery…"):
     ACM  = load_optional_view(US_ACM_VIEW, ["acm_term_premium_10y","acm_tp_10y"],
                               {"acm_tp_10y":"acm_term_premium_10y"})
 
-    # Merge op date (left join zodat US basis leidend blijft)
     for extra in [TIPS, FWD, ACM]:
         if not extra.empty:
             US = pd.merge(US, extra, on="date", how="left")
@@ -147,9 +142,9 @@ if US.empty:
     st.error("Geen US data gevonden. Check je view/secrets.")
     st.stop()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 # Controls
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 c1, c2, c3 = st.columns([1.1, 1.1, 1])
 with c1:
     round_dp = st.slider("Decimalen", 1, 4, 2)
@@ -159,7 +154,6 @@ with c2:
 with c3:
     show_table = st.toggle("Tabel onderaan", value=False)
 
-# Periode
 st.subheader("Periode")
 dmin = max(pd.to_datetime("1990-01-01"), US["date"].min())
 dmax = US["date"].max()
@@ -198,10 +192,8 @@ if US.empty:
 # KPI’s
 # ─────────────────────────────────────────────────────────
 latest = US.iloc[-1]
-
 def g(col):
-    if col not in US.columns:
-        return None
+    if col not in US.columns: return None
     val = latest.get(col)
     return None if pd.isna(val) else float(val)
 
@@ -211,9 +203,8 @@ ntfs = g("ntfs")
 real10 = g("real_10y"); be10 = g("breakeven_10y")
 acm = g("acm_term_premium_10y")
 
-fmt = lambda x, d=round_dp: "—" if x is None or np.isnan(x) else f"{round(float(x), d)}%"
-fmt_bp = lambda x: "—" if x is None or np.isnan(x) else f"{round(float(x)*100, 1)} bp"
-fmt_pp = lambda x: "—" if x is None or np.isnan(x) else f"{round(float(x), 2)} pp"
+fmt     = lambda x, d=round_dp: "—" if x is None or np.isnan(x) else f"{round(float(x), d)}%"
+fmt_pp  = lambda x: "—" if x is None or np.isnan(x) else f"{round(float(x), 2)} pp"
 
 k1,k2,k3,k4,k5,k6,k7,k8 = st.columns(8)
 k1.metric("3M", fmt(y3m))
@@ -239,13 +230,10 @@ if not snap_dates:
     st.stop()
 
 def nearest_index(dates, target_ts):
-    if not dates:
-        return 0
+    if not dates: return 0
     diffs = [abs((pd.Timestamp(d) - pd.Timestamp(target_ts)).days) for d in dates]
     idx = int(np.argmin(diffs))  # cast naar Python int
-    if idx < 0: idx = 0
-    if idx >= len(dates): idx = len(dates) - 1
-    return idx
+    return max(0, min(idx, len(dates) - 1))
 
 snap_primary_idx = int(len(snap_dates) - 1)
 snap_primary = st.selectbox(
@@ -253,7 +241,7 @@ snap_primary = st.selectbox(
     format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d")
 )
 
-compare_enabled_default = True if len(snap_dates) > 1 else False
+compare_enabled_default = len(snap_dates) > 1
 compare = st.checkbox("Vergelijk met 2e peildatum", value=compare_enabled_default,
                       disabled=not compare_enabled_default)
 
@@ -313,35 +301,64 @@ ts.update_layout(margin=dict(l=10, r=10, t=30, b=10))
 st.plotly_chart(ts, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────
-# Tijdreeks — Levels (3M/2Y/5Y/10Y/30Y)
+# Tijdreeks — Levels (multiselect maturities)
 # ─────────────────────────────────────────────────────────
-st.subheader("Tijdreeks — Levels (3M/2Y/5Y/10Y/30Y)")
+st.subheader("Tijdreeks — Levels (selecteer termijnen)")
+
+# beschikbare maturities (alleen kolommen die bestaan)
+available_mats = [(c, n) for c, n in [
+    ("y_3m","3M"),("y_2y","2Y"),("y_5y","5Y"),("y_10y","10Y"),("y_30y","30Y")
+] if c in US.columns]
+
+# default: alle standaard curve-termijnen
+default_sel = [n for c, n in available_mats]  # 3M/2Y/5Y/10Y/30Y indien aanwezig
+label_to_col = {n: c for c, n in available_mats}
+
+maturity_labels = [n for _, n in available_mats]
+chosen_labels = st.multiselect(
+    "Toon termijnen",
+    options=maturity_labels,
+    default=default_sel,
+    help="Standaard staan de curve-termijnen aan. Vink uit om te vereenvoudigen."
+)
+
 fig1 = go.Figure()
-for col, nm in [("y_3m","3M"),("y_2y","2Y"),("y_5y","5Y"),("y_10y","10Y"),("y_30y","30Y")]:
-    if col in US.columns:
-        fig1.add_trace(go.Scatter(x=US["date"], y=US[col], name=nm, mode="lines"))
+for lbl in chosen_labels:
+    col = label_to_col.get(lbl)
+    if col:
+        fig1.add_trace(go.Scatter(x=US["date"], y=US[col], name=lbl, mode="lines"))
 fig1.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Date")
 fig1.update_xaxes(range=[start_date, end_date])
 st.plotly_chart(fig1, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────
-# Tijdreeks — 10Y–2Y, 30Y–10Y & NTFS
+# Tijdreeks — Spreads & NTFS (met toggles)
 # ─────────────────────────────────────────────────────────
 st.subheader("Tijdreeks — 10Y–2Y, 30Y–10Y & NTFS")
+
+scol1, scol2, scol3 = st.columns(3)
+with scol1:
+    show_10_2 = st.checkbox("Toon 10Y–2Y", value=("spread_10_2" in US.columns))
+with scol2:
+    show_30_10 = st.checkbox("Toon 30Y–10Y", value=("spread_30_10" in US.columns))
+with scol3:
+    show_ntfs = st.checkbox("Toon NTFS", value=("ntfs" in US.columns))
+
 fig2 = go.Figure()
-if "spread_10_2" in US.columns:
+if show_10_2 and "spread_10_2" in US.columns:
     fig2.add_trace(go.Scatter(x=US["date"], y=US["spread_10_2"], name="10Y–2Y", mode="lines"))
-if "spread_30_10" in US.columns:
+if show_30_10 and "spread_30_10" in US.columns:
     fig2.add_trace(go.Scatter(x=US["date"], y=US["spread_30_10"], name="30Y–10Y", mode="lines"))
-if "ntfs" in US.columns:
+if show_ntfs and "ntfs" in US.columns:
     fig2.add_trace(go.Scatter(x=US["date"], y=US["ntfs"], name="NTFS", mode="lines"))
     fig2.add_hline(y=0.0, line_width=1, line_color="gray", opacity=0.5)
+
 fig2.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Spread (pp)", xaxis_title="Date")
 fig2.update_xaxes(range=[start_date, end_date])
 st.plotly_chart(fig2, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────
-# Tijdreeks — 10Y Nominaal vs Reëel & Breakeven
+# Tijdreeks — 10Y Nominaal vs Reëel & Breakeven (alleen als data bestaat)
 # ─────────────────────────────────────────────────────────
 if ("y_10y" in US.columns) or ("real_10y" in US.columns) or ("breakeven_10y" in US.columns):
     st.subheader("Tijdreeks — 10Y Nominaal vs Reëel & Breakeven")
@@ -361,13 +378,12 @@ if ("y_10y" in US.columns) or ("real_10y" in US.columns) or ("breakeven_10y" in 
 # ─────────────────────────────────────────────────────────
 st.subheader("Deltas — histogram & tijdreeks")
 
-if   delta_h == "1d": suf="_d1_bp"; is_bp=True
-elif delta_h == "7d": suf="_d7";    is_bp=False
-else:                  suf="_d30";   is_bp=False
+if   delta_h == "1d": suf="_d1_bp"
+elif delta_h == "7d": suf="_d7"
+else:                  suf="_d30"
 
 bases = [("y_3m","3M"),("y_2y","2Y"),("y_5y","5Y"),("y_10y","10Y"),("y_30y","30Y"),
          ("spread_10_2","10Y-2Y"),("spread_30_10","30Y-10Y")]
-
 def_idx = next((i for i,(b,_) in enumerate(bases) if b=="y_10y"), 0)
 b_sel, label_sel = st.selectbox("Metric", bases, index=def_idx, format_func=lambda t: t[1])
 
