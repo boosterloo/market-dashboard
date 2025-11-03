@@ -1,4 +1,4 @@
-# pages/Yield_US.py — US-only, duidelijk & snel
+# pages/Yield_US.py — 🇺🇸 US-only Yield: Curve, Real, Breakeven (robust)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,7 +12,7 @@ from google.oauth2 import service_account
 # ─────────────────────────────────────────────────────────
 # App setup
 # ─────────────────────────────────────────────────────────
-st.set_page_config(page_title="🇺🇸 US Yield — Curve, Real, Breakeven", layout="wide")
+st.set_page_config(page_title="🇺🇸 US Yield — Curve, Real & Breakeven", layout="wide")
 st.title("🇺🇸 US Yield — Curve, Real & Breakeven")
 
 SECRETS_SA = st.secrets.get("gcp_service_account", None)
@@ -23,9 +23,9 @@ PROJECT_ID = (SECRETS_SA or {}).get("project_id") or st.secrets.get("project_id"
 US_VIEW = TABLES.get("us_yield_view", f"{PROJECT_ID}.marketdata.us_yield_curve_enriched_v")
 
 # Optionele views (alleen gebruikt als aanwezig in secrets)
-US_TIPS_VIEW = TABLES.get("us_tips_view", None)                  # bv. real curve of 10y real/BE splits
-US_ACM_VIEW  = TABLES.get("us_acm_tp_view", None)               # bv. acm_term_premium_10y
-US_FWD_VIEW  = TABLES.get("us_forward_view", None)              # bv. ntfs / 18m fwd 3m
+US_TIPS_VIEW = TABLES.get("us_tips_view", None)          # bv. real_10y / breakeven_10y / breakeven_5y
+US_ACM_VIEW  = TABLES.get("us_acm_tp_view", None)        # bv. acm_term_premium_10y
+US_FWD_VIEW  = TABLES.get("us_forward_view", None)       # bv. ntfs / 18m fwd 3m
 
 # ─────────────────────────────────────────────────────────
 # BQ client
@@ -108,7 +108,7 @@ def load_us_view(fqtn: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_optional_view(fqtn: str | None, cols_wanted: list[str], rename_map: dict[str,str]) -> pd.DataFrame:
-    if not fqtn: 
+    if not fqtn:
         return pd.DataFrame()
     cols = list_columns(fqtn)
     if not cols:
@@ -138,7 +138,7 @@ with st.spinner("US data laden uit BigQuery…"):
     ACM  = load_optional_view(US_ACM_VIEW, ["acm_term_premium_10y","acm_tp_10y"],
                               {"acm_tp_10y":"acm_term_premium_10y"})
 
-    # Merge op date (inner join om gaten te vermijden)
+    # Merge op date (left join zodat US basis leidend blijft)
     for extra in [TIPS, FWD, ACM]:
         if not extra.empty:
             US = pd.merge(US, extra, on="date", how="left")
@@ -147,9 +147,9 @@ if US.empty:
     st.error("Geen US data gevonden. Check je view/secrets.")
     st.stop()
 
-# ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Controls
-# ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 c1, c2, c3 = st.columns([1.1, 1.1, 1])
 with c1:
     round_dp = st.slider("Decimalen", 1, 4, 2)
@@ -170,18 +170,19 @@ preset = st.radio(
     horizontal=True, index=4
 )
 
-def clamp(ts): return max(dmin, ts)
+def clamp(ts): 
+    return max(dmin, ts)
 
-if preset == "1W": start_date, end_date = clamp(dmax - pd.DateOffset(weeks=1)), dmax
+if preset == "1W":   start_date, end_date = clamp(dmax - pd.DateOffset(weeks=1)), dmax
 elif preset == "1M": start_date, end_date = clamp(dmax - pd.DateOffset(months=1)), dmax
 elif preset == "3M": start_date, end_date = clamp(dmax - pd.DateOffset(months=3)), dmax
 elif preset == "6M": start_date, end_date = clamp(dmax - pd.DateOffset(months=6)), dmax
 elif preset == "1Y": start_date, end_date = clamp(dmax - pd.DateOffset(years=1)), dmax
 elif preset == "3Y": start_date, end_date = clamp(dmax - pd.DateOffset(years=3)), dmax
 elif preset == "5Y": start_date, end_date = clamp(dmax - pd.DateOffset(years=5)), dmax
-elif preset == "10Y": start_date, end_date = clamp(dmax - pd.DateOffset(years=10)), dmax
-elif preset == "YTD": start_date, end_date = clamp(pd.Timestamp(dmax.year,1,1)), dmax
-elif preset == "Max": start_date, end_date = dmin, dmax
+elif preset == "10Y":start_date, end_date = clamp(dmax - pd.DateOffset(years=10)), dmax
+elif preset == "YTD":start_date, end_date = clamp(pd.Timestamp(dmax.year,1,1)), dmax
+elif preset == "Max":start_date, end_date = dmin, dmax
 else:
     date_range = st.slider("Selecteer periode (Custom)",
                            min_value=dmin.date(), max_value=dmax.date(),
@@ -197,9 +198,12 @@ if US.empty:
 # KPI’s
 # ─────────────────────────────────────────────────────────
 latest = US.iloc[-1]
-def g(col): 
-    return (None if col not in US.columns or pd.isna(latest.get(col)) 
-            else float(latest.get(col)))
+
+def g(col):
+    if col not in US.columns:
+        return None
+    val = latest.get(col)
+    return None if pd.isna(val) else float(val)
 
 y3m = g("y_3m"); y2 = g("y_2y"); y5 = g("y_5y"); y10 = g("y_10y"); y30 = g("y_30y")
 sp10_2 = (y10 - y2) if y10 is not None and y2 is not None else None
@@ -220,24 +224,47 @@ k5.metric("10Y–2Y", fmt_pp(sp10_2))
 k6.metric("NTFS", fmt_pp(ntfs))
 k7.metric("10Y Real", fmt(real10))
 k8.metric("10Y Breakeven", fmt(be10))
-if acm is not None:
+if acm is not None and not np.isnan(acm):
     k9, = st.columns(1)
     k9.metric("ACM Term Premium (10Y)", fmt_pp(acm))
 
 # ─────────────────────────────────────────────────────────
-# Snapshot — Term structure (met vergelijking)
+# Snapshot — Term structure (met vergelijking, robuust)
 # ─────────────────────────────────────────────────────────
 st.subheader("Term Structure — snapshot")
+
 snap_dates = US["date"].tolist()
-snap_primary = st.selectbox("Peildatum", options=snap_dates, index=len(snap_dates)-1,
-                            format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d"))
-compare = st.checkbox("Vergelijk met 2e peildatum", value=True)
+if not snap_dates:
+    st.info("Geen datums beschikbaar in US dataset.")
+    st.stop()
+
+def nearest_index(dates, target_ts):
+    if not dates:
+        return 0
+    diffs = [abs((pd.Timestamp(d) - pd.Timestamp(target_ts)).days) for d in dates]
+    idx = int(np.argmin(diffs))  # cast naar Python int
+    if idx < 0: idx = 0
+    if idx >= len(dates): idx = len(dates) - 1
+    return idx
+
+snap_primary_idx = int(len(snap_dates) - 1)
+snap_primary = st.selectbox(
+    "Peildatum", options=snap_dates, index=snap_primary_idx,
+    format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d")
+)
+
+compare_enabled_default = True if len(snap_dates) > 1 else False
+compare = st.checkbox("Vergelijk met 2e peildatum", value=compare_enabled_default,
+                      disabled=not compare_enabled_default)
+
+snap_secondary = None
 if compare:
-    # ~1 maand terug of dichtstbij
     tgt = pd.Timestamp(snap_primary) - pd.DateOffset(months=1)
-    idx = np.argmin([abs((pd.Timestamp(d)-tgt).days) for d in snap_dates])
-    snap_secondary = st.selectbox("2e peildatum", options=snap_dates, index=idx,
-                                  format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d"))
+    idx = nearest_index(snap_dates, tgt)
+    snap_secondary = st.selectbox(
+        "2e peildatum", options=snap_dates, index=int(idx),
+        format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d")
+    )
 
 def curve_points(row: pd.Series):
     mats = ["3M","2Y","5Y","10Y","30Y"]
@@ -246,19 +273,19 @@ def curve_points(row: pd.Series):
     v = [v for v in vals if pd.notna(v)]
     return m, v
 
-r1 = US[US["date"]==snap_primary].tail(1)
+r1 = US[US["date"] == snap_primary].tail(1)
 rowA = r1.iloc[0] if not r1.empty else pd.Series()
 mA, vA = curve_points(rowA)
 
 ts = make_subplots(rows=1, cols=2, subplot_titles=("Term structure", "Δ vs 2e peildatum (bp)"),
-                   column_widths=[0.6,0.4])
+                   column_widths=[0.6, 0.4])
 
 if mA:
     ts.add_trace(go.Scatter(x=mA, y=vA, mode="lines+markers",
                             name=f"{pd.Timestamp(snap_primary).date()}"), row=1, col=1)
 
-if compare:
-    r2 = US[US["date"]==snap_secondary].tail(1)
+if compare and snap_secondary is not None:
+    r2 = US[US["date"] == snap_secondary].tail(1)
     rowB = r2.iloc[0] if not r2.empty else pd.Series()
     mB, vB = curve_points(rowB)
     if mB:
@@ -267,14 +294,14 @@ if compare:
                                 line=dict(dash="dash")), row=1, col=1)
         # Δ-curve (bp)
         d = {}
-        for m,val in zip(mA,vA): d[m]=[val, None]
-        for m,val in zip(mB,vB): d[m]=[d.get(m,[None,None])[0], val]
-        order = {k:i for i,k in enumerate(["3M","2Y","5Y","10Y","30Y"])}
+        for m, val in zip(mA, vA): d[m] = [val, None]
+        for m, val in zip(mB, vB): d[m] = [d.get(m, [None, None])[0], val]
+        order = {k: i for i, k in enumerate(["3M", "2Y", "5Y", "10Y", "30Y"])}
         xs, ys = [], []
         for k in sorted(d.keys(), key=lambda x: order.get(x, 99)):
-            a,b = d[k]
+            a, b = d[k]
             if a is not None and b is not None:
-                xs.append(k); ys.append((a-b)*100.0)
+                xs.append(k); ys.append((a - b) * 100.0)
         if xs:
             ts.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="Δ (bp)"), row=1, col=2)
 
@@ -282,11 +309,11 @@ ts.update_yaxes(title_text="Yield (%)", row=1, col=1)
 ts.update_yaxes(title_text="Δ (bp)", row=1, col=2)
 ts.update_xaxes(title_text="Maturity", row=1, col=1)
 ts.update_xaxes(title_text="Maturity", row=1, col=2)
-ts.update_layout(margin=dict(l=10,r=10,t=30,b=10))
+ts.update_layout(margin=dict(l=10, r=10, t=30, b=10))
 st.plotly_chart(ts, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────
-# Tijdreeks — Levels
+# Tijdreeks — Levels (3M/2Y/5Y/10Y/30Y)
 # ─────────────────────────────────────────────────────────
 st.subheader("Tijdreeks — Levels (3M/2Y/5Y/10Y/30Y)")
 fig1 = go.Figure()
@@ -298,7 +325,7 @@ fig1.update_xaxes(range=[start_date, end_date])
 st.plotly_chart(fig1, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────
-# Tijdreeks — Spreads & NTFS
+# Tijdreeks — 10Y–2Y, 30Y–10Y & NTFS
 # ─────────────────────────────────────────────────────────
 st.subheader("Tijdreeks — 10Y–2Y, 30Y–10Y & NTFS")
 fig2 = go.Figure()
@@ -314,7 +341,7 @@ fig2.update_xaxes(range=[start_date, end_date])
 st.plotly_chart(fig2, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────
-# Tijdreeks — Nominaal vs Reëel & Breakeven
+# Tijdreeks — 10Y Nominaal vs Reëel & Breakeven
 # ─────────────────────────────────────────────────────────
 if ("y_10y" in US.columns) or ("real_10y" in US.columns) or ("breakeven_10y" in US.columns):
     st.subheader("Tijdreeks — 10Y Nominaal vs Reëel & Breakeven")
@@ -356,6 +383,7 @@ def get_delta_series(df: pd.DataFrame, base: str) -> pd.Series:
         return pd.to_numeric(df[col], errors="coerce") * 100.0  # pp → bp
 
 USd = get_delta_series(US, b_sel)
+
 # Relatief (%): Δpp / vorige pp * 100
 if suf == "_d1_bp":
     dpp = USd / 100.0
@@ -393,6 +421,7 @@ st.plotly_chart(figd, use_container_width=True)
 if show_table:
     st.subheader("Tabel (US, gefilterd)")
     st.dataframe(US.sort_values("date", ascending=False).round(round_dp))
+
 csv = US.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Download CSV (US, gefilterd)", data=csv,
                    file_name="us_yield_filtered.csv", mime="text/csv")
