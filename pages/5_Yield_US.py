@@ -1,4 +1,4 @@
-# pages/Yield_US.py — 🇺🇸 US-only Yield: Curve, Real, Breakeven (interactief & robuust)
+# pages/Yield_US.py — 🇺🇸 US-only Yield: Curve, Real, Breakeven (interactief & robuust, default=Custom, D-1)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -22,9 +22,9 @@ PROJECT_ID = (SECRETS_SA or {}).get("project_id") or st.secrets.get("project_id"
 US_VIEW = TABLES.get("us_yield_view", f"{PROJECT_ID}.marketdata.us_yield_curve_enriched_v")
 
 # Optionele views (worden automatisch samengevoegd als aanwezig)
-US_TIPS_VIEW = TABLES.get("us_tips_view", None)     # bevat real_10y / breakeven_10y / breakeven_5y
-US_ACM_VIEW  = TABLES.get("us_acm_tp_view", None)   # bevat acm_term_premium_10y
-US_FWD_VIEW  = TABLES.get("us_forward_view", None)  # bevat ntfs / 18m fwd 3m
+US_TIPS_VIEW = TABLES.get("us_tips_view", None)     # real_10y / breakeven_10y / breakeven_5y
+US_ACM_VIEW  = TABLES.get("us_acm_tp_view", None)   # acm_term_premium_10y
+US_FWD_VIEW  = TABLES.get("us_forward_view", None)  # ntfs / 18m fwd 3m
 
 # ─────────────────────────────────────────────────────────
 # BQ client & helpers
@@ -143,6 +143,24 @@ if US.empty:
     st.stop()
 
 # ─────────────────────────────────────────────────────────
+# Datum helpers (D-1 defaults, nearest-on-or-before)
+# ─────────────────────────────────────────────────────────
+def nearest_on_or_before(dates: list[pd.Timestamp], target: pd.Timestamp) -> pd.Timestamp:
+    dates_sorted = sorted(pd.to_datetime(dates))
+    # snel pad: als target kleiner is dan eerste datum → eerste
+    if target <= dates_sorted[0]:
+        return dates_sorted[0]
+    # loop achteruit tot we <= target zijn
+    for d in reversed(dates_sorted):
+        if d <= target:
+            return d
+    return dates_sorted[-1]  # fallback
+
+def normalize_utc_today():
+    # naive UTC middernacht
+    return pd.Timestamp.utcnow().normalize()
+
+# ─────────────────────────────────────────────────────────
 # Controls
 # ─────────────────────────────────────────────────────────
 c1, c2, c3 = st.columns([1.1, 1.1, 1])
@@ -158,11 +176,10 @@ st.subheader("Periode")
 dmin = max(pd.to_datetime("1990-01-01"), US["date"].min())
 dmax = US["date"].max()
 
-preset = st.radio(
-    "Presets",
-    ["1W","1M","3M","6M","1Y","3Y","5Y","10Y","YTD","Max","Custom"],
-    horizontal=True, index=4
-)
+# preset standaard op Custom
+preset_options = ["1W","1M","3M","6M","1Y","3Y","5Y","10Y","YTD","Max","Custom"]
+preset_default_index = preset_options.index("Custom")
+preset = st.radio("Presets", preset_options, horizontal=True, index=preset_default_index)
 
 def clamp(ts): 
     return max(dmin, ts)
@@ -178,9 +195,11 @@ elif preset == "10Y":start_date, end_date = clamp(dmax - pd.DateOffset(years=10)
 elif preset == "YTD":start_date, end_date = clamp(pd.Timestamp(dmax.year,1,1)), dmax
 elif preset == "Max":start_date, end_date = dmin, dmax
 else:
+    # Default voor Custom: laatste 3 maanden
+    default_min = clamp(dmax - pd.DateOffset(months=3)).date()
     date_range = st.slider("Selecteer periode (Custom)",
                            min_value=dmin.date(), max_value=dmax.date(),
-                           value=(clamp(dmax - pd.DateOffset(years=1)).date(), dmax.date()))
+                           value=(default_min, dmax.date()))
     start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
 
 US = US[(US["date"]>=start_date) & (US["date"]<=end_date)].copy()
@@ -224,33 +243,26 @@ if acm is not None and not np.isnan(acm):
 # ─────────────────────────────────────────────────────────
 st.subheader("Term Structure — snapshot")
 
-snap_dates = US["date"].tolist()
+snap_dates = sorted(US["date"].tolist())
 if not snap_dates:
     st.info("Geen datums beschikbaar in US dataset.")
     st.stop()
 
-def nearest_index(dates, target_ts):
-    if not dates: return 0
-    diffs = [abs((pd.Timestamp(d) - pd.Timestamp(target_ts)).days) for d in dates]
-    idx = int(np.argmin(diffs))  # cast naar Python int
-    return max(0, min(idx, len(dates) - 1))
+# defaults: gisteren en ~een week terug (8 dagen)
+yesterday = normalize_utc_today() - pd.Timedelta(days=1)
+default_primary = nearest_on_or_before(snap_dates, yesterday)
+default_secondary = nearest_on_or_before(snap_dates, default_primary - pd.Timedelta(days=8))
 
-snap_primary_idx = int(len(snap_dates) - 1)
 snap_primary = st.selectbox(
-    "Peildatum", options=snap_dates, index=snap_primary_idx,
+    "Peildatum", options=snap_dates, index=snap_dates.index(default_primary),
     format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d")
 )
 
-compare_enabled_default = len(snap_dates) > 1
-compare = st.checkbox("Vergelijk met 2e peildatum", value=compare_enabled_default,
-                      disabled=not compare_enabled_default)
-
+compare = st.checkbox("Vergelijk met 2e peildatum", value=True, disabled=(len(snap_dates) <= 1))
 snap_secondary = None
 if compare:
-    tgt = pd.Timestamp(snap_primary) - pd.DateOffset(months=1)
-    idx = nearest_index(snap_dates, tgt)
     snap_secondary = st.selectbox(
-        "2e peildatum", options=snap_dates, index=int(idx),
+        "2e peildatum", options=snap_dates, index=snap_dates.index(default_secondary),
         format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d")
     )
 
@@ -300,18 +312,25 @@ ts.update_xaxes(title_text="Maturity", row=1, col=2)
 ts.update_layout(margin=dict(l=10, r=10, t=30, b=10))
 st.plotly_chart(ts, use_container_width=True)
 
+with st.expander("🔎 Uitleg: hoe lees je de curve en spreads?"):
+    st.markdown("""
+- **Opwaarts hellend (3M→30Y hoger)** → *normaal*: groei & lichte inflatieverwachting.  
+- **Invers (2Y > 10Y)** → markt prijst **korte-termijn rente** (Fed) relatief hoog t.o.v. lange termijn. Vaak **late-cycle** / recessierisico.  
+- **Bull steepening**: lange einden dalen harder (rally in duration) → vaak rond *policy easing*.  
+- **Bear steepening**: lange einden lopen op (term premium/inflatiepremie) → groei/inflatie-vrees.  
+- **10Y–2Y**: klassieke recessiemeter. **NTFS** (near-term forward) is vaak *leading*: draait soms eerder dan 10Y–2Y.
+""")
+
 # ─────────────────────────────────────────────────────────
 # Tijdreeks — Levels (multiselect maturities)
 # ─────────────────────────────────────────────────────────
 st.subheader("Tijdreeks — Levels (selecteer termijnen)")
 
-# beschikbare maturities (alleen kolommen die bestaan)
 available_mats = [(c, n) for c, n in [
     ("y_3m","3M"),("y_2y","2Y"),("y_5y","5Y"),("y_10y","10Y"),("y_30y","30Y")
 ] if c in US.columns]
 
-# default: alle standaard curve-termijnen
-default_sel = [n for c, n in available_mats]  # 3M/2Y/5Y/10Y/30Y indien aanwezig
+default_sel = [n for c, n in available_mats]
 label_to_col = {n: c for c, n in available_mats}
 
 maturity_labels = [n for _, n in available_mats]
@@ -332,7 +351,7 @@ fig1.update_xaxes(range=[start_date, end_date])
 st.plotly_chart(fig1, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────
-# Tijdreeks — Spreads & NTFS (met toggles)
+# Tijdreeks — 10Y–2Y, 30Y–10Y & NTFS (met toggles)
 # ─────────────────────────────────────────────────────────
 st.subheader("Tijdreeks — 10Y–2Y, 30Y–10Y & NTFS")
 
@@ -372,6 +391,23 @@ if ("y_10y" in US.columns) or ("real_10y" in US.columns) or ("breakeven_10y" in 
     fig3.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="%", xaxis_title="Date")
     fig3.update_xaxes(range=[start_date, end_date])
     st.plotly_chart(fig3, use_container_width=True)
+
+    # Info over reële rente / breakeven
+    with st.expander("ℹ️ Wat is reële rente en breakeven — en hoe betrouwbaar is het?"):
+        st.markdown("""
+- **Reële 10Y** komt uit **TIPS-yields** (inflatie-gelinkte Treasuries).  
+- **Breakeven 10Y ≈ Nominale 10Y – Reële 10Y** → de **impliciete inflatieverwachting**.
+- **Let op**: TIPS hebben **liquiditeits- en seizoenseffecten** (carry, indexation-lag). In stressperiodes kan de breakeven tijdelijk vertekenen.  
+- Praktisch: gebruik de **trend** en **niveauvergelijkingen** (b.v. 5Y vs 10Y breakeven), niet elk dagsprongetje afzonderlijk.
+""")
+else:
+    # Als alleen nominale 10Y aanwezig is: duidelijk zijn
+    with st.expander("ℹ️ Over reële rente / breakeven"):
+        st.markdown("""
+Je ziet hier alleen de **nominale 10Y**. Voor **reële 10Y** (TIPS) en **breakeven** moeten de kolommen
+`real_10y` en `breakeven_10y` in je view zitten (of via `us_tips_view` gemerged worden).  
+Zodra die kolommen aanwezig zijn, verschijnen de lijnen automatisch.
+""")
 
 # ─────────────────────────────────────────────────────────
 # Deltas — histogram & tijdreeks
