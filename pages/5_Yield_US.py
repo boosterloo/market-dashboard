@@ -351,6 +351,41 @@ fig1.update_xaxes(range=[start_date, end_date])
 st.plotly_chart(fig1, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────
+# Automatische conclusie over yield curve
+# ─────────────────────────────────────────────────────────
+if "spread_10_2" in US.columns and "spread_30_10" in US.columns:
+    sp10_2_now = float(US.iloc[-1]["spread_10_2"])
+    sp30_10_now = float(US.iloc[-1]["spread_30_10"])
+    sp10_2_prev = float(US.iloc[-5]["spread_10_2"]) if len(US) > 5 else sp10_2_now
+    sp30_10_prev = float(US.iloc[-5]["spread_30_10"]) if len(US) > 5 else sp30_10_now
+
+    delta_10_2 = sp10_2_now - sp10_2_prev
+    delta_30_10 = sp30_10_now - sp30_10_prev
+
+    def describe_curve(sp10_2, sp30_10, d10_2, d30_10):
+        if sp10_2 > 0:
+            shape = "normaal (opwaarts hellend)"
+        elif sp10_2 < -0.05:
+            shape = "duidelijk invers"
+        else:
+            shape = "vlak of licht invers"
+
+        if d10_2 > 0 and d30_10 > 0:
+            trend = "Bear steepening — lange einden lopen op (inflatie/aanboddruk)."
+        elif d10_2 < 0 and d30_10 < 0:
+            trend = "Bull flattening — brede daling in yields (cutverwachting)."
+        elif d10_2 < 0 and d30_10 > 0:
+            trend = "Bull steepening — lange rente daalt, recessie- of cut-verwachting."
+        elif d10_2 > 0 and d30_10 < 0:
+            trend = "Bear flattening — korte kant stijgt door Fed-tightening."
+        else:
+            trend = "Geen duidelijke verandering."
+        return shape, trend
+
+    shape, trend = describe_curve(sp10_2_now, sp30_10_now, delta_10_2, delta_30_10)
+    st.markdown(f"### 📊 Curve-analyse\n- **Huidige vorm:** {shape}\n- **Recente verandering:** {trend}")
+
+# ─────────────────────────────────────────────────────────
 # Spreads & NTFS
 # ─────────────────────────────────────────────────────────
 st.subheader("Tijdreeks — 10Y–2Y, 30Y–10Y & NTFS")
