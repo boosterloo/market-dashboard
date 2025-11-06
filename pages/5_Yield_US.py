@@ -21,7 +21,7 @@ TABLES     = st.secrets.get("tables", {})
 PROJECT_ID = (SECRETS_SA or {}).get("project_id") or st.secrets.get("project_id") or ""
 US_VIEW = TABLES.get("us_yield_view", f"{PROJECT_ID}.marketdata.us_yield_curve_enriched_v")
 
-# Optionele views (worden automatisch samengevoegd als aanwezig)
+# Optioneel: extra views (automatisch gemerged wanneer aanwezig)
 US_TIPS_VIEW = TABLES.get("us_tips_view", None)     # real_10y / breakeven_10y / breakeven_5y
 US_ACM_VIEW  = TABLES.get("us_acm_tp_view", None)   # acm_term_premium_10y
 US_FWD_VIEW  = TABLES.get("us_forward_view", None)  # ntfs / 18m fwd 3m
@@ -123,6 +123,31 @@ def load_optional_view(fqtn: str | None, cols_wanted: list[str], rename_map: dic
     return df
 
 # ─────────────────────────────────────────────────────────
+# TZ-helpers (fix voor TypeError tz-aware vs naive)
+# ─────────────────────────────────────────────────────────
+def _to_naive(ts: pd.Timestamp) -> pd.Timestamp:
+    ts = pd.Timestamp(ts)
+    return ts.tz_localize(None) if ts.tzinfo is not None else ts
+
+def nearest_on_or_before(dates: list[pd.Timestamp], target: pd.Timestamp) -> pd.Timestamp:
+    dates_sorted = sorted([_to_naive(pd.Timestamp(d)) for d in dates])
+    t = _to_naive(pd.Timestamp(target))
+    if not dates_sorted:
+        return t
+    if t <= dates_sorted[0]:
+        return dates_sorted[0]
+    for d in reversed(dates_sorted):
+        if d <= t:
+            return d
+    return dates_sorted[-1]
+
+def normalize_utc_today() -> pd.Timestamp:
+    now_utc = pd.Timestamp.utcnow()
+    if now_utc.tzinfo is not None:
+        now_utc = now_utc.tz_localize(None)
+    return now_utc.normalize()
+
+# ─────────────────────────────────────────────────────────
 # Data laden & mergen
 # ─────────────────────────────────────────────────────────
 with st.spinner("US data laden uit BigQuery…"):
@@ -133,7 +158,6 @@ with st.spinner("US data laden uit BigQuery…"):
                               {"fwd_18m_3m_minus_3m":"ntfs","near_term_forward_spread":"ntfs"})
     ACM  = load_optional_view(US_ACM_VIEW, ["acm_term_premium_10y","acm_tp_10y"],
                               {"acm_tp_10y":"acm_term_premium_10y"})
-
     for extra in [TIPS, FWD, ACM]:
         if not extra.empty:
             US = pd.merge(US, extra, on="date", how="left")
@@ -141,24 +165,6 @@ with st.spinner("US data laden uit BigQuery…"):
 if US.empty:
     st.error("Geen US data gevonden. Check je view/secrets.")
     st.stop()
-
-# ─────────────────────────────────────────────────────────
-# Datum helpers (D-1 defaults, nearest-on-or-before)
-# ─────────────────────────────────────────────────────────
-def nearest_on_or_before(dates: list[pd.Timestamp], target: pd.Timestamp) -> pd.Timestamp:
-    dates_sorted = sorted(pd.to_datetime(dates))
-    # snel pad: als target kleiner is dan eerste datum → eerste
-    if target <= dates_sorted[0]:
-        return dates_sorted[0]
-    # loop achteruit tot we <= target zijn
-    for d in reversed(dates_sorted):
-        if d <= target:
-            return d
-    return dates_sorted[-1]  # fallback
-
-def normalize_utc_today():
-    # naive UTC middernacht
-    return pd.Timestamp.utcnow().normalize()
 
 # ─────────────────────────────────────────────────────────
 # Controls
@@ -314,33 +320,27 @@ st.plotly_chart(ts, use_container_width=True)
 
 with st.expander("🔎 Uitleg: hoe lees je de curve en spreads?"):
     st.markdown("""
-- **Opwaarts hellend (3M→30Y hoger)** → *normaal*: groei & lichte inflatieverwachting.  
-- **Invers (2Y > 10Y)** → markt prijst **korte-termijn rente** (Fed) relatief hoog t.o.v. lange termijn. Vaak **late-cycle** / recessierisico.  
-- **Bull steepening**: lange einden dalen harder (rally in duration) → vaak rond *policy easing*.  
+- **Opwaarts hellend (3M→30Y hoger)** → *normaal*: groei & inflatieverwachting.  
+- **Invers (2Y > 10Y)** → markt prijst **korte-termijn Fed-rente** relatief hoog; vaak *late-cycle*.  
+- **Bull steepening**: lange einden dalen harder (duration-rally) → vaak rond *policy easing*.  
 - **Bear steepening**: lange einden lopen op (term premium/inflatiepremie) → groei/inflatie-vrees.  
-- **10Y–2Y**: klassieke recessiemeter. **NTFS** (near-term forward) is vaak *leading*: draait soms eerder dan 10Y–2Y.
+- **10Y–2Y**: klassieke recessiemeter. **NTFS** (near-term forward) is vaak *leading* en draait eerder.
 """)
 
 # ─────────────────────────────────────────────────────────
-# Tijdreeks — Levels (multiselect maturities)
+# Tijdreeks — Levels (selecteer termijnen)
 # ─────────────────────────────────────────────────────────
 st.subheader("Tijdreeks — Levels (selecteer termijnen)")
-
 available_mats = [(c, n) for c, n in [
     ("y_3m","3M"),("y_2y","2Y"),("y_5y","5Y"),("y_10y","10Y"),("y_30y","30Y")
 ] if c in US.columns]
-
 default_sel = [n for c, n in available_mats]
 label_to_col = {n: c for c, n in available_mats}
-
 maturity_labels = [n for _, n in available_mats]
 chosen_labels = st.multiselect(
-    "Toon termijnen",
-    options=maturity_labels,
-    default=default_sel,
+    "Toon termijnen", options=maturity_labels, default=default_sel,
     help="Standaard staan de curve-termijnen aan. Vink uit om te vereenvoudigen."
 )
-
 fig1 = go.Figure()
 for lbl in chosen_labels:
     col = label_to_col.get(lbl)
@@ -351,10 +351,9 @@ fig1.update_xaxes(range=[start_date, end_date])
 st.plotly_chart(fig1, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────
-# Tijdreeks — 10Y–2Y, 30Y–10Y & NTFS (met toggles)
+# Spreads & NTFS
 # ─────────────────────────────────────────────────────────
 st.subheader("Tijdreeks — 10Y–2Y, 30Y–10Y & NTFS")
-
 scol1, scol2, scol3 = st.columns(3)
 with scol1:
     show_10_2 = st.checkbox("Toon 10Y–2Y", value=("spread_10_2" in US.columns))
@@ -362,7 +361,6 @@ with scol2:
     show_30_10 = st.checkbox("Toon 30Y–10Y", value=("spread_30_10" in US.columns))
 with scol3:
     show_ntfs = st.checkbox("Toon NTFS", value=("ntfs" in US.columns))
-
 fig2 = go.Figure()
 if show_10_2 and "spread_10_2" in US.columns:
     fig2.add_trace(go.Scatter(x=US["date"], y=US["spread_10_2"], name="10Y–2Y", mode="lines"))
@@ -371,53 +369,46 @@ if show_30_10 and "spread_30_10" in US.columns:
 if show_ntfs and "ntfs" in US.columns:
     fig2.add_trace(go.Scatter(x=US["date"], y=US["ntfs"], name="NTFS", mode="lines"))
     fig2.add_hline(y=0.0, line_width=1, line_color="gray", opacity=0.5)
-
 fig2.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Spread (pp)", xaxis_title="Date")
 fig2.update_xaxes(range=[start_date, end_date])
 st.plotly_chart(fig2, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────
-# Tijdreeks — 10Y Nominaal vs Reëel & Breakeven (alleen als data bestaat)
+# 10Y Nominaal vs Reëel & Breakeven — toon alleen wat echt bestaat
 # ─────────────────────────────────────────────────────────
-if ("y_10y" in US.columns) or ("real_10y" in US.columns) or ("breakeven_10y" in US.columns):
-    st.subheader("Tijdreeks — 10Y Nominaal vs Reëel & Breakeven")
+has_real = "real_10y" in US.columns and US["real_10y"].notna().any()
+has_be10 = "breakeven_10y" in US.columns and US["breakeven_10y"].notna().any()
+has_nom10 = "y_10y" in US.columns and US["y_10y"].notna().any()
+
+if has_nom10 or has_real or has_be10:
+    title = "Tijdreeks — 10Y Nominaal" + (" vs Reëel & Breakeven" if (has_real or has_be10) else "")
+    st.subheader(title)
     fig3 = go.Figure()
-    if "y_10y" in US.columns:
+    if has_nom10:
         fig3.add_trace(go.Scatter(x=US["date"], y=US["y_10y"], name="10Y Nominaal", mode="lines"))
-    if "real_10y" in US.columns:
+    if has_real:
         fig3.add_trace(go.Scatter(x=US["date"], y=US["real_10y"], name="10Y Reëel (TIPS)", mode="lines"))
-    if "breakeven_10y" in US.columns:
+    if has_be10:
         fig3.add_trace(go.Scatter(x=US["date"], y=US["breakeven_10y"], name="10Y Breakeven", mode="lines"))
     fig3.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="%", xaxis_title="Date")
     fig3.update_xaxes(range=[start_date, end_date])
     st.plotly_chart(fig3, use_container_width=True)
 
-    # Info over reële rente / breakeven
-    with st.expander("ℹ️ Wat is reële rente en breakeven — en hoe betrouwbaar is het?"):
-        st.markdown("""
-- **Reële 10Y** komt uit **TIPS-yields** (inflatie-gelinkte Treasuries).  
-- **Breakeven 10Y ≈ Nominale 10Y – Reële 10Y** → de **impliciete inflatieverwachting**.
-- **Let op**: TIPS hebben **liquiditeits- en seizoenseffecten** (carry, indexation-lag). In stressperiodes kan de breakeven tijdelijk vertekenen.  
-- Praktisch: gebruik de **trend** en **niveauvergelijkingen** (b.v. 5Y vs 10Y breakeven), niet elk dagsprongetje afzonderlijk.
-""")
-else:
-    # Als alleen nominale 10Y aanwezig is: duidelijk zijn
-    with st.expander("ℹ️ Over reële rente / breakeven"):
-        st.markdown("""
-Je ziet hier alleen de **nominale 10Y**. Voor **reële 10Y** (TIPS) en **breakeven** moeten de kolommen
-`real_10y` en `breakeven_10y` in je view zitten (of via `us_tips_view` gemerged worden).  
-Zodra die kolommen aanwezig zijn, verschijnen de lijnen automatisch.
-""")
-
+    with st.expander("ℹ️ Reëel & breakeven — wat zie je hier?"):
+        if has_real and has_be10:
+            st.markdown("**Reëel** = TIPS-yield (10Y). **Breakeven** ≈ Nominaal − Reëel → impliciete inflatieverwachting. Let op liquiditeit/seasonality in TIPS; kijk vooral naar trend/niveaus.")
+        elif not has_real and not has_be10:
+            st.markdown("Alleen **nominale 10Y** beschikbaar. Voeg `real_10y` en/of `breakeven_10y` toe (bijv. FRED: DFII10 & T10YIE) om meer te zien.")
+        else:
+            st.markdown("De grafiek toont wat beschikbaar is; compleet = zowel `real_10y` (TIPS) als `breakeven_10y`.")
 # ─────────────────────────────────────────────────────────
-# Deltas — histogram & tijdreeks
+# Deltas
 # ─────────────────────────────────────────────────────────
 st.subheader("Deltas — histogram & tijdreeks")
-
+delta_h = delta_h  # uit de controls
 if   delta_h == "1d": suf="_d1_bp"
 elif delta_h == "7d": suf="_d7"
 else:                  suf="_d30"
-
 bases = [("y_3m","3M"),("y_2y","2Y"),("y_5y","5Y"),("y_10y","10Y"),("y_30y","30Y"),
          ("spread_10_2","10Y-2Y"),("spread_30_10","30Y-10Y")]
 def_idx = next((i for i,(b,_) in enumerate(bases) if b=="y_10y"), 0)
@@ -435,8 +426,6 @@ def get_delta_series(df: pd.DataFrame, base: str) -> pd.Series:
         return pd.to_numeric(df[col], errors="coerce") * 100.0  # pp → bp
 
 USd = get_delta_series(US, b_sel)
-
-# Relatief (%): Δpp / vorige pp * 100
 if suf == "_d1_bp":
     dpp = USd / 100.0
     base = pd.to_numeric(US.get(b_sel), errors="coerce")
@@ -459,7 +448,6 @@ with h2:
                      margin=dict(l=10,r=10,t=40,b=10), xaxis_title="Δ (%)", yaxis_title="Aantal dagen")
     st.plotly_chart(H2, use_container_width=True)
 
-# Δ tijdreeks
 figd = go.Figure()
 figd.add_trace(go.Bar(x=US["date"], y=USd, name=f"US Δ{delta_h}", opacity=0.7))
 figd.add_hline(y=0, line_width=1, line_color="gray", opacity=0.5)
