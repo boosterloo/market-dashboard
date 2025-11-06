@@ -143,7 +143,6 @@ def nearest_on_or_before(dates: list[pd.Timestamp], target: pd.Timestamp) -> pd.
     return dates_sorted[-1]
 
 def nearest_index(dates: list[pd.Timestamp], target: pd.Timestamp) -> int:
-    # robuust: kies index met minimale absolute dagafstand
     target = _to_naive(pd.Timestamp(target))
     ds = [_to_naive(pd.Timestamp(d)) for d in dates]
     if not ds:
@@ -235,22 +234,23 @@ if US.empty:
     st.stop()
 
 # ─────────────────────────────────────────────────────────
-# KPI’s
+# KPI’s (robuuste getters)
 # ─────────────────────────────────────────────────────────
 latest = US.iloc[-1]
 def g(col):
-    if col not in US.columns: return None
+    if col not in US.columns: 
+        return None
     val = latest.get(col)
-    return None if pd.isna(val) else float(val)
+    return None if (val is None or pd.isna(val)) else float(val)
 
 y3m = g("y_3m"); y2 = g("y_2y"); y5 = g("y_5y"); y10 = g("y_10y"); y30 = g("y_30y")
-sp10_2_chip = (y10 - y2) if y10 is not None and y2 is not None else None
+sp10_2_chip = (y10 - y2) if (y10 is not None and y2 is not None) else None
 ntfs_chip = g("ntfs")
 real10_chip = g("real_10y"); be10_chip = g("breakeven_10y")
 acm_chip = g("acm_term_premium_10y")
 
-fmt     = lambda x, d=round_dp: "—" if x is None or np.isnan(x) else f"{round(float(x), d)}%"
-fmt_pp  = lambda x: "—" if x is None or np.isnan(x) else f"{round(float(x), 2)} pp"
+fmt     = lambda x, d=round_dp: "—" if (x is None or pd.isna(x)) else f"{round(float(x), d)}%"
+fmt_pp  = lambda x: "—" if (x is None or pd.isna(x)) else f"{round(float(x), 2)} pp"
 
 k1,k2,k3,k4,k5,k6,k7,k8 = st.columns(8)
 k1.metric("3M", fmt(y3m))
@@ -266,7 +266,7 @@ if acm_chip is not None and not np.isnan(acm_chip):
     k9.metric("ACM Term Premium (10Y)", fmt_pp(acm_chip))
 
 # ─────────────────────────────────────────────────────────
-# Regime-badge (compact + kleur) direct onder KPI’s
+# Regime-badge (kleur) + veilige referentiekeuze
 # ─────────────────────────────────────────────────────────
 def _mk_spreads_from_levels(row: pd.Series):
     sp10_2 = row.get("spread_10_2")
@@ -289,9 +289,17 @@ def _nearest_row(days_back: int):
     r = US[US["date"] == dt].tail(1)
     return None if r.empty else r.iloc[0]
 
-row7  = _nearest_row(7)  or _nearest_row(30) or _nearest_row(1)
-if row7 is not None:
-    sp10_2_prev, sp30_10_prev = _mk_spreads_from_levels(row7)
+def pick_ref_row(*candidates: int):
+    """Geef de eerste niet-None referentierij terug (veilig, zonder boolean context op Series)."""
+    for d in candidates:
+        r = _nearest_row(d)
+        if r is not None:
+            return r
+    return None
+
+row_ref = pick_ref_row(7, 30, 1)
+if row_ref is not None:
+    sp10_2_prev, sp30_10_prev = _mk_spreads_from_levels(row_ref)
 else:
     sp10_2_prev, sp30_10_prev = sp10_2_now, sp30_10_now
 
@@ -309,6 +317,7 @@ else:
 
 def _significant(x, thr_bp): 
     return (x is not None) and (abs(x*100) >= thr_bp)
+
 thr_bp = 10  # ≈7–10d drempel
 
 if   (d10_2 is None or d30_10 is None):
@@ -477,9 +486,9 @@ d7_10_2,  d7_30_10  = spread_deltas(row_7d)
 d30_10_2, d30_30_10 = spread_deltas(row_30d)
 
 # thresholds (significantie)
-THR_1D_BP   = 5     # ≥5bp in 1d
-THR_7D_BP   = 10    # ≥10bp in 7d
-THR_30D_BP  = 20    # ≥20bp in 30d
+THR_1D_BP   = 5
+THR_7D_BP   = 10
+THR_30D_BP  = 20
 def _is_sig(d_now: float|None, thr_bp: float) -> bool:
     if d_now is None or pd.isna(d_now):
         return False
@@ -507,7 +516,6 @@ be10   = float(last_row["breakeven_10y"]) if "breakeven_10y" in US.columns and p
 def driver_hint() -> str | None:
     if y10_now is None or (real10 is None and be10 is None):
         return None
-    # Vergelijk met ~7d terug
     r7_real = float(row_7d.get("real_10y")) if (row_7d is not None and "real_10y" in row_7d.index and pd.notna(row_7d.get("real_10y"))) else None
     r7_be   = float(row_7d.get("breakeven_10y")) if (row_7d is not None and "breakeven_10y" in row_7d.index and pd.notna(row_7d.get("breakeven_10y"))) else None
     parts = []
@@ -536,7 +544,6 @@ else:
     shape_txt = "vlak of licht invers"
 
 def describe_trend():
-    # Kies 7d als hoofd-horizon, val terug op 30d of 1d
     dA_10_2, dA_30_10, thr = d7_10_2, d7_30_10, THR_7D_BP
     if dA_10_2 is None or dA_30_10 is None:
         dA_10_2, dA_30_10, thr = d30_10_2, d30_30_10, THR_30D_BP
@@ -564,17 +571,17 @@ def describe_trend():
 
 regime_txt2, evidence_txt = describe_trend()
 
-# Contextregels
+# percentielen + NTFS/driver hints
 ctx_lines = []
-if p_spread is not None:
-    ctx_lines.append(f"10Y–2Y in **p{int(round(p_spread*100))}** over 3Y (lager = meer invers).")
-if p_10y is not None:
-    ctx_lines.append(f"10Y nominaal in **p{int(round(p_10y*100))}** over 3Y.")
-if ntfs_flag:
-    ctx_lines.append(ntfs_flag)
+cutoff_3y = pd.Timestamp(last_row["date"]) - pd.DateOffset(years=3)
+win = US[US["date"] >= cutoff_3y]
+p_spread = _pct_rank(win["spread_10_2"] if "spread_10_2" in win.columns else pd.Series(dtype=float), sp10_2_now) if sp10_2_now is not None else None
+p_10y    = _pct_rank(win["y_10y"]        if "y_10y"        in win.columns else pd.Series(dtype=float), y10_now)    if y10_now    is not None else None
+if p_spread is not None: ctx_lines.append(f"10Y–2Y in **p{int(round(p_spread*100))}** over 3Y (lager = meer invers).")
+if p_10y is not None:    ctx_lines.append(f"10Y nominaal in **p{int(round(p_10y*100))}** over 3Y.")
+if ntfs_flag:            ctx_lines.append(ntfs_flag)
 drv = driver_hint()
-if drv:
-    ctx_lines.append(drv)
+if drv:                  ctx_lines.append(drv)
 
 st.markdown(
     "### 📊 Curve-analyse\n"
