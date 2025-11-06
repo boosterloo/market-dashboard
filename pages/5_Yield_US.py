@@ -1,4 +1,5 @@
-# pages/Yield_US.py — 🇺🇸 US-only Yield: Curve, Real, Breakeven (interactief & robuust, default=Custom, D-1)
+# pages/Yield_US.py — 🇺🇸 US-only Yield: Curve, Real & Breakeven
+# (interactief, robust, default=Custom(3M), snapshots=Yesterday & ~1w back)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -123,11 +124,11 @@ def load_optional_view(fqtn: str | None, cols_wanted: list[str], rename_map: dic
     return df
 
 # ─────────────────────────────────────────────────────────
-# TZ-helpers (fix voor TypeError tz-aware vs naive)
+# TZ / selectbox helpers (voorkomt invalid index type errors)
 # ─────────────────────────────────────────────────────────
 def _to_naive(ts: pd.Timestamp) -> pd.Timestamp:
     ts = pd.Timestamp(ts)
-    return ts.tz_localize(None) if ts.tzinfo is not None else ts
+    return ts.tz_localize(None) if getattr(ts, "tzinfo", None) is not None else ts
 
 def nearest_on_or_before(dates: list[pd.Timestamp], target: pd.Timestamp) -> pd.Timestamp:
     dates_sorted = sorted([_to_naive(pd.Timestamp(d)) for d in dates])
@@ -141,9 +142,18 @@ def nearest_on_or_before(dates: list[pd.Timestamp], target: pd.Timestamp) -> pd.
             return d
     return dates_sorted[-1]
 
+def nearest_index(dates: list[pd.Timestamp], target: pd.Timestamp) -> int:
+    # robuust: kies index met minimale absolute dagafstand
+    target = _to_naive(pd.Timestamp(target))
+    ds = [_to_naive(pd.Timestamp(d)) for d in dates]
+    if not ds:
+        return 0
+    diffs = [abs((d - target).days) for d in ds]
+    return int(np.argmin(diffs))
+
 def normalize_utc_today() -> pd.Timestamp:
     now_utc = pd.Timestamp.utcnow()
-    if now_utc.tzinfo is not None:
+    if getattr(now_utc, "tzinfo", None) is not None:
         now_utc = now_utc.tz_localize(None)
     return now_utc.normalize()
 
@@ -152,12 +162,21 @@ def normalize_utc_today() -> pd.Timestamp:
 # ─────────────────────────────────────────────────────────
 with st.spinner("US data laden uit BigQuery…"):
     US = load_us_view(US_VIEW)
-    TIPS = load_optional_view(US_TIPS_VIEW, ["real_10y","breakeven_10y","breakeven_5y"],
-                              {"real_10y":"real_10y","breakeven_10y":"breakeven_10y","breakeven_5y":"breakeven_5y"})
-    FWD  = load_optional_view(US_FWD_VIEW, ["ntfs","fwd_18m_3m_minus_3m","near_term_forward_spread"],
-                              {"fwd_18m_3m_minus_3m":"ntfs","near_term_forward_spread":"ntfs"})
-    ACM  = load_optional_view(US_ACM_VIEW, ["acm_term_premium_10y","acm_tp_10y"],
-                              {"acm_tp_10y":"acm_term_premium_10y"})
+    TIPS = load_optional_view(
+        US_TIPS_VIEW,
+        ["real_10y","breakeven_10y","breakeven_5y"],
+        {"real_10y":"real_10y","breakeven_10y":"breakeven_10y","breakeven_5y":"breakeven_5y"}
+    )
+    FWD  = load_optional_view(
+        US_FWD_VIEW,
+        ["ntfs","fwd_18m_3m_minus_3m","near_term_forward_spread"],
+        {"fwd_18m_3m_minus_3m":"ntfs","near_term_forward_spread":"ntfs"}
+    )
+    ACM  = load_optional_view(
+        US_ACM_VIEW,
+        ["acm_term_premium_10y","acm_tp_10y"],
+        {"acm_tp_10y":"acm_term_premium_10y"}
+    )
     for extra in [TIPS, FWD, ACM]:
         if not extra.empty:
             US = pd.merge(US, extra, on="date", how="left")
@@ -182,7 +201,7 @@ st.subheader("Periode")
 dmin = max(pd.to_datetime("1990-01-01"), US["date"].min())
 dmax = US["date"].max()
 
-# preset standaard op Custom
+# preset standaard op Custom (laatste 3 maanden)
 preset_options = ["1W","1M","3M","6M","1Y","3Y","5Y","10Y","YTD","Max","Custom"]
 preset_default_index = preset_options.index("Custom")
 preset = st.radio("Presets", preset_options, horizontal=True, index=preset_default_index)
@@ -203,9 +222,11 @@ elif preset == "Max":start_date, end_date = dmin, dmax
 else:
     # Default voor Custom: laatste 3 maanden
     default_min = clamp(dmax - pd.DateOffset(months=3)).date()
-    date_range = st.slider("Selecteer periode (Custom)",
-                           min_value=dmin.date(), max_value=dmax.date(),
-                           value=(default_min, dmax.date()))
+    date_range = st.slider(
+        "Selecteer periode (Custom)",
+        min_value=dmin.date(), max_value=dmax.date(),
+        value=(default_min, dmax.date())
+    )
     start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
 
 US = US[(US["date"]>=start_date) & (US["date"]<=end_date)].copy()
@@ -223,10 +244,10 @@ def g(col):
     return None if pd.isna(val) else float(val)
 
 y3m = g("y_3m"); y2 = g("y_2y"); y5 = g("y_5y"); y10 = g("y_10y"); y30 = g("y_30y")
-sp10_2 = (y10 - y2) if y10 is not None and y2 is not None else None
-ntfs = g("ntfs")
-real10 = g("real_10y"); be10 = g("breakeven_10y")
-acm = g("acm_term_premium_10y")
+sp10_2_chip = (y10 - y2) if y10 is not None and y2 is not None else None
+ntfs_chip = g("ntfs")
+real10_chip = g("real_10y"); be10_chip = g("breakeven_10y")
+acm_chip = g("acm_term_premium_10y")
 
 fmt     = lambda x, d=round_dp: "—" if x is None or np.isnan(x) else f"{round(float(x), d)}%"
 fmt_pp  = lambda x: "—" if x is None or np.isnan(x) else f"{round(float(x), 2)} pp"
@@ -236,31 +257,104 @@ k1.metric("3M", fmt(y3m))
 k2.metric("2Y", fmt(y2))
 k3.metric("10Y", fmt(y10))
 k4.metric("30Y", fmt(y30))
-k5.metric("10Y–2Y", fmt_pp(sp10_2))
-k6.metric("NTFS", fmt_pp(ntfs))
-k7.metric("10Y Real", fmt(real10))
-k8.metric("10Y Breakeven", fmt(be10))
-if acm is not None and not np.isnan(acm):
+k5.metric("10Y–2Y", fmt_pp(sp10_2_chip))
+k6.metric("NTFS", fmt_pp(ntfs_chip))
+k7.metric("10Y Reëel", fmt(real10_chip))
+k8.metric("10Y Breakeven", fmt(be10_chip))
+if acm_chip is not None and not np.isnan(acm_chip):
     k9, = st.columns(1)
-    k9.metric("ACM Term Premium (10Y)", fmt_pp(acm))
+    k9.metric("ACM Term Premium (10Y)", fmt_pp(acm_chip))
+
+# ─────────────────────────────────────────────────────────
+# Regime-badge (compact + kleur) direct onder KPI’s
+# ─────────────────────────────────────────────────────────
+def _mk_spreads_from_levels(row: pd.Series):
+    sp10_2 = row.get("spread_10_2")
+    sp30_10 = row.get("spread_30_10")
+    y2_, y10_, y30_ = row.get("y_2y"), row.get("y_10y"), row.get("y_30y")
+    if (sp10_2 is None or pd.isna(sp10_2)) and pd.notna(y10_) and pd.notna(y2_):
+        sp10_2 = float(y10_) - float(y2_)
+    if (sp30_10 is None or pd.isna(sp30_10)) and pd.notna(y30_) and pd.notna(y10_):
+        sp30_10 = float(y30_) - float(y10_)
+    sp10_2 = None if (sp10_2 is None or pd.isna(sp10_2)) else float(sp10_2)
+    sp30_10 = None if (sp30_10 is None or pd.isna(sp30_10)) else float(sp30_10)
+    return sp10_2, sp30_10
+
+_last = US.iloc[-1]
+sp10_2_now, sp30_10_now = _mk_spreads_from_levels(_last)
+
+def _nearest_row(days_back: int):
+    tgt = pd.Timestamp(_last["date"]) - pd.Timedelta(days=days_back)
+    dt = nearest_on_or_before(list(US["date"]), tgt)
+    r = US[US["date"] == dt].tail(1)
+    return None if r.empty else r.iloc[0]
+
+row7  = _nearest_row(7)  or _nearest_row(30) or _nearest_row(1)
+if row7 is not None:
+    sp10_2_prev, sp30_10_prev = _mk_spreads_from_levels(row7)
+else:
+    sp10_2_prev, sp30_10_prev = sp10_2_now, sp30_10_now
+
+d10_2 = None if (sp10_2_now is None or sp10_2_prev is None) else sp10_2_now - sp10_2_prev
+d30_10 = None if (sp30_10_now is None or sp30_10_prev is None) else sp30_10_now - sp30_10_prev
+
+if sp10_2_now is None:
+    shape_txt, shape_color = "onbekend", "#6b7280"  # gray
+elif sp10_2_now > 0:
+    shape_txt, shape_color = "normaal", "#10b981"   # green
+elif sp10_2_now < -0.05:
+    shape_txt, shape_color = "invers", "#ef4444"    # red
+else:
+    shape_txt, shape_color = "vlak", "#f59e0b"      # amber
+
+def _significant(x, thr_bp): 
+    return (x is not None) and (abs(x*100) >= thr_bp)
+thr_bp = 10  # ≈7–10d drempel
+
+if   (d10_2 is None or d30_10 is None):
+    regime_txt, regime_color = "onduidelijk", "#6b7280"
+elif (d10_2 > 0 and d30_10 > 0 and (_significant(d10_2,thr_bp) or _significant(d30_10,thr_bp))):
+    regime_txt, regime_color = "bear steepening", "#ef4444"
+elif (d10_2 < 0 and d30_10 < 0 and (_significant(d10_2,thr_bp) or _significant(d30_10,thr_bp))):
+    regime_txt, regime_color = "bull flattening", "#10b981"
+elif (d10_2 < 0 and d30_10 > 0 and (_significant(d10_2,thr_bp) or _significant(d30_10,thr_bp))):
+    regime_txt, regime_color = "bull steepening", "#10b981"
+elif (d10_2 > 0 and d30_10 < 0 and (_significant(d10_2,thr_bp) or _significant(d30_10,thr_bp))):
+    regime_txt, regime_color = "bear flattening", "#ef4444"
+else:
+    regime_txt, regime_color = "gemengd", "#6b7280"
+
+badge_html = f"""
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px;">
+  <span style="background:{shape_color};color:white;padding:4px 8px;border-radius:999px;font-weight:600;">
+    Regime: {shape_txt}
+  </span>
+  <span style="background:{regime_color};color:white;padding:4px 8px;border-radius:999px;">
+    {regime_txt}
+  </span>
+  <span style="color:#6b7280;">Δ7–10d 10Y–2Y: {('—' if d10_2 is None else str(round(d10_2*100,1))+' bp')}, 30Y–10Y: {('—' if d30_10 is None else str(round(d30_10*100,1))+' bp')}</span>
+</div>
+"""
+st.markdown(badge_html, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────
 # Snapshot — Term structure (met vergelijking, robuust)
 # ─────────────────────────────────────────────────────────
 st.subheader("Term Structure — snapshot")
-
 snap_dates = sorted(US["date"].tolist())
 if not snap_dates:
     st.info("Geen datums beschikbaar in US dataset.")
     st.stop()
 
-# defaults: gisteren en ~een week terug (8 dagen)
+# defaults: gisteren en ~een week terug (8 dagen), gebruik robuuste indexbepaling
 yesterday = normalize_utc_today() - pd.Timedelta(days=1)
 default_primary = nearest_on_or_before(snap_dates, yesterday)
 default_secondary = nearest_on_or_before(snap_dates, default_primary - pd.Timedelta(days=8))
+snap_primary_idx = nearest_index(snap_dates, default_primary)
+snap_secondary_idx = nearest_index(snap_dates, default_secondary)
 
 snap_primary = st.selectbox(
-    "Peildatum", options=snap_dates, index=snap_dates.index(default_primary),
+    "Peildatum", options=snap_dates, index=snap_primary_idx,
     format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d")
 )
 
@@ -268,7 +362,7 @@ compare = st.checkbox("Vergelijk met 2e peildatum", value=True, disabled=(len(sn
 snap_secondary = None
 if compare:
     snap_secondary = st.selectbox(
-        "2e peildatum", options=snap_dates, index=snap_dates.index(default_secondary),
+        "2e peildatum", options=snap_dates, index=snap_secondary_idx,
         format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d")
     )
 
@@ -318,14 +412,177 @@ ts.update_xaxes(title_text="Maturity", row=1, col=2)
 ts.update_layout(margin=dict(l=10, r=10, t=30, b=10))
 st.plotly_chart(ts, use_container_width=True)
 
-with st.expander("🔎 Uitleg: hoe lees je de curve en spreads?"):
-    st.markdown("""
-- **Opwaarts hellend (3M→30Y hoger)** → *normaal*: groei & inflatieverwachting.  
-- **Invers (2Y > 10Y)** → markt prijst **korte-termijn Fed-rente** relatief hoog; vaak *late-cycle*.  
-- **Bull steepening**: lange einden dalen harder (duration-rally) → vaak rond *policy easing*.  
-- **Bear steepening**: lange einden lopen op (term premium/inflatiepremie) → groei/inflatie-vrees.  
-- **10Y–2Y**: klassieke recessiemeter. **NTFS** (near-term forward) is vaak *leading* en draait eerder.
-""")
+# ─────────────────────────────────────────────────────────
+# Uitleg + Sterke, data-gedreven curve-analyse
+# ─────────────────────────────────────────────────────────
+st.markdown(
+    "### 🔎 Hoe lees je de curve?\n"
+    "- **Normaal (10Y > 2Y)**: groei & inflatieverwachting in de lange kant.\n"
+    "- **Invers (10Y < 2Y)**: korte kant hoog (Fed), vaak *late-cycle*.\n"
+    "- **Bear steepening**: lange einden **stijgen** sneller → inflatie/aanbod/term-premium.\n"
+    "- **Bull steepening**: lange einden **dalen** sneller → recessie-/cut-verwachting.\n"
+    "- **NTFS** draait vaak vroeg; nuttig als *leading* signaal.\n"
+)
+
+def _pct_rank(series: pd.Series, value: float) -> float | None:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty or value is None or pd.isna(value):
+        return None
+    return float((s <= value).mean())
+
+def _fmt(x, dp=2, suffix="pp"):
+    return "—" if x is None or pd.isna(x) else f"{round(float(x), dp)} {suffix}"
+
+def _nearest(dates: list[pd.Timestamp], target: pd.Timestamp) -> pd.Timestamp:
+    return nearest_on_or_before(dates, target)
+
+def _get_spreads_row(row: pd.Series) -> tuple[float|None,float|None]:
+    sp10_2 = row.get("spread_10_2")
+    sp30_10 = row.get("spread_30_10")
+    y2_, y10_, y30_ = row.get("y_2y"), row.get("y_10y"), row.get("y_30y")
+    if (sp10_2 is None or pd.isna(sp10_2)) and pd.notna(y10_) and pd.notna(y2_):
+        sp10_2 = float(y10_) - float(y2_)
+    if (sp30_10 is None or pd.isna(sp30_10)) and pd.notna(y30_) and pd.notna(y10_):
+        sp30_10 = float(y30_) - float(y10_)
+    sp10_2 = None if (sp10_2 is None or pd.isna(sp10_2)) else float(sp10_2)
+    sp30_10 = None if (sp30_10 is None or pd.isna(sp30_10)) else float(sp30_10)
+    return sp10_2, sp30_10
+
+# huidige punt + referentiepunten
+last_row = US.iloc[-1]
+dates_list = list(US["date"])
+y10_now = float(last_row["y_10y"]) if "y_10y" in US.columns and pd.notna(last_row.get("y_10y")) else None
+sp10_2_now, sp30_10_now = _get_spreads_row(last_row)
+
+def row_at_delta(days: int) -> pd.Series | None:
+    tgt = pd.Timestamp(last_row["date"]) - pd.Timedelta(days=days)
+    dt = _nearest(dates_list, tgt)
+    r = US[US["date"] == dt].tail(1)
+    return None if r.empty else r.iloc[0]
+
+row_1d  = row_at_delta(1)
+row_7d  = row_at_delta(7)
+row_30d = row_at_delta(30)
+
+def spread_deltas(prev_row: pd.Series | None):
+    if prev_row is None:
+        return None, None
+    sp10_2_prev, sp30_10_prev = _get_spreads_row(prev_row)
+    d10_2 = None if (sp10_2_now is None or sp10_2_prev is None) else (sp10_2_now - sp10_2_prev)
+    d30_10 = None if (sp30_10_now is None or sp30_10_prev is None) else (sp30_10_now - sp30_10_prev)
+    return d10_2, d30_10
+
+d1_10_2,  d1_30_10  = spread_deltas(row_1d)
+d7_10_2,  d7_30_10  = spread_deltas(row_7d)
+d30_10_2, d30_30_10 = spread_deltas(row_30d)
+
+# thresholds (significantie)
+THR_1D_BP   = 5     # ≥5bp in 1d
+THR_7D_BP   = 10    # ≥10bp in 7d
+THR_30D_BP  = 20    # ≥20bp in 30d
+def _is_sig(d_now: float|None, thr_bp: float) -> bool:
+    if d_now is None or pd.isna(d_now):
+        return False
+    return abs(d_now*100.0) >= thr_bp
+
+# percentielen over laatste 3 jaar (context)
+cutoff_3y = pd.Timestamp(last_row["date"]) - pd.DateOffset(years=3)
+win = US[US["date"] >= cutoff_3y]
+p_spread = _pct_rank(win["spread_10_2"] if "spread_10_2" in win.columns else pd.Series(dtype=float), sp10_2_now) if sp10_2_now is not None else None
+p_10y    = _pct_rank(win["y_10y"]        if "y_10y"        in win.columns else pd.Series(dtype=float), y10_now)    if y10_now    is not None else None
+
+# NTFS signaal (optioneel)
+ntfs_now = float(last_row["ntfs"]) if "ntfs" in US.columns and pd.notna(last_row.get("ntfs")) else None
+ntfs_flag = None
+if ntfs_now is not None:
+    if ntfs_now > 0.0:
+        ntfs_flag = "NTFS > 0 (minder cuts geprijsd op korte horizon)"
+    elif ntfs_now < 0.0:
+        ntfs_flag = "NTFS < 0 (cuts geprijsd in de nabije toekomst)"
+
+# Reëel/breakeven driver-hint (optioneel)
+real10 = float(last_row["real_10y"]) if "real_10y" in US.columns and pd.notna(last_row.get("real_10y")) else None
+be10   = float(last_row["breakeven_10y"]) if "breakeven_10y" in US.columns and pd.notna(last_row.get("breakeven_10y")) else None
+
+def driver_hint() -> str | None:
+    if y10_now is None or (real10 is None and be10 is None):
+        return None
+    # Vergelijk met ~7d terug
+    r7_real = float(row_7d.get("real_10y")) if (row_7d is not None and "real_10y" in row_7d.index and pd.notna(row_7d.get("real_10y"))) else None
+    r7_be   = float(row_7d.get("breakeven_10y")) if (row_7d is not None and "breakeven_10y" in row_7d.index and pd.notna(row_7d.get("breakeven_10y"))) else None
+    parts = []
+    if real10 is not None and r7_real is not None:
+        parts.append("reëel ↑" if real10 > r7_real else "reëel ↓")
+    if be10 is not None and r7_be is not None:
+        parts.append("breakeven ↑" if be10 > r7_be else "breakeven ↓")
+    if not parts:
+        return None
+    if ("reëel ↑" in parts and "breakeven ↑" in parts):
+        return "Nominale 10Y gedreven door **zowel** reële rente als inflatieverwachting."
+    if ("reëel ↑" in parts and "breakeven ↓" in parts):
+        return "Nominale 10Y vooral **reëel** gedreven (groei/term premium)."
+    if ("reëel ↓" in parts and "breakeven ↑" in parts):
+        return "Nominale 10Y vooral **inflatieverwachting** (breakeven) gedreven."
+    return " / ".join(parts)
+
+# Vorm en regime (tekst + bewijs)
+if sp10_2_now is None:
+    shape_txt = "onbekend (ontbrekende 2Y/10Y)"
+elif sp10_2_now > 0:
+    shape_txt = "normaal (10Y > 2Y)"
+elif sp10_2_now < -0.05:
+    shape_txt = "duidelijk invers (10Y < 2Y)"
+else:
+    shape_txt = "vlak of licht invers"
+
+def describe_trend():
+    # Kies 7d als hoofd-horizon, val terug op 30d of 1d
+    dA_10_2, dA_30_10, thr = d7_10_2, d7_30_10, THR_7D_BP
+    if dA_10_2 is None or dA_30_10 is None:
+        dA_10_2, dA_30_10, thr = d30_10_2, d30_30_10, THR_30D_BP
+    if dA_10_2 is None or dA_30_10 is None:
+        dA_10_2, dA_30_10, thr = d1_10_2, d1_30_10, THR_1D_BP
+
+    if dA_10_2 is None or dA_30_10 is None:
+        return "onduidelijk (onvoldoende data)", "—"
+
+    sig10_2 = _is_sig(dA_10_2, thr)
+    sig30_10 = _is_sig(dA_30_10, thr)
+
+    if dA_10_2 > 0 and dA_30_10 > 0 and (sig10_2 or sig30_10):
+        regime = "Bear steepening — lange einden lopen op"
+    elif dA_10_2 < 0 and dA_30_10 < 0 and (sig10_2 or sig30_10):
+        regime = "Bull flattening — brede daling in spreads"
+    elif dA_10_2 < 0 and dA_30_10 > 0 and (sig10_2 or sig30_10):
+        regime = "Bull steepening — lange rente daalt sneller"
+    elif dA_10_2 > 0 and dA_30_10 < 0 and (sig10_2 or sig30_10):
+        regime = "Bear flattening — korte kant stijgt"
+    else:
+        regime = "Gemengd/geen dominant regime"
+    evidence = f"Δ7d 10Y–2Y {_fmt(d7_10_2)} · 30Y–10Y {_fmt(d7_30_10)} | Δ30d 10Y–2Y {_fmt(d30_10_2)} · 30Y–10Y {_fmt(d30_30_10)}"
+    return regime, evidence
+
+regime_txt2, evidence_txt = describe_trend()
+
+# Contextregels
+ctx_lines = []
+if p_spread is not None:
+    ctx_lines.append(f"10Y–2Y in **p{int(round(p_spread*100))}** over 3Y (lager = meer invers).")
+if p_10y is not None:
+    ctx_lines.append(f"10Y nominaal in **p{int(round(p_10y*100))}** over 3Y.")
+if ntfs_flag:
+    ctx_lines.append(ntfs_flag)
+drv = driver_hint()
+if drv:
+    ctx_lines.append(drv)
+
+st.markdown(
+    "### 📊 Curve-analyse\n"
+    f"- **Vorm:** {shape_txt}  |  **10Y–2Y:** {_fmt(sp10_2_now)}  ·  **30Y–10Y:** {_fmt(sp30_10_now)}\n"
+    f"- **Regime:** {regime_txt2}\n"
+    f"- **Bewijs:** {evidence_txt}\n"
+    + ("- " + "\n- ".join(ctx_lines) if ctx_lines else "")
+)
 
 # ─────────────────────────────────────────────────────────
 # Tijdreeks — Levels (selecteer termijnen)
@@ -349,41 +606,6 @@ for lbl in chosen_labels:
 fig1.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Date")
 fig1.update_xaxes(range=[start_date, end_date])
 st.plotly_chart(fig1, use_container_width=True)
-
-# ─────────────────────────────────────────────────────────
-# Automatische conclusie over yield curve
-# ─────────────────────────────────────────────────────────
-if "spread_10_2" in US.columns and "spread_30_10" in US.columns:
-    sp10_2_now = float(US.iloc[-1]["spread_10_2"])
-    sp30_10_now = float(US.iloc[-1]["spread_30_10"])
-    sp10_2_prev = float(US.iloc[-5]["spread_10_2"]) if len(US) > 5 else sp10_2_now
-    sp30_10_prev = float(US.iloc[-5]["spread_30_10"]) if len(US) > 5 else sp30_10_now
-
-    delta_10_2 = sp10_2_now - sp10_2_prev
-    delta_30_10 = sp30_10_now - sp30_10_prev
-
-    def describe_curve(sp10_2, sp30_10, d10_2, d30_10):
-        if sp10_2 > 0:
-            shape = "normaal (opwaarts hellend)"
-        elif sp10_2 < -0.05:
-            shape = "duidelijk invers"
-        else:
-            shape = "vlak of licht invers"
-
-        if d10_2 > 0 and d30_10 > 0:
-            trend = "Bear steepening — lange einden lopen op (inflatie/aanboddruk)."
-        elif d10_2 < 0 and d30_10 < 0:
-            trend = "Bull flattening — brede daling in yields (cutverwachting)."
-        elif d10_2 < 0 and d30_10 > 0:
-            trend = "Bull steepening — lange rente daalt, recessie- of cut-verwachting."
-        elif d10_2 > 0 and d30_10 < 0:
-            trend = "Bear flattening — korte kant stijgt door Fed-tightening."
-        else:
-            trend = "Geen duidelijke verandering."
-        return shape, trend
-
-    shape, trend = describe_curve(sp10_2_now, sp30_10_now, delta_10_2, delta_30_10)
-    st.markdown(f"### 📊 Curve-analyse\n- **Huidige vorm:** {shape}\n- **Recente verandering:** {trend}")
 
 # ─────────────────────────────────────────────────────────
 # Spreads & NTFS
@@ -436,14 +658,16 @@ if has_nom10 or has_real or has_be10:
             st.markdown("Alleen **nominale 10Y** beschikbaar. Voeg `real_10y` en/of `breakeven_10y` toe (bijv. FRED: DFII10 & T10YIE) om meer te zien.")
         else:
             st.markdown("De grafiek toont wat beschikbaar is; compleet = zowel `real_10y` (TIPS) als `breakeven_10y`.")
+
 # ─────────────────────────────────────────────────────────
-# Deltas
+# Deltas — histogram & tijdreeks
 # ─────────────────────────────────────────────────────────
 st.subheader("Deltas — histogram & tijdreeks")
-delta_h = delta_h  # uit de controls
+
 if   delta_h == "1d": suf="_d1_bp"
 elif delta_h == "7d": suf="_d7"
 else:                  suf="_d30"
+
 bases = [("y_3m","3M"),("y_2y","2Y"),("y_5y","5Y"),("y_10y","10Y"),("y_30y","30Y"),
          ("spread_10_2","10Y-2Y"),("spread_30_10","30Y-10Y")]
 def_idx = next((i for i,(b,_) in enumerate(bases) if b=="y_10y"), 0)
@@ -461,6 +685,8 @@ def get_delta_series(df: pd.DataFrame, base: str) -> pd.Series:
         return pd.to_numeric(df[col], errors="coerce") * 100.0  # pp → bp
 
 USd = get_delta_series(US, b_sel)
+
+# Relatief (%): Δpp / vorige pp * 100
 if suf == "_d1_bp":
     dpp = USd / 100.0
     base = pd.to_numeric(US.get(b_sel), errors="coerce")
