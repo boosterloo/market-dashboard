@@ -12,7 +12,7 @@ from plotly.subplots import make_subplots
 from utils.rates import get_q_curve_const
 
 
-# ────────────────────────────── Helpers ──────────────────────────────
+# Helpers
 def norm_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
@@ -77,7 +77,7 @@ def safe_ratio(a, b):
     return a / b if (b is not None and not np.isnan(b) and b != 0) else np.nan
 
 
-# ────────────────────────────── BigQuery ──────────────────────────────
+# BigQuery
 def get_bq_client():
     sa_info = st.secrets["gcp_service_account"]
     creds = service_account.Credentials.from_service_account_info(sa_info)
@@ -125,7 +125,7 @@ def run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
     return _bq_client.query(sql, job_config=job_config).to_dataframe()
 
 
-# ────────────────────────────── Styling ──────────────────────────────
+# Styling
 st.set_page_config(page_title="SPX Options Dashboard", layout="wide")
 st.title("SPX Options Dashboard")
 
@@ -198,7 +198,7 @@ def add_pcr_midline(fig, row: int, col: int):
     fig.add_hline(y=1.0, line=dict(dash="dot", width=1), row=row, col=col)
 
 
-# ────────────────────────────── Filters ──────────────────────────────
+# Filters
 @st.cache_data(ttl=600, show_spinner=False)
 def load_date_bounds():
     df = run_query(
@@ -257,7 +257,7 @@ with g3:
     q_const_simple = st.number_input("Dividendrendement q", 0.0, 0.10, 0.016, 0.001, format="%.3f")
 
 
-# ────────────────────────────── Data loaders ──────────────────────────────
+# Data loaders
 @st.cache_data(ttl=600, show_spinner=False)
 def load_expirations(start_date: date, end_date: date):
     df = run_query(
@@ -380,6 +380,64 @@ def load_detail_filtered(start_date, end_date, sel_type, dte_min, dte_max, mny_m
 
 
 @st.cache_data(ttl=600, show_spinner=False)
+def load_ppd_expiry_ladder_for_strike(sel_snapshot, sel_type, strike, dte_min, dte_max, min_oi, min_vol):
+    sql = f"""
+    SELECT
+      snapshot_date,
+      expiration,
+      LOWER(type) AS type,
+      CAST(days_to_exp AS INT64) AS days_to_exp,
+      CAST(strike AS FLOAT64) AS strike,
+      CAST(underlying_price AS FLOAT64) AS underlying_price,
+      CAST(last_price AS FLOAT64) AS last_price,
+      CAST(mid_price AS FLOAT64) AS mid_price,
+      CAST(bid AS FLOAT64) AS bid,
+      CAST(ask AS FLOAT64) AS ask,
+      CAST(implied_volatility AS FLOAT64) AS implied_volatility,
+      CAST(open_interest AS FLOAT64) AS open_interest,
+      CAST(volume AS FLOAT64) AS volume,
+      CAST(ppd AS FLOAT64) AS ppd
+    FROM `{VIEW}`
+    WHERE TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
+      AND LOWER(type) = @t
+      AND ABS(CAST(strike AS FLOAT64) - @strike) < 0.0001
+      AND days_to_exp BETWEEN @dte_min AND @dte_max
+      AND (COALESCE(open_interest, 0) >= @min_oi OR COALESCE(volume, 0) >= @min_vol)
+    ORDER BY days_to_exp
+    """
+    df = run_query(
+        sql,
+        {
+            "snap_min": pd.to_datetime(sel_snapshot).to_pydatetime(),
+            "t": sel_type,
+            "strike": float(strike),
+            "dte_min": int(dte_min),
+            "dte_max": int(dte_max),
+            "min_oi": int(min_oi),
+            "min_vol": int(min_vol),
+        },
+    )
+    if not df.empty:
+        df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
+        df["expiration"] = pd.to_datetime(df["expiration"]).dt.date
+        for col in [
+            "days_to_exp",
+            "strike",
+            "underlying_price",
+            "last_price",
+            "mid_price",
+            "bid",
+            "ask",
+            "implied_volatility",
+            "open_interest",
+            "volume",
+            "ppd",
+        ]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def load_skew_source(start_date, end_date, dte_lo, dte_hi, min_oi, min_vol):
     sql = f"""
     SELECT
@@ -415,7 +473,7 @@ def load_skew_source(start_date, end_date, dte_lo, dte_hi, min_oi, min_vol):
     return df
 
 
-# ────────────────────────────── Main data ──────────────────────────────
+# Main data
 market = load_daily_market_context(
     start_date,
     end_date,
@@ -454,7 +512,7 @@ if load_deep_analysis:
 exps_all = load_expirations(start_date, end_date)
 
 
-# ────────────────────────────── Context metrics ──────────────────────────────
+# Context metrics
 u_daily = market[["day", "spx"]].dropna().copy()
 u_daily["ret"] = u_daily["spx"].pct_change()
 hv20 = annualize_std(u_daily["ret"].tail(21).dropna())
@@ -522,7 +580,7 @@ if load_deep_analysis and not df.empty:
 iv_slope = iv_short - iv_mid if not np.isnan(iv_short) and not np.isnan(iv_mid) else np.nan
 
 
-# ────────────────────────────── Regime classification ──────────────────────────────
+# Regime classification
 def classify_regime(pcr_vol, pcr_oi, pcr_gap, skew, slope, vrp):
     items = []
 
@@ -606,20 +664,20 @@ def trade_context_label(vrp, skew, slope):
 short_vol_label, downside_label, event_label = trade_context_label(vrp, skew_25d, iv_slope)
 
 
-# ────────────────────────────── Header KPIs ──────────────────────────────
+# Header KPIs
 k1, k2, k3, k4, k5, k6 = st.columns(6)
 with k1:
-    st.metric("PCR Volume", f"{last_pcr_vol:.2f}" if not np.isnan(last_pcr_vol) else "—")
+    st.metric("PCR Volume", f"{last_pcr_vol:.2f}" if not np.isnan(last_pcr_vol) else "-")
 with k2:
-    st.metric("PCR OI", f"{last_pcr_oi:.2f}" if not np.isnan(last_pcr_oi) else "—")
+    st.metric("PCR OI", f"{last_pcr_oi:.2f}" if not np.isnan(last_pcr_oi) else "-")
 with k3:
-    st.metric("25Δ Skew", f"{skew_25d:.2%}" if not np.isnan(skew_25d) else "—")
+    st.metric("25D Skew", f"{skew_25d:.2%}" if not np.isnan(skew_25d) else "-")
 with k4:
-    st.metric("IV Term Slope", f"{iv_slope:.2%}" if not np.isnan(iv_slope) else "—")
+    st.metric("IV Term Slope", f"{iv_slope:.2%}" if not np.isnan(iv_slope) else "-")
 with k5:
-    st.metric("VRP (IV-HV20)", f"{vrp:.2%}" if not np.isnan(vrp) else "—")
+    st.metric("VRP (IV-HV20)", f"{vrp:.2%}" if not np.isnan(vrp) else "-")
 with k6:
-    st.metric("IV Rank", f"{iv_rank * 100:.0f}%" if not np.isnan(iv_rank) else "—")
+    st.metric("IV Rank", f"{iv_rank * 100:.0f}%" if not np.isnan(iv_rank) else "-")
 
 if regime_flags:
     st.markdown("**Marktregime:** " + " | ".join(regime_flags))
@@ -638,7 +696,7 @@ st.caption(
 )
 
 
-# ────────────────────────────── Regime charts ──────────────────────────────
+# Regime charts
 st.header("Regime & Risicoperceptie")
 
 fig_pcr = make_subplots(
@@ -671,7 +729,7 @@ fig_ctx.add_trace(go.Scatter(x=market["day"], y=market["avg_iv"], mode="lines", 
 show_fig(fig_ctx, height=760)
 
 
-# ────────────────────────────── Execution analysis ──────────────────────────────
+# Execution analysis
 if not load_deep_analysis:
     st.warning("Detailanalyse staat uit. Zet `Laad detailanalyse` aan voor series, smile en execution-secties.")
     st.stop()
@@ -765,6 +823,122 @@ else:
         fig_iv.update_yaxes(title_text="SPX", secondary_y=True)
         fig_iv.update_layout(title="IV vs SPX")
         show_fig(fig_iv, height=420)
+
+
+st.subheader("PPD expiry ladder voor geselecteerde strike")
+
+pl1, pl2, pl3 = st.columns([1, 1, 1])
+with pl1:
+    ppd_ladder_dte = st.slider("DTE-bereik expiry ladder", 1, 365, (1, 180), step=1)
+with pl2:
+    ppd_ladder_price_col = st.radio(
+        "Prijsbron expiry ladder",
+        ["mid_price", "last_price", "bid"],
+        index=0,
+        horizontal=True,
+    )
+with pl3:
+    ppd_ladder_smooth = st.toggle("Smooth PPD-lijn", value=True)
+
+ppd_ladder = load_ppd_expiry_ladder_for_strike(
+    sel_snapshot,
+    sel_type,
+    series_strike,
+    ppd_ladder_dte[0],
+    ppd_ladder_dte[1],
+    min_oi,
+    min_vol,
+)
+
+if ppd_ladder.empty:
+    st.info("Geen expiry ladder gevonden voor deze peildatum, type en strike.")
+else:
+    ppd_ladder = ppd_ladder.dropna(subset=["days_to_exp", "ppd"]).copy()
+    ppd_ladder = ppd_ladder.sort_values("days_to_exp")
+    ppd_ladder["ppd_s"] = smooth_series(ppd_ladder["ppd"], 3)
+
+    y_for_best = "ppd_s" if ppd_ladder_smooth and ppd_ladder["ppd_s"].notna().any() else "ppd"
+    best = ppd_ladder.loc[ppd_ladder[y_for_best].idxmax()] if ppd_ladder[y_for_best].notna().any() else None
+
+    fig_ladder = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig_ladder.add_trace(
+        go.Scatter(
+            x=ppd_ladder["days_to_exp"],
+            y=ppd_ladder["ppd"],
+            mode="markers",
+            name="PPD",
+            customdata=np.stack(
+                [
+                    ppd_ladder["expiration"].astype(str),
+                    ppd_ladder[ppd_ladder_price_col],
+                    ppd_ladder["bid"],
+                    ppd_ladder["ask"],
+                    ppd_ladder["implied_volatility"],
+                    ppd_ladder["open_interest"],
+                    ppd_ladder["volume"],
+                ],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "DTE=%{x}<br>"
+                "Expiratie=%{customdata[0]}<br>"
+                "PPD=%{y:.2f}<br>"
+                "Prijs=%{customdata[1]:.2f}<br>"
+                "Bid/Ask=%{customdata[2]:.2f} / %{customdata[3]:.2f}<br>"
+                "IV=%{customdata[4]:.2%}<br>"
+                "OI=%{customdata[5]:.0f}<br>"
+                "Volume=%{customdata[6]:.0f}<extra></extra>"
+            ),
+        ),
+        secondary_y=False,
+    )
+
+    if ppd_ladder_smooth:
+        fig_ladder.add_trace(
+            go.Scatter(
+                x=ppd_ladder["days_to_exp"],
+                y=ppd_ladder["ppd_s"],
+                mode="lines",
+                name="PPD smooth",
+            ),
+            secondary_y=False,
+        )
+
+    fig_ladder.add_trace(
+        go.Scatter(
+            x=ppd_ladder["days_to_exp"],
+            y=ppd_ladder[ppd_ladder_price_col],
+            mode="lines+markers",
+            name=ppd_ladder_price_col,
+        ),
+        secondary_y=True,
+    )
+
+    if best is not None:
+        fig_ladder.add_vline(
+            x=float(best["days_to_exp"]),
+            line=dict(dash="dot"),
+        )
+
+    fig_ladder.update_xaxes(title_text="Dagen tot expiratie")
+    fig_ladder.update_yaxes(title_text="PPD", secondary_y=False)
+    fig_ladder.update_yaxes(title_text="Optieprijs", secondary_y=True)
+    fig_ladder.update_layout(
+        title=(
+            f"{sel_type.upper()} {series_strike:.0f}: PPD en optieprijs per expiratie "
+            f"op {pd.to_datetime(sel_snapshot).strftime('%Y-%m-%d %H:%M')}"
+        )
+    )
+    show_fig(fig_ladder, height=500)
+
+    if best is not None:
+        st.info(
+            f"Hoogste PPD voor deze gekozen strike ligt rond **{int(best['days_to_exp'])} DTE**, "
+            f"expiratie **{best['expiration']}**, met **PPD ≈ {best[y_for_best]:.2f}** "
+            f"en {ppd_ladder_price_col} **≈ {best[ppd_ladder_price_col]:.2f}**."
+        )
+
 
 st.subheader("PPD vs Afstand")
 dist_mode = st.radio("Afstandseenheid", ["punten", "% van spot"], index=0, horizontal=True)
@@ -868,7 +1042,7 @@ with tc2:
     st.markdown(
         "**Downside hedge demand**\n\n"
         f"- Niveau: `{downside_label}`\n"
-        f"- Inputs: 25Δ skew={skew_25d:.2%} | PCR gap={last_pcr_gap:.2f}" if not np.isnan(skew_25d) and not np.isnan(last_pcr_gap) else "**Downside hedge demand**\n\n- Onvoldoende data"
+        f"- Inputs: 25D skew={skew_25d:.2%} | PCR gap={last_pcr_gap:.2f}" if not np.isnan(skew_25d) and not np.isnan(last_pcr_gap) else "**Downside hedge demand**\n\n- Onvoldoende data"
     )
 with tc3:
     st.markdown(
