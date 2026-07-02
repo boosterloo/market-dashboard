@@ -1,4 +1,4 @@
-# pages/2_AEX.py
+# pages/1_AEX.py
 # AEX - Market State Dashboard
 # Focus op regime, trend, momentum, uitputting en forward returns.
 
@@ -671,8 +671,19 @@ if show_vix and "vix_close" in d.columns and d["vix_close"].notna().any():
         row=1, col=1, secondary_y=True
     )
 
+aex_range_cols = ["ha_low", "ha_high", "ema20", "ema50", "ema200"]
+if show_donchian:
+    aex_range_cols += ["dc_low", "dc_high"]
+aex_y_values = pd.concat([d[col] for col in aex_range_cols if col in d.columns], axis=0).dropna()
+aex_y_range = None
+if not aex_y_values.empty:
+    y_min = float(aex_y_values.min())
+    y_max = float(aex_y_values.max())
+    pad = max((y_max - y_min) * 0.08, y_max * 0.005)
+    aex_y_range = [y_min - pad, y_max + pad]
+
 fig1.update_layout(
-    height=700,
+    height=850,
     margin=dict(l=60, r=60, t=80, b=40),
     legend_orientation="h",
     legend_yanchor="top",
@@ -681,8 +692,8 @@ fig1.update_layout(
     xaxis_rangeslider_visible=False,
 )
 fig1.update_xaxes(tickfont=dict(size=13))
-fig1.update_yaxes(title_text="AEX", row=1, col=1, tickfont=dict(size=13), secondary_y=False)
-fig1.update_yaxes(title_text="VIX", row=1, col=1, tickfont=dict(size=13), secondary_y=True)
+fig1.update_yaxes(title_text="AEX", row=1, col=1, tickfont=dict(size=13), range=aex_y_range, secondary_y=False)
+fig1.update_yaxes(title_text="VIX", row=1, col=1, tickfont=dict(size=13), showgrid=False, secondary_y=True)
 st.plotly_chart(fig1, use_container_width=True)
 
 # =========================
