@@ -1,3 +1,6 @@
+
+
+```python
 import math
 from datetime import date, datetime, timedelta
 
@@ -20,9 +23,11 @@ def norm_cdf(z: float) -> float:
 def bs_delta(S, K, iv, T, r, q, is_call):
     if any(x is None or np.isnan(x) or x <= 0 for x in [S, K]) or np.isnan(iv) or iv <= 0 or T <= 0:
         return np.nan
+
     d1 = (math.log(S / K) + (r - q + 0.5 * iv**2) * T) / (iv * math.sqrt(T))
     nd1 = norm_cdf(d1)
     disc_q = math.exp(-q * T)
+
     return disc_q * nd1 if is_call else disc_q * (nd1 - 1.0)
 
 
@@ -74,50 +79,87 @@ def fmt_pct(v, digits=2):
     return f"{v:.{digits}%}" if not np.isnan(safe_float(v)) else "-"
 
 
+def as_date(v):
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v
+    return pd.to_datetime(v).date()
+
+
 # BigQuery
+MAX_BYTES_BILLED = 2 * 1024**3
+BQ_LOCATION = st.secrets.get("BQ_LOCATION", "EU")
+
+
+@st.cache_resource(show_spinner=False)
 def get_bq_client():
     sa_info = st.secrets["gcp_service_account"]
     creds = service_account.Credentials.from_service_account_info(sa_info)
     project_id = st.secrets.get("PROJECT_ID", sa_info.get("project_id"))
-    return bigquery.Client(project=project_id, credentials=creds)
+    client = bigquery.Client(project=project_id, credentials=creds)
+    return client, project_id
 
 
-_bq_client = get_bq_client()
-VIEW = "marketdata.spx_options_enriched_v"
+_bq_client, PROJECT_ID = get_bq_client()
+VIEW = f"{PROJECT_ID}.marketdata.spx_options_enriched_v"
 
 
 def _bq_param(name, value):
     if isinstance(value, (list, tuple)):
         if not value:
             return bigquery.ArrayQueryParameter(name, "STRING", [])
+
         e = value[0]
+
         if isinstance(e, int):
             return bigquery.ArrayQueryParameter(name, "INT64", list(value))
+
         if isinstance(e, float):
             return bigquery.ArrayQueryParameter(name, "FLOAT64", list(value))
+
         if isinstance(e, (date, pd.Timestamp, datetime)):
             vals = [str(pd.to_datetime(v).date()) for v in value]
             return bigquery.ArrayQueryParameter(name, "DATE", vals)
+
         return bigquery.ArrayQueryParameter(name, "STRING", [str(v) for v in value])
 
     if isinstance(value, bool):
         return bigquery.ScalarQueryParameter(name, "BOOL", value)
+
     if isinstance(value, (int, np.integer)):
         return bigquery.ScalarQueryParameter(name, "INT64", int(value))
+
     if isinstance(value, (float, np.floating)):
         return bigquery.ScalarQueryParameter(name, "FLOAT64", float(value))
+
+    if isinstance(value, pd.Timestamp):
+        if value.hour == 0 and value.minute == 0 and value.second == 0 and value.microsecond == 0:
+            return bigquery.ScalarQueryParameter(name, "DATE", str(value.date()))
+        return bigquery.ScalarQueryParameter(name, "TIMESTAMP", value.to_pydatetime())
+
     if isinstance(value, datetime):
         return bigquery.ScalarQueryParameter(name, "TIMESTAMP", value)
-    if isinstance(value, (date, pd.Timestamp)):
-        return bigquery.ScalarQueryParameter(name, "DATE", str(pd.to_datetime(value).date()))
+
+    if isinstance(value, date):
+        return bigquery.ScalarQueryParameter(name, "DATE", str(value))
+
     return bigquery.ScalarQueryParameter(name, "STRING", str(value))
 
 
 def run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
-    job_config = None
+    job_config = bigquery.QueryJobConfig(
+        maximum_bytes_billed=MAX_BYTES_BILLED
+    )
+
     if params:
-        job_config = bigquery.QueryJobConfig(query_parameters=[_bq_param(k, v) for k, v in params.items()])
-    return _bq_client.query(sql, job_config=job_config).to_dataframe()
+        job_config.query_parameters = [_bq_param(k, v) for k, v in params.items()]
+
+    job = _bq_client.query(
+        sql,
+        job_config=job_config,
+        location=BQ_LOCATION,
+    )
+
+    return job.to_dataframe(create_bqstorage_client=False)
 
 
 # Styling
@@ -142,6 +184,7 @@ def _axis_size():
 
 def amplify_axes(fig, height: int | None = None, legend_top: bool = True):
     sz = _axis_size()
+
     fig.update_xaxes(
         tickfont=dict(size=sz),
         title_font=dict(size=sz),
@@ -151,6 +194,7 @@ def amplify_axes(fig, height: int | None = None, legend_top: bool = True):
         gridcolor="rgba(0,0,0,0.10)",
         ticks="outside",
     )
+
     fig.update_yaxes(
         tickfont=dict(size=sz),
         title_font=dict(size=sz),
@@ -162,6 +206,7 @@ def amplify_axes(fig, height: int | None = None, legend_top: bool = True):
         gridwidth=1,
         gridcolor="rgba(0,0,0,0.10)",
     )
+
     fig.update_layout(
         margin=_DEF_MARGIN,
         font=dict(size=max(sz - 6, 13)),
@@ -179,8 +224,10 @@ def amplify_axes(fig, height: int | None = None, legend_top: bool = True):
         autosize=True,
         plot_bgcolor="white",
     )
+
     if height:
         fig.update_layout(height=height)
+
     return fig
 
 
@@ -204,90 +251,117 @@ def load_date_bounds():
     df = run_query(
         f"""
         SELECT
-          MIN(CAST(snapshot_date AS DATE)) AS min_date,
-          MAX(CAST(snapshot_date AS DATE)) AS max_date
+          MIN(DATE(snapshot_date)) AS min_date,
+          MAX(DATE(snapshot_date)) AS max_date
         FROM `{VIEW}`
+        WHERE DATE(snapshot_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 400 DAY)
         """
     )
-    return df["min_date"].iloc[0], df["max_date"].iloc[0]
+
+    if df.empty or pd.isna(df["min_date"].iloc[0]) or pd.isna(df["max_date"].iloc[0]):
+        return None, None
+
+    return as_date(df["min_date"].iloc[0]), as_date(df["max_date"].iloc[0])
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_snapshots(start_date: date, end_date: date):
     df = run_query(
         f"""
-        SELECT DISTINCT TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) AS snap_min
+        SELECT DISTINCT
+          TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) AS snap_min
         FROM `{VIEW}`
         WHERE DATE(snapshot_date) BETWEEN @start AND @end
         ORDER BY snap_min
         """,
         {"start": start_date, "end": end_date},
     )
+
     if df.empty:
         return []
+
     return sorted(pd.to_datetime(df["snap_min"]).dt.to_pydatetime().tolist())
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_snapshot_context(sel_snapshot):
+    snap = pd.to_datetime(sel_snapshot).to_pydatetime()
+
     df = run_query(
         f"""
         SELECT
           AVG(CAST(underlying_price AS FLOAT64)) AS spx,
           AVG(CAST(vix AS FLOAT64)) AS vix
         FROM `{VIEW}`
-        WHERE TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
+        WHERE DATE(snapshot_date) = DATE(@snap_min)
+          AND TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
         """,
-        {"snap_min": pd.to_datetime(sel_snapshot).to_pydatetime()},
+        {"snap_min": snap},
     )
+
     if df.empty:
         return np.nan, np.nan
+
     return safe_float(df["spx"].iloc[0]), safe_float(df["vix"].iloc[0])
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_strikes_for_snapshot(sel_snapshot, sel_type, min_oi, min_vol):
+    snap = pd.to_datetime(sel_snapshot).to_pydatetime()
+
     df = run_query(
         f"""
-        SELECT DISTINCT CAST(strike AS FLOAT64) AS strike
+        SELECT DISTINCT
+          CAST(strike AS FLOAT64) AS strike
         FROM `{VIEW}`
-        WHERE TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
+        WHERE DATE(snapshot_date) = DATE(@snap_min)
+          AND TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
           AND LOWER(type) = @t
           AND (COALESCE(open_interest, 0) >= @min_oi OR COALESCE(volume, 0) >= @min_vol)
         ORDER BY strike
         """,
         {
-            "snap_min": pd.to_datetime(sel_snapshot).to_pydatetime(),
+            "snap_min": snap,
             "t": sel_type,
             "min_oi": int(min_oi),
             "min_vol": int(min_vol),
         },
     )
+
+    if df.empty:
+        return []
+
     return sorted([float(x) for x in df["strike"].dropna().tolist()])
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_expirations_for_option(sel_snapshot, sel_type, strike, min_oi, min_vol):
+    snap = pd.to_datetime(sel_snapshot).to_pydatetime()
+
     df = run_query(
         f"""
-        SELECT DISTINCT expiration
+        SELECT DISTINCT
+          expiration
         FROM `{VIEW}`
-        WHERE TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
+        WHERE DATE(snapshot_date) = DATE(@snap_min)
+          AND TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
           AND LOWER(type) = @t
           AND ABS(CAST(strike AS FLOAT64) - @strike) < 0.0001
           AND (COALESCE(open_interest, 0) >= @min_oi OR COALESCE(volume, 0) >= @min_vol)
         ORDER BY expiration
         """,
         {
-            "snap_min": pd.to_datetime(sel_snapshot).to_pydatetime(),
+            "snap_min": snap,
             "t": sel_type,
             "strike": float(strike),
             "min_oi": int(min_oi),
             "min_vol": int(min_vol),
         },
     )
+
     if df.empty:
         return []
+
     return sorted(pd.to_datetime(df["expiration"]).dt.date.unique())
 
 
@@ -325,6 +399,7 @@ def load_daily_market_context(start_date, end_date, dte_min, dte_max, mny_min, m
     GROUP BY day
     ORDER BY day
     """
+
     df = run_query(
         sql,
         {
@@ -338,10 +413,12 @@ def load_daily_market_context(start_date, end_date, dte_min, dte_max, mny_min, m
             "min_vol": int(min_vol),
         },
     )
+
     if not df.empty:
         df["day"] = pd.to_datetime(df["day"])
         for col in ["spx", "vix", "avg_iv", "vol_put", "vol_call", "oi_put", "oi_call"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
     return df
 
 
@@ -373,14 +450,18 @@ def load_skew_source(start_date, end_date, dte_lo, dte_hi, min_oi, min_vol):
             "min_vol": int(min_vol),
         },
     )
+
     if not df.empty:
         df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
         df["expiration"] = pd.to_datetime(df["expiration"]).dt.date
+
     return df
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_ppd_expiry_ladder_for_strike(sel_snapshot, sel_type, strike, dte_min, dte_max, min_oi, min_vol):
+    snap = pd.to_datetime(sel_snapshot).to_pydatetime()
+
     df = run_query(
         f"""
         SELECT
@@ -400,7 +481,8 @@ def load_ppd_expiry_ladder_for_strike(sel_snapshot, sel_type, strike, dte_min, d
           CAST(volume AS FLOAT64) AS volume,
           CAST(ppd AS FLOAT64) AS ppd
         FROM `{VIEW}`
-        WHERE TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
+        WHERE DATE(snapshot_date) = DATE(@snap_min)
+          AND TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
           AND LOWER(type) = @t
           AND ABS(CAST(strike AS FLOAT64) - @strike) < 0.0001
           AND days_to_exp BETWEEN @dte_min AND @dte_max
@@ -408,7 +490,7 @@ def load_ppd_expiry_ladder_for_strike(sel_snapshot, sel_type, strike, dte_min, d
         ORDER BY expiration
         """,
         {
-            "snap_min": pd.to_datetime(sel_snapshot).to_pydatetime(),
+            "snap_min": snap,
             "t": sel_type,
             "strike": float(strike),
             "dte_min": int(dte_min),
@@ -417,9 +499,11 @@ def load_ppd_expiry_ladder_for_strike(sel_snapshot, sel_type, strike, dte_min, d
             "min_vol": int(min_vol),
         },
     )
+
     if not df.empty:
         df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
         df["expiration"] = pd.to_datetime(df["expiration"]).dt.date
+
         for col in [
             "days_to_exp",
             "strike",
@@ -435,8 +519,10 @@ def load_ppd_expiry_ladder_for_strike(sel_snapshot, sel_type, strike, dte_min, d
             "ppd",
         ]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
         df["spread"] = df["ask"] - df["bid"]
         df["spread_pct_mid"] = df["spread"] / df["mid_price"].replace(0, np.nan)
+
     return df
 
 
@@ -477,16 +563,33 @@ def load_option_history(start_date, end_date, sel_type, strike, expiration, min_
             "min_vol": int(min_vol),
         },
     )
+
     if not df.empty:
         df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
         df["expiration"] = pd.to_datetime(df["expiration"]).dt.date
-        for col in ["days_to_exp", "strike", "underlying_price", "last_price", "mid_price", "bid", "ask", "implied_volatility", "open_interest", "volume", "ppd"]:
+
+        for col in [
+            "days_to_exp",
+            "strike",
+            "underlying_price",
+            "last_price",
+            "mid_price",
+            "bid",
+            "ask",
+            "implied_volatility",
+            "open_interest",
+            "volume",
+            "ppd",
+        ]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
     return df
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_snapshot_chain(sel_snapshot, sel_type, dte_min, dte_max, min_oi, min_vol):
+    snap = pd.to_datetime(sel_snapshot).to_pydatetime()
+
     df = run_query(
         f"""
         SELECT
@@ -506,13 +609,14 @@ def load_snapshot_chain(sel_snapshot, sel_type, dte_min, dte_max, min_oi, min_vo
           CAST(volume AS FLOAT64) AS volume,
           CAST(ppd AS FLOAT64) AS ppd
         FROM `{VIEW}`
-        WHERE TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
+        WHERE DATE(snapshot_date) = DATE(@snap_min)
+          AND TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
           AND LOWER(type) = @t
           AND days_to_exp BETWEEN @dte_min AND @dte_max
           AND (COALESCE(open_interest, 0) >= @min_oi OR COALESCE(volume, 0) >= @min_vol)
         """,
         {
-            "snap_min": pd.to_datetime(sel_snapshot).to_pydatetime(),
+            "snap_min": snap,
             "t": sel_type,
             "dte_min": int(dte_min),
             "dte_max": int(dte_max),
@@ -520,29 +624,66 @@ def load_snapshot_chain(sel_snapshot, sel_type, dte_min, dte_max, min_oi, min_vo
             "min_vol": int(min_vol),
         },
     )
+
     if not df.empty:
         df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
         df["expiration"] = pd.to_datetime(df["expiration"]).dt.date
-        for col in ["days_to_exp", "strike", "underlying_price", "moneyness", "dist_points", "mid_price", "bid", "ask", "implied_volatility", "open_interest", "volume", "ppd"]:
+
+        for col in [
+            "days_to_exp",
+            "strike",
+            "underlying_price",
+            "moneyness",
+            "dist_points",
+            "mid_price",
+            "bid",
+            "ask",
+            "implied_volatility",
+            "open_interest",
+            "volume",
+            "ppd",
+        ]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
         df["abs_dist_pts"] = df["dist_points"].abs()
         df["abs_dist_pct"] = 100.0 * df["abs_dist_pts"] / df["underlying_price"].replace(0, np.nan)
+
     return df
 
 
 # Global controls
 min_date, max_date = load_date_bounds()
+
+if min_date is None or max_date is None:
+    st.warning("Geen data gevonden in de laatste 400 dagen.")
+    st.stop()
+
 default_start = max(min_date, max_date - timedelta(days=14))
 
 with st.expander("Algemene filters", expanded=True):
     c0, c1, c2 = st.columns([1.1, 1.8, 1.1])
+
     with c0:
         axis_scale = st.slider("As-lettergrootte", 1.2, 2.2, 1.5, 0.1)
         st.session_state["_axis_mult"] = axis_scale
+
     with c1:
-        range_choice = st.radio("Periode voor marktcontext", ["14d", "30d", "90d", "1y", "Custom"], index=0, horizontal=True)
+        range_choice = st.radio(
+            "Periode voor marktcontext",
+            ["14d", "30d", "90d", "1y", "Custom"],
+            index=0,
+            horizontal=True,
+        )
+
     with c2:
-        q_const_simple = st.number_input("Dividendrendement q", 0.0, 0.10, 0.016, 0.001, format="%.3f")
+        q_const_simple = st.number_input(
+            "Dividendrendement q",
+            0.0,
+            0.10,
+            0.016,
+            0.001,
+            format="%.3f",
+        )
 
     if range_choice != "Custom":
         days_map = {"14d": 14, "30d": 30, "90d": 90, "1y": 365}
@@ -559,22 +700,25 @@ with st.expander("Algemene filters", expanded=True):
         )
 
     f1, f2, f3, f4 = st.columns([1.2, 1.2, 1, 1])
+
     with f1:
         context_dte_range = st.slider("DTE voor marktcontext", 0, 365, (0, 60), step=1)
+
     with f2:
         context_mny_range = st.slider("Moneyness voor marktcontext", -0.30, 0.30, (-0.15, 0.15), step=0.01)
+
     with f3:
         min_oi = st.slider("Min OI", 0, 100, 1, step=1)
+
     with f4:
         min_vol = st.slider("Min Volume", 0, 100, 1, step=1)
 
 
 snapshots_all = load_snapshots(start_date, end_date)
+
 if not snapshots_all:
     st.warning("Geen snapshots gevonden voor deze periode.")
     st.stop()
-
-default_snapshot = snapshots_all[-1]
 
 market = load_daily_market_context(
     start_date,
@@ -608,21 +752,28 @@ last_vix = float(market["vix"].dropna().iloc[-1]) if market["vix"].notna().any()
 last_spx = float(market["spx"].dropna().iloc[-1]) if market["spx"].notna().any() else np.nan
 vrp = last_iv - hv20 if not np.isnan(last_iv) and not np.isnan(hv20) else np.nan
 
+
 # Header KPIs
 k1, k2, k3, k4, k5 = st.columns(5)
+
 with k1:
     st.metric("SPX", fmt_num(last_spx, 1))
+
 with k2:
     st.metric("VIX", fmt_num(last_vix, 2))
+
 with k3:
     st.metric("PCR Volume", fmt_num(last_pcr_vol, 2))
+
 with k4:
     st.metric("PCR OI", fmt_num(last_pcr_oi, 2))
+
 with k5:
     st.metric("VRP IV-HV20", fmt_pct(vrp, 2))
 
+
 st.caption(
-    "Tip: gebruik vooral de tab 'Beste expiratie voor short optie' om te kiezen welke maturity het meeste PPD oplevert voor een gekozen far OTM strike."
+    "Tip: gebruik vooral 'Beste expiratie voor short optie' om te kiezen welke maturity het meeste PPD oplevert voor een gekozen far OTM strike."
 )
 
 
@@ -645,6 +796,7 @@ def type_radio(label, key, default="put"):
 def strike_selectbox(label, sel_snapshot, sel_type, key, default_offset_points=400.0):
     spot, _ = load_snapshot_context(sel_snapshot)
     strikes = load_strikes_for_snapshot(sel_snapshot, sel_type, min_oi, min_vol)
+
     if not strikes:
         st.warning("Geen strikes gevonden voor deze selectie.")
         return None, spot, []
@@ -660,22 +812,28 @@ def strike_selectbox(label, sel_snapshot, sel_type, key, default_offset_points=4
         key=key,
         format_func=lambda x: f"{x:.0f}",
     )
-    st.caption(f"Spot op peildatum: {fmt_num(spot, 1)} | standaard rond {'SPX - 400' if sel_type == 'put' else 'SPX + 400'}")
+
+    st.caption(
+        f"Spot op peildatum: {fmt_num(spot, 1)} | standaard rond {'SPX - 400' if sel_type == 'put' else 'SPX + 400'}"
+    )
+
     return strike, spot, strikes
 
 
-tab_regime, tab_trade, tab_history, tab_distance, tab_term = st.tabs(
+page = st.radio(
+    "Onderdeel",
     [
         "Marktbeeld",
         "Beste expiratie voor short optie",
         "Historiek van optie",
         "PPD naar afstand",
         "Term structure en smile",
-    ]
+    ],
+    horizontal=True,
 )
 
 
-with tab_regime:
+if page == "Marktbeeld":
     section_title(
         "Marktbeeld",
         "Algemene context: SPX, VIX, put/call-ratio, implied volatility en volatiliteitspremie.",
@@ -688,11 +846,14 @@ with tab_regime:
         vertical_spacing=0.05,
         subplot_titles=("PCR Volume: actuele flow", "PCR OI: bestaande positioning", "PCR Gap: flow minus positioning"),
     )
+
     fig_pcr.add_trace(go.Scatter(x=market["day"], y=market["PCR_vol"], mode="lines", name="PCR Volume"), row=1, col=1)
     fig_pcr.add_trace(go.Scatter(x=market["day"], y=market["PCR_oi"], mode="lines", name="PCR OI"), row=2, col=1)
     fig_pcr.add_trace(go.Bar(x=market["day"], y=market["PCR_gap"], name="PCR Gap"), row=3, col=1)
+
     add_pcr_midline(fig_pcr, 1, 1)
     add_pcr_midline(fig_pcr, 2, 1)
+
     show_fig(fig_pcr, height=740)
 
     fig_ctx = make_subplots(
@@ -702,9 +863,11 @@ with tab_regime:
         vertical_spacing=0.05,
         subplot_titles=("SPX", "VIX", "Gemiddelde IV"),
     )
+
     fig_ctx.add_trace(go.Scatter(x=market["day"], y=market["spx"], mode="lines", name="SPX"), row=1, col=1)
     fig_ctx.add_trace(go.Scatter(x=market["day"], y=market["vix"], mode="lines", name="VIX"), row=2, col=1)
     fig_ctx.add_trace(go.Scatter(x=market["day"], y=market["avg_iv"], mode="lines", name="IV"), row=3, col=1)
+
     show_fig(fig_ctx, height=740)
 
     st.info(
@@ -713,25 +876,31 @@ with tab_regime:
     )
 
 
-with tab_trade:
+elif page == "Beste expiratie voor short optie":
     section_title(
         "Beste expiratie voor short optie",
         "Kies een peildatum, put/call en strike. De grafiek vergelijkt alle expiraties voor die strike. Links staat PPD, rechts de optieprijs.",
     )
 
     c1, c2, c3 = st.columns([1.2, 0.8, 1.2])
+
     with c1:
         ladder_snapshot = snapshot_selectbox("Peildatum", "ladder_snapshot")
+
     with c2:
         ladder_type = type_radio("Type", "ladder_type", default="put")
+
     with c3:
         ladder_strike, ladder_spot, _ = strike_selectbox("Strike", ladder_snapshot, ladder_type, "ladder_strike")
 
     c4, c5, c6 = st.columns([1.2, 1, 1])
+
     with c4:
         ladder_dte = st.slider("DTE-bereik", 1, 365, (1, 180), step=1, key="ladder_dte")
+
     with c5:
         ladder_price_col = st.radio("Prijs op rechteras", ["mid_price", "bid", "last_price"], index=0, horizontal=True, key="ladder_price")
+
     with c6:
         ladder_smooth = st.toggle("Smooth PPD", value=True, key="ladder_smooth")
 
@@ -753,6 +922,7 @@ with tab_trade:
             ladder["ppd_s"] = smooth_series(ladder["ppd"], 3)
             ladder["T"] = ladder["days_to_exp"] / 365.0
             ladder["q"] = get_q_curve_const(ladder["T"].to_numpy(dtype=float), q_const=q_const_simple, to_continuous=True)
+
             ladder["delta"] = ladder.apply(
                 lambda r: bs_delta(
                     float(r["underlying_price"]),
@@ -837,6 +1007,7 @@ with tab_trade:
                     f"op {pd.to_datetime(ladder_snapshot).strftime('%Y-%m-%d %H:%M')}"
                 )
             )
+
             show_fig(fig, height=520)
 
             if best is not None:
@@ -884,28 +1055,34 @@ with tab_trade:
             )
 
 
-with tab_history:
+elif page == "Historiek van optie":
     section_title(
         "Historiek van een gekozen optie",
         "Volg een specifieke optie door de tijd: peildatum voor defaults, put/call, strike en expiratie.",
     )
 
     h1, h2, h3 = st.columns([1.2, 0.8, 1.2])
+
     with h1:
         hist_snapshot = snapshot_selectbox("Peildatum voor standaardkeuze", "hist_snapshot")
+
     with h2:
         hist_type = type_radio("Type", "hist_type", default="put")
+
     with h3:
         hist_strike, _, _ = strike_selectbox("Strike", hist_snapshot, hist_type, "hist_strike")
 
     if hist_strike is not None:
         hist_exps = load_expirations_for_option(hist_snapshot, hist_type, hist_strike, min_oi, min_vol)
+
         if not hist_exps:
             st.info("Geen expiraties gevonden voor deze optie.")
         else:
             target_exp = date.today() + timedelta(days=14)
             default_exp = pick_first_on_or_after(hist_exps, target_exp)
+
             h4, h5 = st.columns([1.2, 1])
+
             with h4:
                 hist_exp = st.selectbox(
                     "Expiratie",
@@ -913,6 +1090,7 @@ with tab_history:
                     index=hist_exps.index(default_exp) if default_exp in hist_exps else 0,
                     key="hist_exp",
                 )
+
             with h5:
                 hist_price_col = st.radio("Prijsbron", ["mid_price", "last_price", "bid"], index=0, horizontal=True, key="hist_price")
 
@@ -922,10 +1100,17 @@ with tab_history:
                 st.info("Geen historische data voor deze optie.")
             else:
                 s1, s2 = st.columns(2)
+
                 with s1:
                     fig_price = make_subplots(specs=[[{"secondary_y": True}]])
-                    fig_price.add_trace(go.Scatter(x=hist["snapshot_date"], y=hist[hist_price_col], mode="lines+markers", name="Optieprijs"), secondary_y=False)
-                    fig_price.add_trace(go.Scatter(x=hist["snapshot_date"], y=hist["underlying_price"], mode="lines", line=dict(dash="dot"), name="SPX"), secondary_y=True)
+                    fig_price.add_trace(
+                        go.Scatter(x=hist["snapshot_date"], y=hist[hist_price_col], mode="lines+markers", name="Optieprijs"),
+                        secondary_y=False,
+                    )
+                    fig_price.add_trace(
+                        go.Scatter(x=hist["snapshot_date"], y=hist["underlying_price"], mode="lines", line=dict(dash="dot"), name="SPX"),
+                        secondary_y=True,
+                    )
                     fig_price.update_yaxes(title_text="Optieprijs", secondary_y=False)
                     fig_price.update_yaxes(title_text="SPX", secondary_y=True)
                     fig_price.update_layout(title=f"{hist_type.upper()} {hist_strike:.0f} exp {hist_exp}: prijs vs SPX")
@@ -933,25 +1118,34 @@ with tab_history:
 
                 with s2:
                     fig_iv = make_subplots(specs=[[{"secondary_y": True}]])
-                    fig_iv.add_trace(go.Scatter(x=hist["snapshot_date"], y=hist["implied_volatility"], mode="lines+markers", name="IV"), secondary_y=False)
-                    fig_iv.add_trace(go.Scatter(x=hist["snapshot_date"], y=hist["ppd"], mode="lines+markers", name="PPD"), secondary_y=True)
+                    fig_iv.add_trace(
+                        go.Scatter(x=hist["snapshot_date"], y=hist["implied_volatility"], mode="lines+markers", name="IV"),
+                        secondary_y=False,
+                    )
+                    fig_iv.add_trace(
+                        go.Scatter(x=hist["snapshot_date"], y=hist["ppd"], mode="lines+markers", name="PPD"),
+                        secondary_y=True,
+                    )
                     fig_iv.update_yaxes(title_text="IV", secondary_y=False)
                     fig_iv.update_yaxes(title_text="PPD", secondary_y=True)
                     fig_iv.update_layout(title="IV en PPD door de tijd")
                     show_fig(fig_iv, height=430)
 
 
-with tab_distance:
+elif page == "PPD naar afstand":
     section_title(
         "PPD naar afstand tot spot",
         "Bekijk hoeveel PPD de markt geeft bij verschillende afstanden vanaf SPX op een gekozen peildatum.",
     )
 
     d1, d2, d3 = st.columns([1.2, 0.8, 1.2])
+
     with d1:
         dist_snapshot = snapshot_selectbox("Peildatum", "dist_snapshot")
+
     with d2:
         dist_type = type_radio("Type", "dist_type", default="put")
+
     with d3:
         dist_dte = st.slider("DTE-bereik", 1, 365, (1, 60), step=1, key="dist_dte")
 
@@ -972,11 +1166,18 @@ with tab_distance:
             x_title = "|K-S| / S in procent"
 
         chain["dist_bin"] = pd.cut(chain[x_col], bins=bins, include_lowest=True)
+
         g = (
             chain.groupby("dist_bin")
-            .agg(ppd=("ppd", "median"), iv=("implied_volatility", "median"), price=("mid_price", "median"), n=("ppd", "count"))
+            .agg(
+                ppd=("ppd", "median"),
+                iv=("implied_volatility", "median"),
+                price=("mid_price", "median"),
+                n=("ppd", "count"),
+            )
             .reset_index()
         )
+
         g = g[g["n"] >= 3].copy()
         g["bin_mid"] = g["dist_bin"].apply(lambda iv: iv.mid if pd.notna(iv) else np.nan)
         g["ppd_s"] = smooth_series(g["ppd"], 3)
@@ -985,24 +1186,29 @@ with tab_distance:
         fig_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd"], mode="markers", name="PPD"), secondary_y=False)
         fig_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd_s"], mode="lines", name="PPD smooth"), secondary_y=False)
         fig_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["price"], mode="lines", name="Mid prijs"), secondary_y=True)
+
         fig_dist.update_xaxes(title_text=x_title)
         fig_dist.update_yaxes(title_text="PPD", secondary_y=False)
         fig_dist.update_yaxes(title_text="Mid prijs", secondary_y=True)
         fig_dist.update_layout(title=f"{dist_type.upper()}: PPD en prijs naar afstand tot spot")
+
         show_fig(fig_dist, height=500)
 
 
-with tab_term:
+elif page == "Term structure en smile":
     section_title(
         "Term structure en smile",
         "Bekijk implied volatility per looptijd en per strike. Dit is context voor je trade-keuze.",
     )
 
     t1, t2, t3 = st.columns([1.2, 0.8, 1.2])
+
     with t1:
         term_snapshot = snapshot_selectbox("Peildatum", "term_snapshot")
+
     with t2:
         term_type = type_radio("Type", "term_type", default="put")
+
     with t3:
         term_strike, _, _ = strike_selectbox("Strike voor smile-defaults", term_snapshot, term_type, "term_strike")
 
@@ -1014,7 +1220,13 @@ with tab_term:
         c1, c2 = st.columns(2)
 
         with c1:
-            term = term_chain.groupby("days_to_exp", as_index=False)["implied_volatility"].median().sort_values("days_to_exp")
+            term = (
+                term_chain
+                .groupby("days_to_exp", as_index=False)["implied_volatility"]
+                .median()
+                .sort_values("days_to_exp")
+            )
+
             fig_term = go.Figure(
                 go.Scatter(
                     x=term["days_to_exp"],
@@ -1023,33 +1235,51 @@ with tab_term:
                     name="IV",
                 )
             )
+
             fig_term.update_layout(title="IV term structure", xaxis_title="DTE", yaxis_title="IV")
             show_fig(fig_term, height=410)
 
         with c2:
             exps = sorted(term_chain["expiration"].dropna().unique())
+
             if not exps:
                 st.info("Geen expiraties voor smile.")
             else:
                 default_exp = pick_first_on_or_after(exps, date.today() + timedelta(days=14))
+
                 smile_exp = st.selectbox(
                     "Expiratie voor smile",
                     options=exps,
                     index=exps.index(default_exp) if default_exp in exps else 0,
                     key="smile_exp",
                 )
+
                 sm = (
                     term_chain[term_chain["expiration"] == smile_exp]
                     .groupby("strike", as_index=False)["implied_volatility"]
                     .median()
                     .sort_values("strike")
                 )
-                fig_sm = go.Figure(go.Scatter(x=sm["strike"], y=sm["implied_volatility"], mode="lines+markers", name="IV Smile"))
+
+                fig_sm = go.Figure(
+                    go.Scatter(
+                        x=sm["strike"],
+                        y=sm["implied_volatility"],
+                        mode="lines+markers",
+                        name="IV Smile",
+                    )
+                )
+
                 if term_strike is not None:
                     fig_sm.add_vline(x=float(term_strike), line=dict(dash="dot"))
+
                 fig_sm.update_layout(title=f"IV smile exp {smile_exp}", xaxis_title="Strike", yaxis_title="IV")
                 show_fig(fig_sm, height=410)
+
 
 st.caption(
     "Gebruik dit dashboard als contextlaag. Voor concrete trades blijft bevestiging via price action, macro-events, expiratiekalender en executionkwaliteit nodig."
 )
+```
+
+Na plakken: deployen, dashboard openen, en in BigQuery `INFORMATION_SCHEMA.JOBS_BY_PROJECT` checken of er nog onverwacht veel queries of bytes doorheen gaan.
