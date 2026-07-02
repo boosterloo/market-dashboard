@@ -283,6 +283,21 @@ def normalize_100(series: pd.Series) -> pd.Series:
     return s / valid.iloc[0] * 100.0
 
 
+def padded_range(series_list: list[pd.Series], pad_ratio: float = 0.08):
+    values = pd.concat([pd.to_numeric(s, errors="coerce") for s in series_list], axis=0).dropna()
+    if values.empty:
+        return None
+    y_min = float(values.min())
+    y_max = float(values.max())
+    if not np.isfinite(y_min) or not np.isfinite(y_max):
+        return None
+    if y_min == y_max:
+        pad = abs(y_max) * pad_ratio if y_max != 0 else 1.0
+    else:
+        pad = (y_max - y_min) * pad_ratio
+    return [y_min - pad, y_max + pad]
+
+
 def pct_as_str(x):
     return "-" if pd.isna(x) else f"{x:.2f}%"
 
@@ -353,6 +368,13 @@ with st.sidebar:
     ema_fast = st.number_input("EMA fast", 5, 100, 20, step=1)
     ema_mid = st.number_input("EMA mid", 10, 150, 50, step=1)
     ema_slow = st.number_input("EMA slow", 50, 400, 200, step=5)
+    show_emas = st.checkbox("EMA's tonen in hoofdgrafiek", value=False)
+    selected_emas = st.multiselect(
+        "Welke EMA's",
+        options=["fast", "mid", "slow"],
+        default=["mid", "slow"],
+        disabled=not show_emas,
+    )
     rsi_period = st.slider("RSI periode", 5, 40, 14, 1)
 
     st.divider()
@@ -400,7 +422,8 @@ if "gold_close" in d.columns:
     d["gold_silver_ratio"] = d["gold_close"] / d["silver_close"].replace(0, np.nan)
     d["silver_gold_rel"] = normalize_100(d["silver_close"]) - normalize_100(d["gold_close"])
 
-for span in [ema_fast, ema_mid, ema_slow]:
+ema_spans = sorted(set([ema_fast, ema_mid, ema_slow]))
+for span in ema_spans:
     d[f"silver_ema{span}"] = ema(d["silver_close"], span)
 
 d["silver_rsi"] = rsi_wilder(d["silver_close"], rsi_period)
@@ -505,7 +528,7 @@ else:
 st.divider()
 
 # ---------- Price + overlays ----------
-st.subheader("Silver - Price, EMA and macro overlays")
+st.subheader("Silver - Price and macro overlays")
 sel = st.multiselect(
     "Kies drivers voor overlay",
     options=driver_choices,
@@ -514,40 +537,54 @@ sel = st.multiselect(
 )
 
 fig = make_subplots(specs=[[{"secondary_y": view_mode.startswith("Eigen")}]] )
-fig.add_trace(go.Scatter(x=d["date"], y=d["silver_close"], name="Silver (USD/oz)", line=dict(width=2.5, color="#111111")))
-fig.add_trace(go.Scatter(x=d["date"], y=d[f"silver_ema{ema_fast}"], name=f"EMA{ema_fast}", line=dict(width=2, color="#E69F00")))
-fig.add_trace(go.Scatter(x=d["date"], y=d[f"silver_ema{ema_mid}"], name=f"EMA{ema_mid}", line=dict(width=2, color="#009E73")))
-fig.add_trace(go.Scatter(x=d["date"], y=d[f"silver_ema{ema_slow}"], name=f"EMA{ema_slow}", line=dict(width=2, color="#0072B2")))
+primary_range_series = []
+secondary_range_series = []
+
+if view_mode.startswith("Genormaliseerd"):
+    silver_plot = normalize_100(d["silver_close"])
+    fig.add_trace(go.Scatter(x=d["date"], y=silver_plot, name="Silver (=100)", line=dict(width=2.5, color="#111111")))
+    primary_range_series.append(silver_plot)
+else:
+    fig.add_trace(go.Scatter(x=d["date"], y=d["silver_close"], name="Silver (USD/oz)", line=dict(width=2.5, color="#111111")))
+    primary_range_series.append(d["silver_close"])
+
+ema_config = {
+    "fast": (ema_fast, "#E69F00"),
+    "mid": (ema_mid, "#009E73"),
+    "slow": (ema_slow, "#0072B2"),
+}
+if show_emas:
+    for key in selected_emas:
+        span, color = ema_config[key]
+        ema_series = d[f"silver_ema{span}"]
+        y = normalize_100(ema_series) if view_mode.startswith("Genormaliseerd") else ema_series
+        fig.add_trace(go.Scatter(x=d["date"], y=y, name=f"EMA{span}", line=dict(width=1.8, color=color)))
+        primary_range_series.append(y)
 
 palette = ["#6B7280", "#8B5CF6", "#EF4444", "#10B981", "#A855F7", "#F59E0B", "#3B82F6"]
-base_added = False
 for i, name in enumerate(sel):
     col = DRIVER_MAP[name]
     series = d[col]
     if series.notna().sum() == 0:
         continue
     if view_mode.startswith("Genormaliseerd"):
-        if not base_added:
-            fig.add_trace(
-                go.Scatter(
-                    x=d["date"],
-                    y=normalize_100(d["silver_close"]),
-                    name="Silver (=100)",
-                    line=dict(width=1.8, color="#111111", dash="dot"),
-                )
-            )
-            base_added = True
         y = normalize_100(series)
         fig.add_trace(go.Scatter(x=d["date"], y=y, name=name, line=dict(width=2, color=palette[i % len(palette)])))
+        primary_range_series.append(y)
     else:
         fig.add_trace(
             go.Scatter(x=d["date"], y=series, name=name, line=dict(width=2, color=palette[i % len(palette)])),
             secondary_y=True,
         )
+        secondary_range_series.append(series)
 
-fig.update_yaxes(title_text="Index (=100)" if view_mode.startswith("Genormaliseerd") else "Silver USD/oz", secondary_y=False)
+fig.update_yaxes(
+    title_text="Index (=100)" if view_mode.startswith("Genormaliseerd") else "Silver USD/oz",
+    range=padded_range(primary_range_series),
+    secondary_y=False,
+)
 if view_mode.startswith("Eigen"):
-    fig.update_yaxes(title_text="Drivers", secondary_y=True)
+    fig.update_yaxes(title_text="Drivers", range=padded_range(secondary_range_series), secondary_y=True)
 fig.update_layout(height=560, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
 st.plotly_chart(fig, use_container_width=True)
 
