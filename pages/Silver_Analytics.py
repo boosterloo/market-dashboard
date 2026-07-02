@@ -389,6 +389,8 @@ with st.sidebar:
     st.divider()
     st.markdown("#### Correlatie / beta")
     corr_win = st.slider("Rolling corr window", 10, 180, 60, 5)
+    corr_transform = st.radio("Correlatiebasis", ["Returns / changes", "Levels"], index=0)
+    lead_lag_max = st.slider("Lead/lag max dagen", 5, 60, 20, 5)
     scatter_mode = st.radio("Scatter transformatie", ["%-returns vs %-returns", "Levels vs Levels"], index=0)
 
 # ---------- Period ----------
@@ -676,17 +678,132 @@ if liquidity_cols or level_cols:
 st.divider()
 
 # ---------- Rolling correlations ----------
-st.subheader("Rolling correlaties - Silver vs drivers")
+st.subheader("Correlation map - Silver and drivers")
 sel_corr = st.multiselect("Kies drivers voor correlatie", options=driver_choices, default=default_overlay)
 if sel_corr:
+    corr_cols = {"Silver": "silver_close"}
+    corr_cols.update({name: DRIVER_MAP[name] for name in sel_corr if DRIVER_MAP[name] in d.columns})
+
+    corr_frame = pd.DataFrame({"date": d["date"]})
+    for name, col in corr_cols.items():
+        raw = pd.to_numeric(d[col], errors="coerce")
+        if corr_transform.startswith("Returns"):
+            if name in ["US 10Y (yield %)", "US 10Y Real (TIPS %)", "VIX", "Gold/Silver ratio", "M2 YoY (%)", "Real M2 YoY (%)"]:
+                corr_frame[name] = raw.diff()
+            else:
+                corr_frame[name] = raw.pct_change() * 100.0
+        else:
+            corr_frame[name] = raw
+
+    corr_frame = corr_frame.set_index("date")
+    corr_data = corr_frame.dropna(how="all")
+    corr_matrix = corr_data.corr(min_periods=max(10, int(corr_win * 0.5)))
+
+    if corr_matrix.empty or "Silver" not in corr_matrix.columns:
+        st.info("Geen voldoende overlappende data voor een correlatie-heatmap.")
+    else:
+        fig_h = go.Figure(
+            data=go.Heatmap(
+                z=corr_matrix.values,
+                x=corr_matrix.columns,
+                y=corr_matrix.index,
+                zmin=-1,
+                zmax=1,
+                colorscale="RdBu",
+                reversescale=True,
+                colorbar=dict(title="corr"),
+                text=np.round(corr_matrix.values, 2),
+                texttemplate="%{text}",
+                hovertemplate="%{y} vs %{x}: %{z:.2f}<extra></extra>",
+            )
+        )
+        fig_h.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig_h, use_container_width=True)
+
+        rel_rows = []
+        for name in corr_matrix.columns:
+            if name == "Silver":
+                continue
+            val = corr_matrix.loc["Silver", name] if "Silver" in corr_matrix.index else np.nan
+            if pd.notna(val):
+                rel_rows.append({"Driver": name, "Corr vs Silver": val, "Abs corr": abs(val)})
+        if rel_rows:
+            rel_df = pd.DataFrame(rel_rows).sort_values("Abs corr", ascending=False)
+            top_txt = []
+            for _, row in rel_df.head(3).iterrows():
+                direction = "positief" if row["Corr vs Silver"] > 0 else "negatief"
+                top_txt.append(f"{row['Driver']}: {direction} ({row['Corr vs Silver']:.2f})")
+            st.info("Sterkste samenhang in deze periode: " + " | ".join(top_txt))
+            show_rel = rel_df.drop(columns=["Abs corr"]).copy()
+            show_rel["Corr vs Silver"] = show_rel["Corr vs Silver"].map(lambda x: f"{x:.2f}")
+            st.dataframe(show_rel, use_container_width=True, hide_index=True)
+
+    st.subheader("Lead/lag heatmap - welke driver loopt voor?")
+    lag_rows = []
+    lag_values = list(range(-lead_lag_max, lead_lag_max + 1, 5))
+    silver_series = corr_frame["Silver"]
+    for name in sel_corr:
+        if name not in corr_frame.columns:
+            continue
+        driver_series = corr_frame[name]
+        row_vals = []
+        for lag in lag_values:
+            # Positieve lag: driver beweegt eerder dan silver; negatieve lag: silver beweegt eerder.
+            shifted_driver = driver_series.shift(lag)
+            joined = pd.concat([silver_series.rename("silver"), shifted_driver.rename("driver")], axis=1).dropna()
+            row_vals.append(joined["silver"].corr(joined["driver"]) if len(joined) >= 20 else np.nan)
+        lag_rows.append(row_vals)
+
+    if lag_rows:
+        lag_matrix = np.array(lag_rows, dtype=float)
+        fig_lag = go.Figure(
+            data=go.Heatmap(
+                z=lag_matrix,
+                x=lag_values,
+                y=sel_corr,
+                zmin=-1,
+                zmax=1,
+                colorscale="RdBu",
+                reversescale=True,
+                colorbar=dict(title="corr"),
+                hovertemplate="Driver %{y}<br>Lag %{x}d: %{z:.2f}<extra></extra>",
+            )
+        )
+        fig_lag.update_layout(
+            height=max(360, 70 + 34 * len(sel_corr)),
+            margin=dict(l=10, r=10, t=30, b=40),
+            xaxis_title="Lag in dagen: + betekent driver leidt silver",
+        )
+        st.plotly_chart(fig_lag, use_container_width=True)
+
+        best_rows = []
+        for driver_name, values in zip(sel_corr, lag_matrix):
+            if np.all(np.isnan(values)):
+                continue
+            idx = int(np.nanargmax(np.abs(values)))
+            best_rows.append(
+                {
+                    "Driver": driver_name,
+                    "Beste lag": lag_values[idx],
+                    "Corr": values[idx],
+                    "Interpretatie": "driver leidt silver" if lag_values[idx] > 0 else "silver leidt driver" if lag_values[idx] < 0 else "zelfde dag",
+                }
+            )
+        if best_rows:
+            best_df = pd.DataFrame(best_rows).sort_values("Corr", key=lambda s: s.abs(), ascending=False)
+            best_df["Corr"] = best_df["Corr"].map(lambda x: f"{x:.2f}")
+            st.dataframe(best_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Rolling correlaties - Silver vs drivers")
     figc = go.Figure()
     any_line = False
     for name in sel_corr:
-        col = DRIVER_MAP[name]
-        returns = name not in ["US 10Y (yield %)", "US 10Y Real (TIPS %)", "VIX", "Gold/Silver ratio"]
-        rc = rolling_corr(d["silver_close"], d[col], corr_win, returns=returns)
-        if rc.empty:
+        if name not in corr_frame.columns:
             continue
+        joined = pd.concat([corr_frame["Silver"].rename("silver"), corr_frame[name].rename("driver")], axis=1).dropna()
+        if len(joined) < corr_win:
+            continue
+        rc = joined["silver"].rolling(corr_win).corr(joined["driver"]).dropna()
         figc.add_trace(go.Scatter(x=rc.index, y=rc.values, mode="lines", name=name, line=dict(width=2)))
         any_line = True
     figc.add_hline(y=0.0, line_dash="dot")
