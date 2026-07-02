@@ -269,10 +269,23 @@ def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast_line = series.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    ema_slow_line = series.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    macd_line = ema_fast_line - ema_slow_line
+    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
 def zscore(s: pd.Series, win: int = 20) -> pd.Series:
     mu = s.rolling(win, min_periods=win).mean()
     sd = s.rolling(win, min_periods=win).std()
     return (s - mu) / sd.replace(0, np.nan)
+
+
+def slope_pct(series: pd.Series, lookback: int = 10) -> pd.Series:
+    return ((series / series.shift(lookback)) - 1.0) * 100.0
 
 
 def normalize_100(series: pd.Series) -> pd.Series:
@@ -430,6 +443,142 @@ for span in ema_spans:
 
 d["silver_rsi"] = rsi_wilder(d["silver_close"], rsi_period)
 d["silver_z20"] = zscore(d["silver_close"], 20)
+d["silver_macd_line"], d["silver_macd_signal"], d["silver_macd_hist"] = macd(d["silver_close"])
+d["silver_macd_hist_prev"] = d["silver_macd_hist"].shift(1)
+d["silver_ema_fast_slope_10"] = slope_pct(d[f"silver_ema{ema_fast}"], 10)
+d["silver_ema_mid_slope_10"] = slope_pct(d[f"silver_ema{ema_mid}"], 10)
+d["silver_stretch_fast_pct"] = (d["silver_close"] / d[f"silver_ema{ema_fast}"] - 1.0) * 100.0
+
+
+def classify_silver_trend(row):
+    close = row["silver_close"]
+    e_fast = row[f"silver_ema{ema_fast}"]
+    e_mid = row[f"silver_ema{ema_mid}"]
+    e_slow = row[f"silver_ema{ema_slow}"]
+    s_fast = row["silver_ema_fast_slope_10"]
+    s_mid = row["silver_ema_mid_slope_10"]
+
+    if pd.isna(close) or pd.isna(e_fast) or pd.isna(e_mid) or pd.isna(e_slow):
+        return "Onvoldoende data"
+    if close > e_fast > e_mid > e_slow and s_fast > 0 and s_mid > 0:
+        return "Strong Bull"
+    if close > e_mid > e_slow:
+        return "Bull"
+    if close < e_fast < e_mid < e_slow and s_fast < 0 and s_mid < 0:
+        return "Strong Bear"
+    if close < e_mid < e_slow:
+        return "Bear"
+    return "Neutral"
+
+
+def classify_silver_strength(row):
+    spread_fast_mid = abs((row[f"silver_ema{ema_fast}"] / row[f"silver_ema{ema_mid}"] - 1) * 100) if pd.notna(row[f"silver_ema{ema_mid}"]) and row[f"silver_ema{ema_mid}"] != 0 else np.nan
+    spread_mid_slow = abs((row[f"silver_ema{ema_mid}"] / row[f"silver_ema{ema_slow}"] - 1) * 100) if pd.notna(row[f"silver_ema{ema_slow}"]) and row[f"silver_ema{ema_slow}"] != 0 else np.nan
+    slope_fast = abs(row["silver_ema_fast_slope_10"]) if pd.notna(row["silver_ema_fast_slope_10"]) else np.nan
+    score = 0
+    if pd.notna(spread_fast_mid) and spread_fast_mid > 2.0:
+        score += 1
+    if pd.notna(spread_mid_slow) and spread_mid_slow > 4.0:
+        score += 1
+    if pd.notna(slope_fast) and slope_fast > 2.0:
+        score += 1
+    if pd.notna(row["silver_stretch_fast_pct"]) and abs(row["silver_stretch_fast_pct"]) > 5:
+        score += 1
+    if score >= 3:
+        return "Sterk"
+    if score >= 2:
+        return "Gemiddeld"
+    return "Zwak"
+
+
+def classify_silver_momentum(row):
+    hist = row["silver_macd_hist"]
+    hist_prev = row["silver_macd_hist_prev"]
+    rsi = row["silver_rsi"]
+    if pd.isna(hist) or pd.isna(hist_prev) or pd.isna(rsi):
+        return "Onvoldoende data"
+    if hist > 0 and hist > hist_prev and rsi > 55:
+        return "Versnellend omhoog"
+    if hist > 0 and hist <= hist_prev and rsi > 50:
+        return "Positief maar afzwakkend"
+    if hist < 0 and hist < hist_prev and rsi < 45:
+        return "Versnellend omlaag"
+    if hist < 0 and hist >= hist_prev and rsi < 50:
+        return "Negatief maar afzwakkend"
+    return "Neutraal"
+
+
+def classify_silver_exhaustion(row):
+    flags = 0
+    if pd.notna(row["silver_rsi"]) and (row["silver_rsi"] >= 72 or row["silver_rsi"] <= 28):
+        flags += 1
+    if pd.notna(row["silver_z20"]) and abs(row["silver_z20"]) >= 2.0:
+        flags += 1
+    if pd.notna(row["silver_stretch_fast_pct"]) and abs(row["silver_stretch_fast_pct"]) >= 6.0:
+        flags += 1
+    if flags >= 2:
+        return "Hoog"
+    if flags == 1:
+        return "Oplopend"
+    return "Laag"
+
+
+def classify_macro_bias(row):
+    score = 0
+    reasons = []
+    dxy_delta = trend_delta(d, "dxy_close", trend_look)
+    real_yield_delta = trend_delta(d, "tips10y_real", trend_look)
+    m2_delta = trend_delta(d, "m2_real_yoy", trend_look)
+    copper_mom = d["copper_close"].pct_change(trend_look).dropna().iloc[-1] if "copper_close" in d.columns and d["copper_close"].notna().sum() > trend_look else np.nan
+
+    if pd.notna(dxy_delta):
+        score += 1 if dxy_delta < 0 else -1
+        reasons.append(f"DXY {dxy_delta:+.2f}")
+    if pd.notna(real_yield_delta):
+        score += 1 if real_yield_delta < 0 else -1
+        reasons.append(f"real yield {real_yield_delta:+.2f}")
+    if pd.notna(m2_delta):
+        score += 1 if m2_delta > 0 else -1
+        reasons.append(f"real M2 YoY {m2_delta:+.2f}pp")
+    if pd.notna(copper_mom):
+        score += 1 if copper_mom > 0 else -1
+        reasons.append(f"copper {copper_mom * 100:+.2f}%")
+
+    if score >= 2:
+        return "Macro tailwind", " | ".join(reasons)
+    if score <= -2:
+        return "Macro headwind", " | ".join(reasons)
+    return "Macro mixed", " | ".join(reasons) if reasons else "Onvoldoende macrodata"
+
+
+def build_silver_summary(row):
+    trend = row["silver_trend"]
+    strength = row["silver_trend_strength"]
+    momentum = row["silver_momentum"]
+    exhaustion = row["silver_exhaustion"]
+    macro = row["macro_bias"]
+
+    parts = []
+    if trend in ["Strong Bull", "Bull"]:
+        parts.append(f"Zilver zit technisch in een {trend.lower()} fase met {strength.lower()} trendkracht")
+    elif trend in ["Strong Bear", "Bear"]:
+        parts.append(f"Zilver zit technisch in een {trend.lower()} fase met {strength.lower()} trendkracht")
+    else:
+        parts.append("Zilver zit technisch in een neutrale of overgangsfase")
+    if momentum != "Onvoldoende data":
+        parts.append(f"momentum is {momentum.lower()}")
+    parts.append(f"uitputting is {exhaustion.lower()}")
+    parts.append(f"macrobeeld: {macro.lower()}")
+    return ". ".join(parts) + "."
+
+
+d["silver_trend"] = d.apply(classify_silver_trend, axis=1)
+d["silver_trend_strength"] = d.apply(classify_silver_strength, axis=1)
+d["silver_momentum"] = d.apply(classify_silver_momentum, axis=1)
+d["silver_exhaustion"] = d.apply(classify_silver_exhaustion, axis=1)
+macro_bias, macro_detail = classify_macro_bias(d.iloc[-1])
+d["macro_bias"] = macro_bias
+d["macro_detail"] = macro_detail
 
 driver_choices = [name for name, col in DRIVER_MAP.items() if col in d.columns and d[col].notna().any()]
 default_overlay = [
@@ -456,20 +605,47 @@ with st.expander("Debug: driver-kolommen en non-null counts", expanded=False):
     )
 
 # ---------- KPI ----------
-st.subheader("KPI's")
+st.subheader("Silver Market State")
 silver_last = last_val(d, "silver_close")
 silver_dpct = latest_pct(d, "silver_close", "silver_delta_pct")
 gold_last = last_val(d, "gold_close")
 ratio_last = last_val(d, "gold_silver_ratio")
 copper_dpct = latest_pct(d, "copper_close", "copper_delta_pct") if "copper_close" in d.columns else np.nan
+state_ready = d.dropna(subset=["silver_close"]).copy()
+last_state = state_ready.iloc[-1] if not state_ready.empty else d.iloc[-1]
+summary_text = build_silver_summary(last_state)
 
-k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
 k1.metric("Silver (USD/oz)", f"{silver_last:,.2f}" if pd.notna(silver_last) else "-", pct_as_str(silver_dpct))
-k2.metric("Gold (USD/oz)", f"{gold_last:,.2f}" if pd.notna(gold_last) else "-")
-k3.metric("Gold/Silver ratio", f"{ratio_last:,.1f}" if pd.notna(ratio_last) else "-")
-k4.metric("Copper delta", pct_as_str(copper_dpct))
-k5.metric("DXY", f"{last_val(d, 'dxy_close'):.2f}" if pd.notna(last_val(d, "dxy_close")) else "-")
-k6.metric("Real M2 YoY", pct_as_str(last_val(d, "m2_real_yoy")))
+k2.metric("Trend", last_state["silver_trend"])
+k3.metric("Trendkracht", last_state["silver_trend_strength"])
+k4.metric("Momentum", last_state["silver_momentum"])
+k5.metric("Uitputting", last_state["silver_exhaustion"])
+k6.metric("Macro bias", last_state["macro_bias"])
+k7.metric("Gold/Silver", f"{ratio_last:,.1f}" if pd.notna(ratio_last) else "-")
+k8.metric("Real M2 YoY", pct_as_str(last_val(d, "m2_real_yoy")))
+
+st.info(summary_text)
+if last_state.get("macro_detail", ""):
+    st.caption(f"Macro detail ({trend_look}d): {last_state['macro_detail']}")
+
+d1, d2, d3, d4, d5, d6 = st.columns(6)
+d1.metric("RSI", f"{last_val(d, 'silver_rsi'):.1f}" if pd.notna(last_val(d, "silver_rsi")) else "-")
+d2.metric("MACD hist", f"{last_val(d, 'silver_macd_hist'):.3f}" if pd.notna(last_val(d, "silver_macd_hist")) else "-")
+d3.metric("Z-score 20d", f"{last_val(d, 'silver_z20'):.2f}" if pd.notna(last_val(d, "silver_z20")) else "-")
+d4.metric("Stretch vs EMA fast", f"{last_val(d, 'silver_stretch_fast_pct'):.2f}%" if pd.notna(last_val(d, "silver_stretch_fast_pct")) else "-")
+d5.metric("Copper delta", pct_as_str(copper_dpct))
+d6.metric("DXY", f"{last_val(d, 'dxy_close'):.2f}" if pd.notna(last_val(d, "dxy_close")) else "-")
+
+with st.expander("Hoe wordt deze diagnose gelezen?", expanded=False):
+    st.markdown(
+        """
+        - **Trend** kijkt naar silver close versus EMA fast/mid/slow en de richting van de EMA's.
+        - **Momentum** combineert MACD-histogram en RSI.
+        - **Uitputting** kijkt naar RSI-extremen, z-score en stretch versus de snelle EMA.
+        - **Macro bias** combineert DXY, real yield, real M2 YoY en koper over de gekozen driver-lookback.
+        """
+    )
 
 # ---------- Signals ----------
 st.subheader("Signal dashboard")
