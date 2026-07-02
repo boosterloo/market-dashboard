@@ -1,6 +1,3 @@
-
-
-```python
 import math
 from datetime import date, datetime, timedelta
 
@@ -1280,6 +1277,3 @@ elif page == "Term structure en smile":
 st.caption(
     "Gebruik dit dashboard als contextlaag. Voor concrete trades blijft bevestiging via price action, macro-events, expiratiekalender en executionkwaliteit nodig."
 )
-```
-
-Na plakken: deployen, dashboard openen, en in BigQuery `INFORMATION_SCHEMA.JOBS_BY_PROJECT` checken of er nog onverwacht veel queries of bytes doorheen gaan.
