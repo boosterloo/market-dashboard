@@ -54,6 +54,7 @@ AEX_VIEW = TABLES.get("aex_view", "nth-pier-468314-p7.marketdata.aex_with_vix_v"
 CRYPTO_WIDE_VIEW = TABLES.get("crypto_daily_wide", "nth-pier-468314-p7.marketdata.crypto_daily_wide_v")
 FX_WIDE_VIEW = TABLES.get("fx_wide_view", "nth-pier-468314-p7.marketdata.fx_daily_wide_v")
 US_YIELD_VIEW = TABLES.get("us_yield_view", "nth-pier-468314-p7.marketdata.us_yields_daily_wide_v")
+MACRO_VIEW = TABLES.get("macro_view", "nth-pier-468314-p7.marketdata.macro_series_wide_monthly_fill_v")
 
 with st.expander("Debug: gebruikte bronnen", expanded=False):
     st.write(
@@ -64,6 +65,7 @@ with st.expander("Debug: gebruikte bronnen", expanded=False):
             "crypto_daily_wide (BTC fallback)": CRYPTO_WIDE_VIEW,
             "fx_wide_view (DXY/EURUSD fallback)": FX_WIDE_VIEW,
             "us_yield_view (US10Y/TIPS fallback)": US_YIELD_VIEW,
+            "macro_view (M2 fallback)": MACRO_VIEW,
         }
     )
 
@@ -175,6 +177,45 @@ def load_yield_fallback() -> pd.DataFrame:
     return merged if merged is not None else pd.DataFrame()
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_m2_fallback() -> pd.DataFrame:
+    candidates = [
+        "m2",
+        "m2_ma3",
+        "m2_real",
+        "m2_real_ma3",
+        "m2_yoy",
+        "m2_real_yoy",
+        "m2_vel",
+        "m2_vel_ma3",
+        "m2_vel_yoy",
+    ]
+    try:
+        cols_sql = ", ".join(candidates)
+        d = run_query(f"SELECT date, {cols_sql} FROM `{MACRO_VIEW}` ORDER BY date")
+        return _numeric_df(d)
+    except Exception:
+        try:
+            d_all = run_query(f"SELECT * FROM `{MACRO_VIEW}` ORDER BY date")
+            if d_all.empty:
+                return pd.DataFrame()
+            lower_map = {c.lower(): c for c in d_all.columns}
+            keep = ["date"]
+            for c in candidates:
+                if c in d_all.columns:
+                    keep.append(c)
+                elif c.lower() in lower_map:
+                    keep.append(lower_map[c.lower()])
+            if len(keep) <= 1:
+                return pd.DataFrame()
+            d = d_all[keep].copy()
+            rename = {lower_map[c.lower()]: c for c in candidates if c.lower() in lower_map and lower_map[c.lower()] != c}
+            d = d.rename(columns=rename)
+            return _numeric_df(d)
+        except Exception:
+            return pd.DataFrame()
+
+
 def merge_new_cols(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
     if right is None or right.empty:
         return left
@@ -204,7 +245,7 @@ if drv_main.empty:
 else:
     df = merge_new_cols(df, drv_main)
 
-for fallback in [load_vix_fallback(), load_crypto_fallback(), load_fx_fallback(), load_yield_fallback()]:
+for fallback in [load_vix_fallback(), load_crypto_fallback(), load_fx_fallback(), load_yield_fallback(), load_m2_fallback()]:
     df = merge_new_cols(df, fallback)
 
 df = df.sort_values("date").drop_duplicates(subset=["date"]).reset_index(drop=True)
@@ -296,6 +337,10 @@ DRIVER_MAP = {
     "US 10Y Real (TIPS %)": "tips10y_real",
     "VIX": "vix_close",
     "BTC (BTCUSD)": "btc_close",
+    "M2 YoY (%)": "m2_yoy",
+    "Real M2 YoY (%)": "m2_real_yoy",
+    "M2 level": "m2",
+    "M2 velocity": "m2_vel",
 }
 
 with st.sidebar:
@@ -317,6 +362,7 @@ with st.sidebar:
     yield_drop_thr = st.number_input("Yield bullish als delta lager dan", -5.0, 5.0, 0.0, step=0.1)
     ratio_hi = st.slider("Gold/Silver ratio hoog", 50.0, 120.0, 85.0, 1.0)
     ratio_lo = st.slider("Gold/Silver ratio laag", 30.0, 90.0, 65.0, 1.0)
+    m2_impulse_thr = st.number_input("M2 liquidity impulse bullish boven", -5.0, 5.0, 0.0, step=0.1)
 
     st.divider()
     st.markdown("#### Correlatie / beta")
@@ -362,11 +408,11 @@ d["silver_z20"] = zscore(d["silver_close"], 20)
 
 driver_choices = [name for name, col in DRIVER_MAP.items() if col in d.columns and d[col].notna().any()]
 default_overlay = [
-    x for x in ["Gold (USD/oz)", "Gold/Silver ratio", "Copper (industrial proxy)", "DXY (Dollar Index)", "US 10Y Real (TIPS %)", "VIX"]
+    x for x in ["Gold (USD/oz)", "Gold/Silver ratio", "Copper (industrial proxy)", "DXY (Dollar Index)", "US 10Y Real (TIPS %)", "Real M2 YoY (%)", "VIX"]
     if x in driver_choices
 ]
 default_scatter = [
-    x for x in ["Gold (USD/oz)", "Copper (industrial proxy)", "DXY (Dollar Index)", "US 10Y (yield %)", "US 10Y Real (TIPS %)"]
+    x for x in ["Gold (USD/oz)", "Copper (industrial proxy)", "DXY (Dollar Index)", "US 10Y (yield %)", "US 10Y Real (TIPS %)", "Real M2 YoY (%)"]
     if x in driver_choices
 ]
 
@@ -375,6 +421,7 @@ with st.expander("Debug: driver-kolommen en non-null counts", expanded=False):
     dbg_cols = [
         "silver_close", "gold_close", "gold_silver_ratio", "copper_close",
         "dxy_close", "eurusd_close", "us10y", "tips10y_real", "vix_close", "btc_close",
+        "m2", "m2_real", "m2_yoy", "m2_real_yoy", "m2_vel", "m2_vel_yoy",
     ]
     st.write(
         {
@@ -397,7 +444,7 @@ k2.metric("Gold (USD/oz)", f"{gold_last:,.2f}" if pd.notna(gold_last) else "-")
 k3.metric("Gold/Silver ratio", f"{ratio_last:,.1f}" if pd.notna(ratio_last) else "-")
 k4.metric("Copper delta", pct_as_str(copper_dpct))
 k5.metric("DXY", f"{last_val(d, 'dxy_close'):.2f}" if pd.notna(last_val(d, "dxy_close")) else "-")
-k6.metric("Real 10Y", pct_as_str(last_val(d, "tips10y_real")))
+k6.metric("Real M2 YoY", pct_as_str(last_val(d, "m2_real_yoy")))
 
 # ---------- Signals ----------
 st.subheader("Signal dashboard")
@@ -427,6 +474,11 @@ for col, label, threshold in [
     delta = trend_delta(d, col, trend_look)
     if pd.notna(delta) and delta < threshold:
         alerts.append(("green", label, f"Delta {trend_look}d = {delta:.2f}"))
+
+for col, label in [("m2_yoy", "M2 YoY verbetert"), ("m2_real_yoy", "Real M2 YoY verbetert")]:
+    delta = trend_delta(d, col, trend_look)
+    if pd.notna(delta) and delta > m2_impulse_thr:
+        alerts.append(("green", label, f"Delta {trend_look}d = {delta:.2f}pp"))
 
 if "copper_close" in d.columns and d["copper_close"].notna().sum() > trend_look:
     c_delta = d["copper_close"].pct_change(trend_look).dropna()
@@ -542,6 +594,50 @@ st.plotly_chart(fig_m, use_container_width=True)
 
 st.divider()
 
+# ---------- Liquidity ----------
+liquidity_cols = [c for c in ["m2_yoy", "m2_real_yoy", "m2_vel_yoy"] if c in d.columns and d[c].notna().any()]
+level_cols = [c for c in ["m2", "m2_real", "m2_vel"] if c in d.columns and d[c].notna().any()]
+if liquidity_cols or level_cols:
+    st.subheader("Liquidity - M2 and velocity")
+    fig_l = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        subplot_titles=["M2 YoY / Real M2 YoY / Velocity YoY", "Silver vs liquidity levels (=100)"],
+        vertical_spacing=0.10,
+    )
+    liq_palette = {"m2_yoy": "#2563eb", "m2_real_yoy": "#16a34a", "m2_vel_yoy": "#dc2626"}
+    for c in liquidity_cols:
+        fig_l.add_trace(
+            go.Scatter(x=d["date"], y=d[c], name=c, line=dict(width=2, color=liq_palette.get(c, "#6B7280"))),
+            row=1,
+            col=1,
+        )
+    fig_l.add_hline(y=0, line_dash="dot", row=1, col=1)
+    fig_l.add_trace(
+        go.Scatter(x=d["date"], y=normalize_100(d["silver_close"]), name="Silver (=100)", line=dict(width=2.5, color="#111111")),
+        row=2,
+        col=1,
+    )
+    for c in level_cols:
+        fig_l.add_trace(go.Scatter(x=d["date"], y=normalize_100(d[c]), name=f"{c} (=100)", line=dict(width=2)), row=2, col=1)
+    fig_l.update_layout(height=620, margin=dict(l=10, r=10, t=60, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+    fig_l.update_yaxes(title_text="YoY %", row=1, col=1)
+    fig_l.update_yaxes(title_text="Index", row=2, col=1)
+    st.plotly_chart(fig_l, use_container_width=True)
+
+    notes = []
+    for c in ["m2_yoy", "m2_real_yoy"]:
+        val = last_val(d, c)
+        delta = trend_delta(d, c, trend_look)
+        if pd.notna(val) and pd.notna(delta):
+            direction = "verbetert" if delta > 0 else "verslechtert" if delta < 0 else "vlak"
+            notes.append(f"{c}: {val:.2f}% en {direction} over {trend_look} dagen ({delta:+.2f}pp)")
+    if notes:
+        st.info("Liquidity read-through: " + " | ".join(notes))
+
+st.divider()
+
 # ---------- Rolling correlations ----------
 st.subheader("Rolling correlaties - Silver vs drivers")
 sel_corr = st.multiselect("Kies drivers voor correlatie", options=driver_choices, default=default_overlay)
@@ -631,6 +727,12 @@ show_cols = [
     "eurusd_close",
     "us10y",
     "tips10y_real",
+    "m2",
+    "m2_real",
+    "m2_yoy",
+    "m2_real_yoy",
+    "m2_vel",
+    "m2_vel_yoy",
     "vix_close",
     "btc_close",
 ]
