@@ -1,200 +1,250 @@
+# =========================
+try:
+    if not bq_ping():
+        st.error("Geen BigQuery-verbinding.")
+        st.stop()
+except Exception as e:
+    st.error("Geen BigQuery-verbinding.")
+    st.caption(f"Details: {e}")
+    st.stop()
+
+# =========================
+# Data
+# =========================
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_aex():
+    return run_query(f"SELECT * FROM `{AEX_VIEW}` ORDER BY date")
 
 
-def build_summary(row):
-    trend = classify_trend(row)
-    strength = classify_trend_strength(row)
-    momentum = classify_momentum(row)
-    exhaustion = classify_exhaustion(row)
-    vol = classify_vol_regime(row)
+with st.spinner("AEX data laden..."):
+    df = load_aex()
 
-    parts = []
+if df.empty:
+    st.warning("Geen data in view.")
+    st.stop()
 
-    if trend in ["Strong Bull", "Bull"]:
-        parts.append(f"Trend is {trend.lower()} met {strength.lower()} trendkracht")
-    elif trend in ["Strong Bear", "Bear"]:
-        parts.append(f"Trend is {trend.lower()} met {strength.lower()} trendkracht")
+df["date"] = pd.to_datetime(df["date"])
+df = df[df["date"].dt.weekday < 5].copy()
+
+for c in ["open", "high", "low", "close", "vix_close", "delta_abs", "delta_pct"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+if "delta_abs" not in df.columns or df["delta_abs"].isna().all():
+    df["delta_abs"] = df["close"].diff()
+
+if "delta_pct" not in df.columns or df["delta_pct"].isna().all():
+    df["delta_pct"] = df["close"].pct_change() * 100.0
+
+# =========================
+# Defaults
+# =========================
+DEFAULTS = {
+    "ema_spans": [20, 50, 200],
+    "macd": (12, 26, 9),
+    "rsi_period": 14,
+    "adx_length": 14,
+    "donchian_n": 20,
+    "corr_win_default": 20,
+    "rsi_dyn_win": 252,
+}
+
+# =========================
+# Helpers
+# =========================
+def ema(s: pd.Series, span: int):
+    return s.ewm(span=span, adjust=False, min_periods=span).mean()
+
+
+def atr_rma(high, low, close, length: int):
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def donchian(d: pd.DataFrame, n=20):
+    return (
+        d["high"].rolling(n, min_periods=n).max(),
+        d["low"].rolling(n, min_periods=n).min(),
+    )
+
+
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    ema_slow = series.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def adx(df_: pd.DataFrame, length: int = 14):
+    high, low, close = df_["high"], df_["low"], df_["close"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr1 = (high - low).abs()
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1 / length, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df_.index).ewm(alpha=1 / length, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=df_.index).ewm(alpha=1 / length, adjust=False).mean() / atr
+
+    denom = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / denom
+    adx_val = dx.ewm(alpha=1 / length, adjust=False).mean()
+
+    return plus_di, minus_di, adx_val
+
+
+def rma(x: pd.Series, length: int):
+    return x.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def rsi_wilder(close: pd.Series, length: int = 14):
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = rma(up, length)
+    roll_down = rma(down, length)
+    rs = roll_up / roll_down.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def rolling_percentile(s: pd.Series, q: float, win: int = 252):
+    return s.rolling(win, min_periods=max(20, int(win * 0.6))).quantile(q)
+
+
+def zscore(series: pd.Series, win: int):
+    mean = series.rolling(win, min_periods=max(20, int(win * 0.6))).mean()
+    std = series.rolling(win, min_periods=max(20, int(win * 0.6))).std()
+    return (series - mean) / std.replace(0, np.nan)
+
+
+def slope_pct(series: pd.Series, lookback: int = 10):
+    return ((series / series.shift(lookback)) - 1.0) * 100.0
+
+
+def safe_last(series: pd.Series):
+    x = series.dropna()
+    if len(x) == 0:
+        return np.nan
+    return x.iloc[-1]
+
+
+def fmt_num(x, nd=2, suffix=""):
+    if pd.isna(x):
+        return "-"
+    return f"{x:.{nd}f}{suffix}"
+
+
+def ytd_return_full(full_df: pd.DataFrame):
+    sub = full_df.dropna(subset=["date", "close"]).copy()
+    if sub.empty:
+        return None
+    max_d = sub["date"].max()
+    start = pd.Timestamp(date(max_d.year, 1, 1))
+    sub = sub[sub["date"] >= start]
+    return (sub["close"].iloc[-1] / sub["close"].iloc[0] - 1) * 100 if len(sub) >= 2 else None
+
+
+def pytd_return_full(full_df: pd.DataFrame):
+    sub = full_df.dropna(subset=["date", "close"]).copy()
+    if sub.empty:
+        return None
+    max_d = sub["date"].max()
+    prev_year = max_d.year - 1
+    start = pd.Timestamp(date(prev_year, 1, 1))
+    try:
+        end = max_d.replace(year=prev_year)
+    except Exception:
+        end = pd.Timestamp(date(prev_year, 12, 31))
+    sub = sub[(sub["date"] >= start) & (sub["date"] <= end)]
+    return (sub["close"].iloc[-1] / sub["close"].iloc[0] - 1) * 100 if len(sub) >= 2 else None
+
+
+def heikin_ashi(src: pd.DataFrame):
+    ha = src.copy()
+    ha["ha_close"] = (ha["open"] + ha["high"] + ha["low"] + ha["close"]) / 4.0
+
+    ha_open = pd.Series(index=ha.index, dtype=float)
+    first_valid_idx = ha[["open", "close"]].dropna().index.min()
+
+    if pd.isna(first_valid_idx):
+        ha["ha_open"] = np.nan
+        ha["ha_high"] = np.nan
+        ha["ha_low"] = np.nan
+        return ha[["ha_open", "ha_high", "ha_low", "ha_close"]]
+
+    ha_open.loc[first_valid_idx] = (ha.loc[first_valid_idx, "open"] + ha.loc[first_valid_idx, "close"]) / 2.0
+    start_pos = ha.index.get_loc(first_valid_idx)
+
+    for i in range(start_pos + 1, len(ha)):
+        prev_idx = ha.index[i - 1]
+        cur_idx = ha.index[i]
+        if pd.notna(ha_open.loc[prev_idx]) and pd.notna(ha.loc[prev_idx, "ha_close"]):
+            ha_open.loc[cur_idx] = (ha_open.loc[prev_idx] + ha.loc[prev_idx, "ha_close"]) / 2.0
+        else:
+            ha_open.loc[cur_idx] = np.nan
+
+    ha["ha_open"] = ha_open
+    ha["ha_high"] = pd.concat([ha["high"], ha["ha_open"], ha["ha_close"]], axis=1).max(axis=1)
+    ha["ha_low"] = pd.concat([ha["low"], ha["ha_open"], ha["ha_close"]], axis=1).min(axis=1)
+
+    return ha[["ha_open", "ha_high", "ha_low", "ha_close"]]
+
+
+# =========================
+# Indicator calculation
+# =========================
+@st.cache_data(ttl=1800)
+def compute_indicators(full_df: pd.DataFrame):
+    dfx = full_df.copy()
+
+    for span in DEFAULTS["ema_spans"]:
+        dfx[f"ema{span}"] = ema(dfx["close"], span)
+
+    dfx["atr14"] = atr_rma(dfx["high"], dfx["low"], dfx["close"], 14)
+    dfx["macd_line"], dfx["macd_signal"], dfx["macd_hist"] = macd(dfx["close"], *DEFAULTS["macd"])
+    dfx["di_plus"], dfx["di_minus"], dfx["adx14"] = adx(dfx, DEFAULTS["adx_length"])
+
+    dfx["rsi14"] = rsi_wilder(dfx["close"], DEFAULTS["rsi_period"])
+    dfx["rsi14_s"] = dfx["rsi14"].ewm(span=5, adjust=False).mean()
+    dfx["rsi_dyn_hi"] = rolling_percentile(dfx["rsi14"], 0.80, DEFAULTS["rsi_dyn_win"])
+    dfx["rsi_dyn_lo"] = rolling_percentile(dfx["rsi14"], 0.20, DEFAULTS["rsi_dyn_win"])
+
+    dfx["dc_high"], dfx["dc_low"] = donchian(dfx, DEFAULTS["donchian_n"])
+    dfx["ema20_slope_10"] = slope_pct(dfx["ema20"], 10)
+    dfx["ema50_slope_10"] = slope_pct(dfx["ema50"], 10)
+
+    dfx["stretch_ema20_atr"] = (dfx["close"] - dfx["ema20"]) / dfx["atr14"].replace(0, np.nan)
+    dfx["stretch_ema50_atr"] = (dfx["close"] - dfx["ema50"]) / dfx["atr14"].replace(0, np.nan)
+    dfx["z20"] = zscore(dfx["close"], 20)
+    dfx["z50"] = zscore(dfx["close"], 50)
+    dfx["atr_pct_close"] = (dfx["atr14"] / dfx["close"]) * 100.0
+
+    dfx["rv_10"] = dfx["close"].pct_change().rolling(10).std() * np.sqrt(252) * 100.0
+    dfx["rv_20"] = dfx["close"].pct_change().rolling(20).std() * np.sqrt(252) * 100.0
+
+    if "vix_close" in dfx.columns:
+        vix_ma20 = dfx["vix_close"].rolling(20, min_periods=20).mean()
+        vix_sd20 = dfx["vix_close"].rolling(20, min_periods=20).std()
+        dfx["vix_z"] = (dfx["vix_close"] - vix_ma20) / vix_sd20.replace(0, np.nan)
+        dfx["vix_change_5d"] = dfx["vix_close"].pct_change(5) * 100.0
+        dfx["vix_rv20_spread"] = dfx["vix_close"] - dfx["rv_20"]
     else:
-        parts.append("Markt zit meer in een neutrale of overgangsfase")
-
-    if momentum != "Onvoldoende data":
-        parts.append(f"momentum oogt {momentum.lower()}")
-
-    if exhaustion == "Hoog":
-        parts.append("uitputting is hoog")
-    elif exhaustion == "Oplopend":
-        parts.append("uitputting loopt op")
-    else:
-        parts.append("uitputting blijft beperkt")
-
-    if vol != "Onvoldoende data":
-        parts.append(f"volatiliteitsregime staat op {vol.lower()}")
-
-    return ". ".join(parts) + "."
-
-
-d["macd_hist_prev"] = d["macd_hist"].shift(1)
-d["trend_label"] = d.apply(classify_trend, axis=1)
-d["trend_strength"] = d.apply(classify_trend_strength, axis=1)
-d["momentum_label"] = d.apply(classify_momentum, axis=1)
-d["exhaustion_label"] = d.apply(classify_exhaustion, axis=1)
-d["vol_regime"] = d.apply(classify_vol_regime, axis=1)
-
-state_ready = d.dropna(subset=["close"]).copy()
-last_state_row = state_ready.iloc[-1] if not state_ready.empty else d.iloc[-1]
-
-# =========================
-# Regime shading helper
-# =========================
-def add_regime_spans(fig, data, row=1, col=1):
-    colors = {
-        "Strong Bull": "rgba(0,140,70,0.08)",
-        "Bull": "rgba(0,180,90,0.05)",
-        "Neutral": "rgba(130,130,130,0.05)",
-        "Bear": "rgba(220,90,0,0.05)",
-        "Strong Bear": "rgba(200,0,0,0.08)",
-    }
-    lbl = data["trend_label"].fillna("Neutral")
-    if lbl.empty:
-        return
-
-    start_idx = 0
-    current = lbl.iloc[0]
-
-    for i in range(1, len(lbl)):
-        if lbl.iloc[i] != current:
-            fig.add_vrect(
-                x0=data["date"].iloc[start_idx],
-                x1=data["date"].iloc[i - 1],
-                fillcolor=colors.get(current, "rgba(130,130,130,0.04)"),
-                line_width=0,
-                row=row,
-                col=col,
-                layer="below",
-            )
-            start_idx = i
-            current = lbl.iloc[i]
-
-    fig.add_vrect(
-        x0=data["date"].iloc[start_idx],
-        x1=data["date"].iloc[len(lbl) - 1],
-        fillcolor=colors.get(current, "rgba(130,130,130,0.04)"),
-        line_width=0,
-        row=row,
-        col=col,
-        layer="below",
-    )
-
-
-# =========================
-# Top diagnostics
-# =========================
-summary_text = build_summary(last_state_row)
-ytd_full = ytd_return_full(df)
-
-last_close_val = safe_last(d["close"])
-last_delta_day = safe_last(d["close"].pct_change() * 100.0)
-last_vix_val = safe_last(d["vix_close"]) if "vix_close" in d.columns else np.nan
-last_rsi_val = safe_last(d["rsi14_s"])
-last_adx_val = safe_last(d["adx14"])
-last_macd_hist_val = safe_last(d["macd_hist"])
-last_stretch_val = safe_last(d["stretch_ema20_atr"])
-last_z20_val = safe_last(d["z20"])
-last_atr_pct_val = safe_last(d["atr_pct_close"])
-
-k1, k2, k3, k4, k5, k6, k7, k8, k9 = st.columns(9)
-k1.metric("Laatste close", fmt_num(last_close_val))
-k2.metric("Delta % dag", fmt_num(last_delta_day, 2, "%"))
-k3.metric("Trend", last_state_row["trend_label"])
-k4.metric("Trendkracht", last_state_row["trend_strength"])
-k5.metric("Momentum", last_state_row["momentum_label"])
-k6.metric("Uitputting", last_state_row["exhaustion_label"])
-k7.metric("Vol-regime", last_state_row["vol_regime"])
-k8.metric("YTD", fmt_num(ytd_full, 2, "%") if ytd_full is not None else "-")
-k9.metric("VIX", fmt_num(last_vix_val))
-
-st.info(summary_text)
-
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("RSI(14) smoothed", fmt_num(last_rsi_val))
-m2.metric("ADX(14)", fmt_num(last_adx_val))
-m3.metric("MACD hist", fmt_num(last_macd_hist_val, 3))
-m4.metric("Stretch vs EMA20", fmt_num(last_stretch_val, 2, " ATR"))
-m5.metric("Z-score 20d", fmt_num(last_z20_val, 2))
-m6.metric("ATR % close", fmt_num(last_atr_pct_val, 2, "%"))
-
-# =========================
-# Main chart: Heikin Ashi
-# =========================
-fig1 = make_subplots(
-    rows=1,
-    cols=1,
-    specs=[[{"secondary_y": True}]],
-    subplot_titles=["AEX Heikin Ashi + EMA20/50/200" + (" + VIX" if show_vix else "")]
-)
-
-if show_regime_shading:
-    add_regime_spans(fig1, d, row=1, col=1)
-
-ha_plot = d.dropna(subset=["ha_open", "ha_high", "ha_low", "ha_close"]).copy()
-
-fig1.add_trace(
-    go.Candlestick(
-        x=ha_plot["date"],
-        open=ha_plot["ha_open"],
-        high=ha_plot["ha_high"],
-        low=ha_plot["ha_low"],
-        close=ha_plot["ha_close"],
-        name="Heikin Ashi"
-    ),
-    row=1, col=1, secondary_y=False
-)
-
-for span in DEFAULTS["ema_spans"]:
-    fig1.add_trace(
-        go.Scatter(x=d["date"], y=d[f"ema{span}"], mode="lines", name=f"EMA{span}", line=dict(width=2)),
-        row=1, col=1, secondary_y=False
-    )
-
-if show_donchian:
-    fig1.add_trace(
-        go.Scatter(x=d["date"], y=d["dc_high"], mode="lines", name="DC High", line=dict(width=1, dash="dot")),
-        row=1, col=1, secondary_y=False
-    )
-    fig1.add_trace(
-        go.Scatter(x=d["date"], y=d["dc_low"], mode="lines", name="DC Low", line=dict(width=1, dash="dot")),
-        row=1, col=1, secondary_y=False
-    )
-
-if show_vix and "vix_close" in d.columns and d["vix_close"].notna().any():
-    fig1.add_trace(
-        go.Scatter(x=d["date"], y=d["vix_close"], mode="lines", name="VIX", line=dict(width=2)),
-        row=1, col=1, secondary_y=True
-    )
-
-fig1.update_layout(
-    height=700,
-    margin=dict(l=60, r=60, t=80, b=40),
-    legend_orientation="h",
-    legend_yanchor="top",
-    legend_y=1.08,
-    legend_x=0,
-    xaxis_rangeslider_visible=False,
-)
-fig1.update_xaxes(tickfont=dict(size=13))
-fig1.update_yaxes(title_text="AEX", row=1, col=1, tickfont=dict(size=13), secondary_y=False)
-fig1.update_yaxes(title_text="VIX", row=1, col=1, tickfont=dict(size=13), secondary_y=True)
-st.plotly_chart(fig1, use_container_width=True)
-
-# =========================
-# Momentum dashboard
-# =========================
-fig2 = make_subplots(
-    rows=4,
-    cols=1,
-    shared_xaxes=True,
-    subplot_titles=[
-        "RSI(14) Wilder + dynamische zones",
-        "MACD(12,26,9)",
-        "ADX(14) + DI",
-        "Stretch vs EMA20 in ATR",
-    ],
+        dfx["vix_close"] = np.nan
+        dfx["vix_z"] = np.nan
