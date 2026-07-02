@@ -84,8 +84,7 @@ def as_date(v):
 
 # BigQuery
 MAX_BYTES_BILLED = 2 * 1024**3
-BQ_LOCATION = st.secrets.get("BQ_LOCATION", "EU")
-
+BQ_LOCATION = "europe-west1"
 
 @st.cache_resource(show_spinner=False)
 def get_bq_client():
