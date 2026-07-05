@@ -293,9 +293,9 @@ if "silver_close" not in df.columns:
     st.stop()
 
 drv_main = load_drv_main()
-if drv_main.empty:
-    st.warning(f"Drivers-view niet gevonden of geen rechten: `{DRIVERS_WIDE_VIEW}`. Fallback-bronnen ingeschakeld.")
-else:
+drivers_view_status = "fallback"
+if not drv_main.empty:
+    drivers_view_status = "loaded"
     df = merge_new_cols(df, drv_main)
 
 for fallback in [load_vix_fallback(), load_crypto_fallback(), load_fx_fallback(), load_yield_fallback(), load_m2_fallback()]:
@@ -329,6 +329,37 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
+
+
+def heikin_ashi(src: pd.DataFrame) -> pd.DataFrame:
+    ha = src.copy()
+    ha["ha_close"] = (ha["open"] + ha["high"] + ha["low"] + ha["close"]) / 4.0
+
+    ha_open = pd.Series(index=ha.index, dtype=float)
+    first_valid_idx = ha[["open", "close"]].dropna().index.min()
+    if pd.isna(first_valid_idx):
+        return pd.DataFrame(
+            {
+                "ha_open": np.nan,
+                "ha_high": np.nan,
+                "ha_low": np.nan,
+                "ha_close": np.nan,
+            },
+            index=ha.index,
+        )
+
+    ha_open.loc[first_valid_idx] = (ha.loc[first_valid_idx, "open"] + ha.loc[first_valid_idx, "close"]) / 2.0
+    start_pos = ha.index.get_loc(first_valid_idx)
+    for i in range(start_pos + 1, len(ha)):
+        prev_idx = ha.index[i - 1]
+        cur_idx = ha.index[i]
+        if pd.notna(ha_open.loc[prev_idx]) and pd.notna(ha.loc[prev_idx, "ha_close"]):
+            ha_open.loc[cur_idx] = (ha_open.loc[prev_idx] + ha.loc[prev_idx, "ha_close"]) / 2.0
+
+    ha["ha_open"] = ha_open
+    ha["ha_high"] = pd.concat([ha["high"], ha["ha_open"], ha["ha_close"]], axis=1).max(axis=1)
+    ha["ha_low"] = pd.concat([ha["low"], ha["ha_open"], ha["ha_close"]], axis=1).min(axis=1)
+    return ha[["ha_open", "ha_high", "ha_low", "ha_close"]]
 
 
 def zscore(s: pd.Series, win: int = 20) -> pd.Series:
@@ -652,6 +683,8 @@ with st.expander("Debug: driver-kolommen en non-null counts", expanded=False):
     ]
     st.write(
         {
+            "drivers_view_status": drivers_view_status,
+            "drivers_view": DRIVERS_WIDE_VIEW,
             "present": {c: c in df.columns or c in d.columns for c in dbg_cols},
             "notna_count_in_range": {c: int(d[c].notna().sum()) if c in d.columns else 0 for c in dbg_cols},
         }
@@ -888,6 +921,96 @@ if show_delta:
     fig_d.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
     fig_d.update_yaxes(title_text="Delta % dag")
     st.plotly_chart(fig_d, use_container_width=True)
+
+# ---------- TA chart ----------
+st.subheader("Silver TA - Heikin Ashi, trend and momentum")
+real_ohlc_cols = ["silver_open", "silver_high", "silver_low", "silver_close"]
+has_real_ohlc = all(c in d.columns and d[c].notna().any() for c in real_ohlc_cols)
+
+if has_real_ohlc:
+    ta_ohlc = d[["date", "silver_open", "silver_high", "silver_low", "silver_close"]].rename(
+        columns={
+            "silver_open": "open",
+            "silver_high": "high",
+            "silver_low": "low",
+            "silver_close": "close",
+        }
+    ).copy()
+    ohlc_note = "Heikin Ashi op basis van echte OHLC-kolommen."
+else:
+    ta_ohlc = d[["date", "silver_close"]].copy()
+    ta_ohlc["open"] = ta_ohlc["silver_close"].shift(1).fillna(ta_ohlc["silver_close"])
+    ta_ohlc["close"] = ta_ohlc["silver_close"]
+    ta_ohlc["high"] = ta_ohlc[["open", "close"]].max(axis=1)
+    ta_ohlc["low"] = ta_ohlc[["open", "close"]].min(axis=1)
+    ohlc_note = "Geen echte silver OHLC-kolommen gevonden; candles zijn synthetisch uit close-to-close beweging."
+
+ha = heikin_ashi(ta_ohlc[["open", "high", "low", "close"]])
+ta_plot = pd.concat([ta_ohlc[["date", "close"]], ha], axis=1).dropna(subset=["ha_open", "ha_high", "ha_low", "ha_close"])
+
+fig_ta = make_subplots(
+    rows=3,
+    cols=1,
+    shared_xaxes=True,
+    subplot_titles=["Heikin Ashi + trend EMA's", f"RSI({rsi_period})", "MACD(12,26,9)"],
+    row_heights=[0.58, 0.20, 0.22],
+    vertical_spacing=0.06,
+)
+
+fig_ta.add_trace(
+    go.Candlestick(
+        x=ta_plot["date"],
+        open=ta_plot["ha_open"],
+        high=ta_plot["ha_high"],
+        low=ta_plot["ha_low"],
+        close=ta_plot["ha_close"],
+        name="Heikin Ashi",
+    ),
+    row=1,
+    col=1,
+)
+
+for span, color in [(ema_fast, "#E69F00"), (ema_mid, "#009E73"), (ema_slow, "#0072B2")]:
+    ema_col = f"silver_ema{span}"
+    if ema_col in d.columns and d[ema_col].notna().any():
+        fig_ta.add_trace(
+            go.Scatter(x=d["date"], y=d[ema_col], name=f"EMA{span}", line=dict(width=2, color=color)),
+            row=1,
+            col=1,
+        )
+
+fig_ta.add_trace(go.Scatter(x=d["date"], y=d["silver_rsi"], name="RSI", line=dict(width=2)), row=2, col=1)
+fig_ta.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+fig_ta.add_hline(y=50, line_dash="dot", row=2, col=1)
+fig_ta.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+
+fig_ta.add_trace(go.Scatter(x=d["date"], y=d["silver_macd_line"], name="MACD", line=dict(width=2)), row=3, col=1)
+fig_ta.add_trace(go.Scatter(x=d["date"], y=d["silver_macd_signal"], name="Signal", line=dict(width=2)), row=3, col=1)
+fig_ta.add_trace(
+    go.Bar(
+        x=d["date"],
+        y=d["silver_macd_hist"],
+        name="Hist",
+        marker_color=np.where(d["silver_macd_hist"] >= 0, "rgba(16,150,24,0.65)", "rgba(239,68,68,0.65)"),
+    ),
+    row=3,
+    col=1,
+)
+fig_ta.add_hline(y=0, line_dash="dot", row=3, col=1)
+
+price_range = padded_range([ta_plot["ha_low"], ta_plot["ha_high"], d[f"silver_ema{ema_mid}"], d[f"silver_ema{ema_slow}"]])
+fig_ta.update_layout(
+    height=900,
+    margin=dict(l=10, r=10, t=70, b=30),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    xaxis_rangeslider_visible=False,
+)
+fig_ta.update_yaxes(title_text="Silver", range=price_range, row=1, col=1)
+fig_ta.update_yaxes(title_text="RSI", range=[0, 100], row=2, col=1)
+fig_ta.update_yaxes(title_text="MACD", row=3, col=1)
+fig_ta.update_xaxes(rangeslider_visible=False)
+st.plotly_chart(fig_ta, use_container_width=True)
+st.caption(ohlc_note)
 
 # ---------- Ratio and momentum ----------
 if "gold_silver_ratio" in d.columns:
