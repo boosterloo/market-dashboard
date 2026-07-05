@@ -91,6 +91,16 @@ def _numeric_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def best_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    lower = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c in df.columns:
+            return c
+        if c.lower() in lower:
+            return lower[c.lower()]
+    return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_com() -> pd.DataFrame:
     df = run_query(f"SELECT * FROM `{COM_WIDE_VIEW}` ORDER BY date")
@@ -139,8 +149,10 @@ def load_fx_fallback() -> pd.DataFrame:
     merged = None
     for sql in [
         f"SELECT date, dxy_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
+        f"SELECT date, dxy AS dxy_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
         f"SELECT date, DXY AS dxy_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
         f"SELECT date, eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
+        f"SELECT date, eurusd AS eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
         f"SELECT date, EURUSD AS eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
     ]:
         try:
@@ -151,7 +163,27 @@ def load_fx_fallback() -> pd.DataFrame:
             merged = d if merged is None else pd.merge(merged, d, on="date", how="outer")
         except Exception:
             continue
-    return merged if merged is not None else pd.DataFrame()
+    if merged is not None:
+        return merged
+    try:
+        d_all = run_query(f"SELECT * FROM `{FX_WIDE_VIEW}` ORDER BY date")
+        if d_all.empty:
+            return pd.DataFrame()
+        dxy_col = best_col(d_all, ["dxy_close", "dxy", "DXY", "dollar_index", "usd_index"])
+        eurusd_col = best_col(d_all, ["eurusd_close", "eurusd", "EURUSD", "eur_usd"])
+        keep = ["date"]
+        rename = {}
+        if dxy_col:
+            keep.append(dxy_col)
+            rename[dxy_col] = "dxy_close"
+        if eurusd_col and eurusd_col not in keep:
+            keep.append(eurusd_col)
+            rename[eurusd_col] = "eurusd_close"
+        if len(keep) <= 1:
+            return pd.DataFrame()
+        return _numeric_df(d_all[keep].rename(columns=rename))
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -161,8 +193,10 @@ def load_yield_fallback() -> pd.DataFrame:
         f"SELECT date, y_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
         f"SELECT date, y_10y_synth AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
         f"SELECT date, us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, us_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
         f"SELECT date, y_10y AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
         f"SELECT date, y_10y_synth AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, us_10y AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
     ]:
         try:
             d = run_query(sql)
@@ -174,7 +208,26 @@ def load_yield_fallback() -> pd.DataFrame:
             continue
     if merged is not None:
         merged = merged.loc[:, ~merged.columns.duplicated()]
-    return merged if merged is not None else pd.DataFrame()
+        return merged
+    try:
+        d_all = run_query(f"SELECT * FROM `{US_YIELD_VIEW}` ORDER BY date")
+        if d_all.empty:
+            return pd.DataFrame()
+        us10y_col = best_col(d_all, ["us10y", "y_10y", "y_10y_synth", "us_10y", "rate_10y", "tenor_10y", "yield_10y"])
+        real10y_col = best_col(d_all, ["tips10y_real", "real10y", "real_10y", "tips_10y", "tips10y", "y_10y_real"])
+        keep = ["date"]
+        rename = {}
+        if us10y_col:
+            keep.append(us10y_col)
+            rename[us10y_col] = "us10y"
+        if real10y_col and real10y_col not in keep:
+            keep.append(real10y_col)
+            rename[real10y_col] = "tips10y_real"
+        if len(keep) <= 1:
+            return pd.DataFrame()
+        return _numeric_df(d_all[keep].rename(columns=rename))
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -582,7 +635,7 @@ d["macro_detail"] = macro_detail
 
 driver_choices = [name for name, col in DRIVER_MAP.items() if col in d.columns and d[col].notna().any()]
 default_overlay = [
-    x for x in ["Gold (USD/oz)", "Gold/Silver ratio", "Copper (industrial proxy)", "DXY (Dollar Index)", "US 10Y Real (TIPS %)", "Real M2 YoY (%)", "VIX"]
+    x for x in ["Gold (USD/oz)", "Gold/Silver ratio", "Copper (industrial proxy)", "DXY (Dollar Index)", "US 10Y (yield %)", "US 10Y Real (TIPS %)", "Real M2 YoY (%)", "VIX"]
     if x in driver_choices
 ]
 default_scatter = [
@@ -646,6 +699,65 @@ with st.expander("Hoe wordt deze diagnose gelezen?", expanded=False):
         - **Macro bias** combineert DXY, real yield, real M2 YoY en koper over de gekozen driver-lookback.
         """
     )
+
+macro_watch = [
+    ("DXY", "dxy_close", "level", "Dollar sterker is meestal druk op metalen."),
+    ("US 10Y", "us10y", "pp", "Nominale rente; hogere rente verhoogt opportunity cost."),
+    ("US 10Y real", "tips10y_real", "pp", "Reele rente is vaak belangrijker voor precious metals."),
+    ("M2 YoY", "m2_yoy", "pp", "Liquiditeitsgroei kan risk assets en metals ondersteunen."),
+    ("Real M2 YoY", "m2_real_yoy", "pp", "Inflatie-gecorrigeerde liquiditeitsimpuls."),
+]
+available_macro_watch = [(label, col, unit, note) for label, col, unit, note in macro_watch if col in d.columns and d[col].notna().any()]
+if available_macro_watch:
+    st.subheader("Dollar, rates & liquidity")
+    macro_cols = st.columns(min(5, len(available_macro_watch)))
+    for i, (label, col, unit, _) in enumerate(available_macro_watch[:5]):
+        val = last_val(d, col)
+        delta = trend_delta(d, col, trend_look)
+        if unit == "pp":
+            value_text = pct_as_str(val)
+            delta_text = f"{delta:+.2f}pp / {trend_look}d" if pd.notna(delta) else None
+        else:
+            value_text = f"{val:,.2f}" if pd.notna(val) else "-"
+            delta_text = f"{delta:+.2f} / {trend_look}d" if pd.notna(delta) else None
+        macro_cols[i].metric(label, value_text, delta_text)
+
+    fig_macro = go.Figure()
+    fig_macro.add_trace(
+        go.Scatter(
+            x=d["date"],
+            y=normalize_100(d["silver_close"]),
+            name="Silver (=100)",
+            line=dict(width=2.5, color="#111111"),
+        )
+    )
+    macro_palette = {
+        "dxy_close": "#ef4444",
+        "us10y": "#2563eb",
+        "tips10y_real": "#7c3aed",
+        "m2_yoy": "#16a34a",
+        "m2_real_yoy": "#059669",
+    }
+    for label, col, _, _ in available_macro_watch:
+        fig_macro.add_trace(
+            go.Scatter(
+                x=d["date"],
+                y=normalize_100(d[col]),
+                name=f"{label} (=100)",
+                line=dict(width=2, color=macro_palette.get(col, "#6b7280")),
+            )
+        )
+    fig_macro.update_layout(
+        height=420,
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        yaxis_title="Index (=100)",
+    )
+    st.plotly_chart(fig_macro, use_container_width=True)
+
+    with st.expander("Waarom deze macrofactoren?", expanded=False):
+        for label, _, _, note in available_macro_watch:
+            st.markdown(f"- **{label}**: {note}")
 
 # ---------- Signals ----------
 st.subheader("Signal dashboard")
