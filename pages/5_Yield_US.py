@@ -149,6 +149,26 @@ def normalize_utc_today() -> pd.Timestamp:
         now_utc = now_utc.tz_localize(None)
     return now_utc.normalize()
 
+def padded_range(series_list, pad_frac: float = 0.08, min_pad: float = 0.02, include_zero: bool = False):
+    vals = []
+    for s in series_list:
+        if s is None:
+            continue
+        arr = pd.to_numeric(pd.Series(s), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        if not arr.empty:
+            vals.append(arr)
+    if not vals:
+        return None
+    combined = pd.concat(vals, ignore_index=True)
+    lo, hi = float(combined.min()), float(combined.max())
+    if include_zero:
+        lo, hi = min(lo, 0.0), max(hi, 0.0)
+    span = hi - lo
+    pad = max(span * pad_frac, min_pad)
+    if span == 0:
+        pad = max(abs(hi) * pad_frac, min_pad)
+    return [lo - pad, hi + pad]
+
 # ── Data ────────────────────────────────────────────────────────────────────
 with st.spinner("US data laden uit BigQuery…"):
     US = load_us_view(US_VIEW)
@@ -427,12 +447,17 @@ default_sel = [n for c, n in available_mats]
 label_to_col = {n: c for c, n in available_mats}
 chosen_labels = st.multiselect("Toon termijnen", options=[n for _,n in available_mats], default=default_sel)
 fig1 = go.Figure()
+fig1_series = []
 for lbl in chosen_labels:
     col = label_to_col.get(lbl)
     if col:
         fig1.add_trace(go.Scatter(x=US["date"], y=US[col], name=lbl, mode="lines"))
+        fig1_series.append(US[col])
 fig1.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Yield (%)", xaxis_title="Date")
 fig1.update_xaxes(range=[start_date, end_date])
+yr = padded_range(fig1_series)
+if yr:
+    fig1.update_yaxes(range=yr, fixedrange=False)
 st.plotly_chart(fig1, use_container_width=True)
 
 # ── Spreads & NTFS ──────────────────────────────────────────────────────────
@@ -445,21 +470,32 @@ with scol2:
 with scol3:
     show_ntfs = st.checkbox("Toon NTFS", value=("ntfs" in US.columns))
 fig2 = go.Figure()
+fig2_series = []
 if show_10_2:
     if "spread_10_2" in US.columns and US["spread_10_2"].notna().any():
         fig2.add_trace(go.Scatter(x=US["date"], y=US["spread_10_2"], name="10Y–2Y", mode="lines"))
+        fig2_series.append(US["spread_10_2"])
     elif {"y_10y","y_2y"}.issubset(US.columns):
-        fig2.add_trace(go.Scatter(x=US["date"], y=US["y_10y"]-US["y_2y"], name="10Y–2Y (calc)", mode="lines"))
+        calc = US["y_10y"]-US["y_2y"]
+        fig2.add_trace(go.Scatter(x=US["date"], y=calc, name="10Y–2Y (calc)", mode="lines"))
+        fig2_series.append(calc)
 if show_30_10:
     if "spread_30_10" in US.columns and US["spread_30_10"].notna().any():
         fig2.add_trace(go.Scatter(x=US["date"], y=US["spread_30_10"], name="30Y–10Y", mode="lines"))
+        fig2_series.append(US["spread_30_10"])
     elif {"y_30y","y_10y"}.issubset(US.columns):
-        fig2.add_trace(go.Scatter(x=US["date"], y=US["y_30y"]-US["y_10y"], name="30Y–10Y (calc)", mode="lines"))
+        calc = US["y_30y"]-US["y_10y"]
+        fig2.add_trace(go.Scatter(x=US["date"], y=calc, name="30Y–10Y (calc)", mode="lines"))
+        fig2_series.append(calc)
 if show_ntfs and "ntfs" in US.columns:
     fig2.add_trace(go.Scatter(x=US["date"], y=US["ntfs"], name="NTFS", mode="lines"))
+    fig2_series.append(US["ntfs"])
     fig2.add_hline(y=0.0, line_width=1, line_color="gray", opacity=0.5)
 fig2.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Spread (pp)", xaxis_title="Date")
 fig2.update_xaxes(range=[start_date, end_date])
+yr = padded_range(fig2_series, include_zero=True)
+if yr:
+    fig2.update_yaxes(range=yr, fixedrange=False)
 st.plotly_chart(fig2, use_container_width=True)
 
 # ── 10Y Nominaal / Reëel / Breakeven ────────────────────────────────────────
@@ -474,6 +510,16 @@ if has_nom10 or has_real or has_be10:
     if has_be10:  fig3.add_trace(go.Scatter(x=US["date"], y=US["breakeven_10y"], name="10Y Breakeven", mode="lines"))
     fig3.update_layout(margin=dict(l=10,r=10,t=10,b=10), yaxis_title="%", xaxis_title="Date")
     fig3.update_xaxes(range=[start_date, end_date])
+    fig3_series = []
+    if has_nom10:
+        fig3_series.append(US["y_10y"])
+    if has_real:
+        fig3_series.append(US["real_10y"])
+    if has_be10:
+        fig3_series.append(US["breakeven_10y"])
+    yr = padded_range(fig3_series)
+    if yr:
+        fig3.update_yaxes(range=yr, fixedrange=False)
     st.plotly_chart(fig3, use_container_width=True)
     with st.expander("ℹ️ Reëel & breakeven — wat zie je hier?"):
         if has_real and has_be10:
@@ -531,10 +577,11 @@ if has_real:
     fig_real.add_trace(go.Scatter(x=US["date"], y=US["real_10y"], name="10Y Reeel (TIPS)", mode="lines"), row=1, col=1)
     if has_be10:
         fig_real.add_trace(go.Scatter(x=US["date"], y=US["breakeven_10y"], name="10Y Breakeven", mode="lines"), row=1, col=1)
+    real_dd = pd.to_numeric(US["real_10y"], errors="coerce").diff() * 100.0
     fig_real.add_trace(
         go.Bar(
             x=US["date"],
-            y=pd.to_numeric(US["real_10y"], errors="coerce").diff() * 100.0,
+            y=real_dd,
             name="Reeel d/d (bp)",
             opacity=0.45,
         ),
@@ -547,8 +594,15 @@ if has_real:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         barmode="relative",
     )
-    fig_real.update_yaxes(title_text="%", row=1, col=1)
-    fig_real.update_yaxes(title_text="bp", row=2, col=1)
+    level_series = [US["real_10y"]]
+    if has_nom10:
+        level_series.append(US["y_10y"])
+    if has_be10:
+        level_series.append(US["breakeven_10y"])
+    yr_levels = padded_range(level_series)
+    yr_bars = padded_range([real_dd], include_zero=True, min_pad=1.0)
+    fig_real.update_yaxes(title_text="%", range=yr_levels, fixedrange=False, row=1, col=1)
+    fig_real.update_yaxes(title_text="bp", range=yr_bars, fixedrange=False, row=2, col=1)
     fig_real.update_xaxes(range=[start_date, end_date])
     st.plotly_chart(fig_real, use_container_width=True)
     st.caption("Reele rente stijgt = vaak strakker voor risk assets en precious metals. Breakeven stijgt = meer inflatieverwachting in de nominale 10Y.")
@@ -607,6 +661,9 @@ figd.add_trace(go.Bar(x=US["date"], y=USd, name=f"US Δ{delta_h}", opacity=0.7))
 figd.add_hline(y=0, line_width=1, line_color="gray", opacity=0.5)
 figd.update_layout(margin=dict(l=10,r=10,t=10,b=10), barmode="overlay", yaxis_title="Δ (bp)", xaxis_title="Date")
 figd.update_xaxes(range=[start_date, end_date])
+yr = padded_range([USd], include_zero=True, min_pad=1.0)
+if yr:
+    figd.update_yaxes(range=yr, fixedrange=False)
 st.plotly_chart(figd, use_container_width=True)
 
 # ── Tabel & CSV ─────────────────────────────────────────────────────────────
