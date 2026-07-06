@@ -484,8 +484,11 @@ if has_nom10 or has_real or has_be10:
             st.markdown("Grafiek toont de beschikbare componenten; compleet = zowel `real_10y` (TIPS) als `breakeven_10y`.")
 
 # ── Deltas ──────────────────────────────────────────────────────────────────
+st.subheader("Reele rente - impuls")
+if not has_real:
+    st.info("Reele rente is nog niet beschikbaar in de geladen BigQuery-bron. De pagina probeert `real_10y`, `tips10y_real`, `real10y` en `y_10y_real` uit de US-view en uit `marketdata.yield_curve_latest_v` te laden.")
+
 if has_real:
-    st.subheader("Reele rente - impuls")
 
     real_s = US[["date", "real_10y"]].dropna()
     real_delta_7d = None
