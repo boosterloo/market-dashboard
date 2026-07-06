@@ -19,6 +19,7 @@ TABLES     = st.secrets.get("tables", {})
 
 PROJECT_ID = (SECRETS_SA or {}).get("project_id") or st.secrets.get("project_id") or ""
 US_VIEW    = TABLES.get("us_yield_view", f"{PROJECT_ID}.marketdata.us_yield_curve_enriched_v")
+US_REAL_FALLBACK = TABLES.get("us_yield_real_view", f"{PROJECT_ID}.marketdata.yield_curve_latest_v")
 US_TIPS    = TABLES.get("us_tips_view", None)       # real_10y, breakeven_10y, breakeven_5y
 US_ACM     = TABLES.get("us_acm_tp_view", None)     # acm_term_premium_10y
 US_FWD     = TABLES.get("us_forward_view", None)    # ntfs / near_term_forward_spread
@@ -151,13 +152,15 @@ def normalize_utc_today() -> pd.Timestamp:
 # ── Data ────────────────────────────────────────────────────────────────────
 with st.spinner("US data laden uit BigQuery…"):
     US = load_us_view(US_VIEW)
+    REAL_FALLBACK = load_optional_view(US_REAL_FALLBACK, ["real_10y","tips10y_real","breakeven_10y"],
+                                       {"real_10y":"real_10y","tips10y_real":"real_10y","breakeven_10y":"breakeven_10y"})
     TIPS = load_optional_view(US_TIPS, ["real_10y","tips10y_real","breakeven_10y","breakeven_5y"],
                               {"real_10y":"real_10y","tips10y_real":"real_10y","breakeven_10y":"breakeven_10y","breakeven_5y":"breakeven_5y"})
     FWD  = load_optional_view(US_FWD,  ["ntfs","fwd_18m_3m_minus_3m","near_term_forward_spread"],
                               {"fwd_18m_3m_minus_3m":"ntfs","near_term_forward_spread":"ntfs"})
     ACM  = load_optional_view(US_ACM,  ["acm_term_premium_10y","acm_tp_10y"],
                               {"acm_tp_10y":"acm_term_premium_10y"})
-    for extra in [TIPS, FWD, ACM]:
+    for extra in [REAL_FALLBACK, TIPS, FWD, ACM]:
         if not extra.empty:
             US = pd.merge(US, extra, on="date", how="left")
 
