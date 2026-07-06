@@ -70,7 +70,11 @@ def load_us_view(fqtn: str) -> pd.DataFrame:
         if src in cols: sel.append(f"SAFE_CAST({src} AS FLOAT64) AS {alias}")
     for s in ["spread_10_2","spread_30_10"]:
         if s in cols: sel.append(f"SAFE_CAST({s} AS FLOAT64) AS {s}")
-    for r in ["real_10y","breakeven_10y","breakeven_5y"]:
+    for src in ["real_10y", "tips10y_real", "real10y", "y_10y_real"]:
+        if src in cols:
+            sel.append(f"SAFE_CAST({src} AS FLOAT64) AS real_10y")
+            break
+    for r in ["breakeven_10y","breakeven_5y"]:
         if r in cols: sel.append(f"SAFE_CAST({r} AS FLOAT64) AS {r}")
     for f in ["ntfs","fwd_18m_3m_minus_3m","near_term_forward_spread"]:
         if f in cols: sel.append(f"SAFE_CAST({f} AS FLOAT64) AS ntfs")
@@ -103,6 +107,20 @@ def load_optional_view(fqtn: str | None, cols_wanted: list[str], rename_map: dic
     df["date"] = pd.to_datetime(df["date"])
     return df
 
+def coalesce_duplicate_columns(df: pd.DataFrame, base_cols: list[str]) -> pd.DataFrame:
+    for base in base_cols:
+        candidates = [c for c in [base, f"{base}_x", f"{base}_y"] if c in df.columns]
+        if not candidates:
+            continue
+        merged = pd.to_numeric(df[candidates[0]], errors="coerce")
+        for c in candidates[1:]:
+            merged = merged.combine_first(pd.to_numeric(df[c], errors="coerce"))
+        df[base] = merged
+        drop_cols = [c for c in candidates if c != base]
+        if drop_cols:
+            df = df.drop(columns=drop_cols)
+    return df
+
 # ── Tijd helpers ─────────────────────────────────────────────────────────────
 def _to_naive(ts: pd.Timestamp) -> pd.Timestamp:
     ts = pd.Timestamp(ts)
@@ -133,8 +151,8 @@ def normalize_utc_today() -> pd.Timestamp:
 # ── Data ────────────────────────────────────────────────────────────────────
 with st.spinner("US data laden uit BigQuery…"):
     US = load_us_view(US_VIEW)
-    TIPS = load_optional_view(US_TIPS, ["real_10y","breakeven_10y","breakeven_5y"],
-                              {"real_10y":"real_10y","breakeven_10y":"breakeven_10y","breakeven_5y":"breakeven_5y"})
+    TIPS = load_optional_view(US_TIPS, ["real_10y","tips10y_real","breakeven_10y","breakeven_5y"],
+                              {"real_10y":"real_10y","tips10y_real":"real_10y","breakeven_10y":"breakeven_10y","breakeven_5y":"breakeven_5y"})
     FWD  = load_optional_view(US_FWD,  ["ntfs","fwd_18m_3m_minus_3m","near_term_forward_spread"],
                               {"fwd_18m_3m_minus_3m":"ntfs","near_term_forward_spread":"ntfs"})
     ACM  = load_optional_view(US_ACM,  ["acm_term_premium_10y","acm_tp_10y"],
@@ -142,6 +160,14 @@ with st.spinner("US data laden uit BigQuery…"):
     for extra in [TIPS, FWD, ACM]:
         if not extra.empty:
             US = pd.merge(US, extra, on="date", how="left")
+
+US = coalesce_duplicate_columns(US, ["real_10y", "breakeven_10y", "breakeven_5y", "ntfs", "acm_term_premium_10y"])
+if {"y_10y", "real_10y"}.issubset(US.columns):
+    implied_be = pd.to_numeric(US["y_10y"], errors="coerce") - pd.to_numeric(US["real_10y"], errors="coerce")
+    if "breakeven_10y" in US.columns:
+        US["breakeven_10y"] = pd.to_numeric(US["breakeven_10y"], errors="coerce").combine_first(implied_be)
+    else:
+        US["breakeven_10y"] = implied_be
 
 if US.empty:
     st.error("Geen US data gevonden. Check je view/secrets.")
@@ -455,6 +481,72 @@ if has_nom10 or has_real or has_be10:
             st.markdown("Grafiek toont de beschikbare componenten; compleet = zowel `real_10y` (TIPS) als `breakeven_10y`.")
 
 # ── Deltas ──────────────────────────────────────────────────────────────────
+if has_real:
+    st.subheader("Reele rente - impuls")
+
+    real_s = US[["date", "real_10y"]].dropna()
+    real_delta_7d = None
+    real_delta_30d = None
+    be_delta_30d = None
+
+    if not real_s.empty:
+        last_real_row = real_s.iloc[-1]
+        ref7 = row_at_or_before(real_s, pd.Timestamp(last_real_row["date"]) - pd.Timedelta(days=7))
+        ref30 = row_at_or_before(real_s, pd.Timestamp(last_real_row["date"]) - pd.Timedelta(days=30))
+        if ref7 is not None:
+            real_delta_7d = (float(last_real_row["real_10y"]) - float(ref7["real_10y"])) * 100.0
+        if ref30 is not None:
+            real_delta_30d = (float(last_real_row["real_10y"]) - float(ref30["real_10y"])) * 100.0
+
+    if has_be10:
+        be_s = US[["date", "breakeven_10y"]].dropna()
+        if not be_s.empty:
+            last_be_row = be_s.iloc[-1]
+            ref30_be = row_at_or_before(be_s, pd.Timestamp(last_be_row["date"]) - pd.Timedelta(days=30))
+            if ref30_be is not None:
+                be_delta_30d = (float(last_be_row["breakeven_10y"]) - float(ref30_be["breakeven_10y"])) * 100.0
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("10Y reeel", fmt(real10))
+    d2.metric("Reeel 7d", fmt_bp(real_delta_7d / 100.0) if real_delta_7d is not None else "—")
+    d3.metric("Reeel 30d", fmt_bp(real_delta_30d / 100.0) if real_delta_30d is not None else "—")
+    d4.metric("Breakeven 30d", fmt_bp(be_delta_30d / 100.0) if be_delta_30d is not None else "—")
+
+    fig_real = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        row_heights=[0.7, 0.3],
+        subplot_titles=("10Y nominaal, reeel en breakeven", "Dagelijkse verandering reele rente"),
+    )
+    if has_nom10:
+        fig_real.add_trace(go.Scatter(x=US["date"], y=US["y_10y"], name="10Y Nominaal", mode="lines"), row=1, col=1)
+    fig_real.add_trace(go.Scatter(x=US["date"], y=US["real_10y"], name="10Y Reeel (TIPS)", mode="lines"), row=1, col=1)
+    if has_be10:
+        fig_real.add_trace(go.Scatter(x=US["date"], y=US["breakeven_10y"], name="10Y Breakeven", mode="lines"), row=1, col=1)
+    fig_real.add_trace(
+        go.Bar(
+            x=US["date"],
+            y=pd.to_numeric(US["real_10y"], errors="coerce").diff() * 100.0,
+            name="Reeel d/d (bp)",
+            opacity=0.45,
+        ),
+        row=2,
+        col=1,
+    )
+    fig_real.add_hline(y=0.0, line_width=1, line_color="gray", opacity=0.4, row=2, col=1)
+    fig_real.update_layout(
+        margin=dict(l=10,r=10,t=35,b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        barmode="relative",
+    )
+    fig_real.update_yaxes(title_text="%", row=1, col=1)
+    fig_real.update_yaxes(title_text="bp", row=2, col=1)
+    fig_real.update_xaxes(range=[start_date, end_date])
+    st.plotly_chart(fig_real, use_container_width=True)
+    st.caption("Reele rente stijgt = vaak strakker voor risk assets en precious metals. Breakeven stijgt = meer inflatieverwachting in de nominale 10Y.")
+
 st.subheader("Deltas — histogram & tijdreeks")
 if   delta_h == "1d": suf="_d1_bp"
 elif delta_h == "7d": suf="_d7"
@@ -462,6 +554,7 @@ else:                  suf="_d30"
 
 bases = [("y_3m","3M"),("y_2y","2Y"),("y_5y","5Y"),("y_10y","10Y"),("y_30y","30Y"),
          ("spread_10_2","10Y-2Y"),("spread_30_10","30Y-10Y")]
+bases = bases + [("real_10y", "10Y Reeel")] if has_real else bases
 def_idx = next((i for i,(b,_) in enumerate(bases) if b=="y_10y"), 0)
 b_sel, label_sel = st.selectbox("Metric", bases, index=def_idx, format_func=lambda t: t[1])
 
@@ -473,7 +566,8 @@ def get_delta_series(df: pd.DataFrame, base: str) -> pd.Series:
     else:
         col = f"{base}{suf}"
         if col not in df.columns:
-            return pd.Series(index=df.index, dtype=float)
+            periods = 7 if suf == "_d7" else 30
+            return pd.to_numeric(df.get(base), errors="coerce").diff(periods) * 100.0
         return pd.to_numeric(df[col], errors="coerce") * 100.0  # pp → bp
 
 USd = get_delta_series(US, b_sel)
@@ -481,7 +575,10 @@ if suf == "_d1_bp":
     dpp = USd / 100.0
     base = pd.to_numeric(US.get(b_sel), errors="coerce")
 else:
-    dpp  = pd.to_numeric(US.get(f"{b_sel}{suf}", pd.Series(index=US.index)), errors="coerce")
+    if f"{b_sel}{suf}" in US.columns:
+        dpp = pd.to_numeric(US[f"{b_sel}{suf}"], errors="coerce")
+    else:
+        dpp = USd / 100.0
     base = pd.to_numeric(US.get(b_sel), errors="coerce")
 pct = (dpp / base.shift(1).replace(0,np.nan)) * 100.0
 
