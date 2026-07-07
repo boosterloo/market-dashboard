@@ -174,6 +174,11 @@ def load_macro() -> pd.DataFrame:
         raise ValueError(f"Kolom 'date' niet aanwezig in view {MACRO_VIEW}")
     return df
 
+if st.button("Ververs macrodata uit BigQuery"):
+    load_macro.clear()
+    st.rerun()
+st.caption("Macrodata wordt normaal maximaal 30 minuten gecachet.")
+
 # ========= Data laden =========
 try:
     df = load_macro()
