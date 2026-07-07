@@ -111,6 +111,54 @@ def tiny_delta_chart(x: pd.Series, y: pd.Series, name: str):
                       xaxis=dict(title=""), yaxis=dict(title="Δ per stap", range=padded_range(d)))
     st.plotly_chart(fig, use_container_width=True)
 
+def latest_non_null_date(df: pd.DataFrame, col: str | None) -> pd.Timestamp | None:
+    if not col or col not in df.columns:
+        return None
+    mask = pd.to_numeric(df[col], errors="coerce").notna()
+    if not mask.any():
+        return None
+    return df.loc[mask, "date"].max()
+
+def build_freshness_table(df: pd.DataFrame, colmap: dict[str, str | None]) -> pd.DataFrame:
+    checks = [
+        ("CPI headline", colmap.get("cpi_idx"), 75),
+        ("CPI core", colmap.get("cpi_core_idx"), 75),
+        ("PCE headline", colmap.get("pce_idx"), 90),
+        ("PPI headline", colmap.get("ppi_idx") or colmap.get("ppi_yoy"), 75),
+        ("Industrial production", colmap.get("industrial_production"), 75),
+        ("Retail sales", colmap.get("retail_sales"), 75),
+        ("Housing starts", colmap.get("housing_starts"), 75),
+        ("Unemployment", colmap.get("unemployment"), 75),
+        ("Payrolls", colmap.get("payrolls"), 75),
+        ("Initial claims", colmap.get("init_claims"), 21),
+        ("M2", colmap.get("m2"), 90),
+        ("Real M2", colmap.get("m2_real"), 90),
+        ("M2 velocity", colmap.get("m2_vel"), 120),
+    ]
+    today = pd.Timestamp.today().normalize()
+    rows = []
+    for label, col, stale_after_days in checks:
+        latest = latest_non_null_date(df, col)
+        if latest is None:
+            rows.append({
+                "Serie": label,
+                "Kolom": col or "(ontbreekt)",
+                "Laatste data": None,
+                "Dagen oud": None,
+                "Status": "Ontbreekt/leeg",
+            })
+            continue
+        latest = pd.Timestamp(latest).normalize()
+        age = int((today - latest).days)
+        rows.append({
+            "Serie": label,
+            "Kolom": col,
+            "Laatste data": latest.date().isoformat(),
+            "Dagen oud": age,
+            "Status": "Achter" if age > stale_after_days else "OK",
+        })
+    return pd.DataFrame(rows)
+
 # ========= BigQuery health =========
 try:
     with st.spinner("BigQuery check…"):
@@ -160,6 +208,18 @@ colmap = {
     "m2_vel_yoy": best_col(df, ["m2_vel_yoy"]),
     "maybe_ppi_in_indprod": best_col(df, ["ind_production","ppi_ind_production","ind_production_ppi"]),
 }
+
+freshness = build_freshness_table(df, colmap)
+problem_rows = freshness[freshness["Status"].isin(["Achter", "Ontbreekt/leeg"])]
+max_data_date = df["date"].max().date()
+st.caption(f"Macro-view: `{MACRO_VIEW}` | laatste datum in view: {max_data_date}")
+if not problem_rows.empty:
+    st.warning(
+        "Een deel van de macrodata is oud of ontbreekt. "
+        "Open 'Data freshness per serie' voor de exacte kolommen."
+    )
+with st.expander("Data freshness per serie", expanded=not problem_rows.empty):
+    st.dataframe(freshness, use_container_width=True, hide_index=True)
 
 # ======== CPI/PCE/PPI naar YoY % ========
 df_pct = df.copy()
