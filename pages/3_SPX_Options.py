@@ -79,6 +79,7 @@ MAX_BYTES_BILLED = 2 * 1024**3
 BQ_LOCATION = "europe-west1"
 PROJECT_ID = "nth-pier-468314-p7"
 VIEW = "nth-pier-468314-p7.marketdata.spx_options_enriched_v"
+DATASET_FQ = "nth-pier-468314-p7.marketdata"
 
 
 @st.cache_resource(show_spinner=False)
@@ -251,6 +252,83 @@ def load_snapshot_freshness():
         int(df["rows_total"].iloc[0] or 0),
         int(df["rows_latest_day"].iloc[0] or 0),
     )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_option_source_diagnostics() -> pd.DataFrame:
+    required_cols = [
+        "snapshot_date",
+        "expiration",
+        "type",
+        "strike",
+        "underlying_price",
+        "days_to_exp",
+        "mid_price",
+        "bid",
+        "ask",
+        "implied_volatility",
+        "open_interest",
+        "volume",
+        "ppd",
+    ]
+    cols = run_query(
+        f"""
+        SELECT
+          c.table_name,
+          ANY_VALUE(t.table_type) AS table_type,
+          COUNTIF(c.column_name IN UNNEST(@required_cols)) AS required_cols_present,
+          COUNTIF(c.column_name = 'snapshot_date') AS has_snapshot_date
+        FROM `{DATASET_FQ}.INFORMATION_SCHEMA.COLUMNS` c
+        LEFT JOIN `{DATASET_FQ}.INFORMATION_SCHEMA.TABLES` t
+          ON c.table_name = t.table_name
+        WHERE REGEXP_CONTAINS(LOWER(c.table_name), r'(spx|option)')
+        GROUP BY c.table_name
+        HAVING has_snapshot_date > 0
+        ORDER BY required_cols_present DESC, table_name
+        LIMIT 20
+        """,
+        {"required_cols": required_cols},
+    )
+    if cols.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, row in cols.iterrows():
+        table_name = str(row["table_name"]).replace("`", "")
+        fqtn = f"{DATASET_FQ}.{table_name}"
+        info = {
+            "source": fqtn,
+            "type": row.get("table_type"),
+            "required_cols_present": int(row.get("required_cols_present") or 0),
+            "latest_snapshot": None,
+            "rows_total": None,
+            "rows_last_7d": None,
+            "error": None,
+        }
+        try:
+            stats = run_query(
+                f"""
+                SELECT
+                  MAX(CAST(snapshot_date AS TIMESTAMP)) AS latest_snapshot,
+                  COUNT(*) AS rows_total,
+                  COUNTIF(DATE(snapshot_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)) AS rows_last_7d
+                FROM `{fqtn}`
+                WHERE DATE(snapshot_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 400 DAY)
+                """
+            )
+            if not stats.empty:
+                info["latest_snapshot"] = stats["latest_snapshot"].iloc[0]
+                info["rows_total"] = int(stats["rows_total"].iloc[0] or 0)
+                info["rows_last_7d"] = int(stats["rows_last_7d"].iloc[0] or 0)
+        except Exception as e:
+            info["error"] = str(e)[:220]
+        rows.append(info)
+
+    out = pd.DataFrame(rows)
+    if not out.empty and "latest_snapshot" in out.columns:
+        out["latest_snapshot"] = pd.to_datetime(out["latest_snapshot"], errors="coerce")
+        out = out.sort_values(["latest_snapshot", "required_cols_present"], ascending=[False, False])
+    return out
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -611,6 +689,35 @@ if latest_snapshot is not None:
         )
 else:
     st.warning(f"Geen snapshots gevonden in `{VIEW}`.")
+
+with st.expander("Diagnose SPX option bronnen", expanded=False):
+    st.caption(
+        "Scant BigQuery dataset `marketdata` op SPX/option bronnen met `snapshot_date` "
+        "en vergelijkt welke tabel/view het meest recent is."
+    )
+    diag = load_option_source_diagnostics()
+    if diag.empty:
+        st.info("Geen SPX/option bronnen met snapshot_date gevonden in BigQuery.")
+    else:
+        show = diag.copy()
+        show["active_dashboard_source"] = show["source"].eq(VIEW)
+        show["latest_snapshot"] = pd.to_datetime(show["latest_snapshot"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+        st.dataframe(
+            show[
+                [
+                    "active_dashboard_source",
+                    "source",
+                    "type",
+                    "latest_snapshot",
+                    "rows_last_7d",
+                    "rows_total",
+                    "required_cols_present",
+                    "error",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 with st.expander("Algemene filters", expanded=True):
     c0, c1, c2 = st.columns([1.1, 1.8, 1.1])
