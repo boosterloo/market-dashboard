@@ -78,8 +78,26 @@ def fmt_pct(v, digits=2):
 MAX_BYTES_BILLED = 2 * 1024**3
 BQ_LOCATION = "europe-west1"
 PROJECT_ID = "nth-pier-468314-p7"
-VIEW = "nth-pier-468314-p7.marketdata.spx_options_enriched_v"
+DEFAULT_VIEW = "nth-pier-468314-p7.marketdata.spx_options_enriched_v"
+VIEW = DEFAULT_VIEW
 DATASET_FQ = "nth-pier-468314-p7.marketdata"
+REQUIRED_OPTION_COLS = [
+    "snapshot_date",
+    "expiration",
+    "type",
+    "strike",
+    "underlying_price",
+    "vix",
+    "days_to_exp",
+    "last_price",
+    "mid_price",
+    "bid",
+    "ask",
+    "implied_volatility",
+    "open_interest",
+    "volume",
+    "ppd",
+]
 
 
 @st.cache_resource(show_spinner=False)
@@ -256,21 +274,6 @@ def load_snapshot_freshness():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_option_source_diagnostics() -> pd.DataFrame:
-    required_cols = [
-        "snapshot_date",
-        "expiration",
-        "type",
-        "strike",
-        "underlying_price",
-        "days_to_exp",
-        "mid_price",
-        "bid",
-        "ask",
-        "implied_volatility",
-        "open_interest",
-        "volume",
-        "ppd",
-    ]
     cols = run_query(
         f"""
         SELECT
@@ -287,7 +290,7 @@ def load_option_source_diagnostics() -> pd.DataFrame:
         ORDER BY required_cols_present DESC, table_name
         LIMIT 20
         """,
-        {"required_cols": required_cols},
+        {"required_cols": REQUIRED_OPTION_COLS},
     )
     if cols.empty:
         return pd.DataFrame()
@@ -665,11 +668,44 @@ def as_utc_naive(ts) -> pd.Timestamp:
     return t
 
 
+def choose_option_source(diag: pd.DataFrame) -> tuple[str, str]:
+    if diag.empty:
+        return DEFAULT_VIEW, "Geen alternatieve bronnen gevonden; default view gebruikt."
+
+    d = diag.copy()
+    d["latest_snapshot"] = pd.to_datetime(d["latest_snapshot"], errors="coerce")
+    d["rows_last_7d"] = pd.to_numeric(d["rows_last_7d"], errors="coerce").fillna(0)
+    d["required_cols_present"] = pd.to_numeric(d["required_cols_present"], errors="coerce").fillna(0)
+    d["error"] = d["error"].fillna("")
+
+    default_rows = d[d["source"].eq(DEFAULT_VIEW)]
+    if not default_rows.empty:
+        default = default_rows.iloc[0]
+        if pd.notna(default["latest_snapshot"]) and int(default["rows_last_7d"]) > 0:
+            return DEFAULT_VIEW, "Default enriched view heeft recente rows."
+
+    compatible = d[
+        (d["required_cols_present"] >= len(REQUIRED_OPTION_COLS))
+        & (d["rows_last_7d"] > 0)
+        & (d["latest_snapshot"].notna())
+        & (d["error"].eq(""))
+    ].sort_values("latest_snapshot", ascending=False)
+
+    if not compatible.empty:
+        source = str(compatible.iloc[0]["source"])
+        if source != DEFAULT_VIEW:
+            return source, f"Automatisch overgeschakeld naar recentere compatible bron: {source}"
+
+    return DEFAULT_VIEW, "Geen recentere complete bron gevonden; default view gebruikt."
+
+
 # Global controls
 if st.button("Ververs SPX option data uit BigQuery"):
     clear_option_caches()
     st.rerun()
 
+source_diag = load_option_source_diagnostics()
+VIEW, source_reason = choose_option_source(source_diag)
 min_date, max_date = load_date_bounds()
 latest_snapshot, rows_total, rows_latest_day = load_snapshot_freshness()
 default_start = max(min_date, max_date - timedelta(days=14))
@@ -680,12 +716,13 @@ if latest_snapshot is not None:
     st.caption(
         "SPX option view: "
         f"laatste snapshot {latest_snapshot_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC "
-        f"({age_hours:.1f} uur oud) | rows op laatste dag: {rows_latest_day:,} | view: `{VIEW}`"
+        f"({age_hours:.1f} uur oud) | rows op laatste dag: {rows_latest_day:,} | bron: `{VIEW}`"
     )
+    st.caption(source_reason)
     if age_hours > 36:
         st.warning(
-            "De BigQuery-view zelf lijkt achter te lopen. "
-            "Als de scraper wel groen is, schrijft hij waarschijnlijk niet door naar deze enriched view."
+            "De actieve BigQuery-bron lijkt nog steeds achter te lopen. "
+            "Dan schrijft de scraper waarschijnlijk geen recente complete option rows weg."
         )
 else:
     st.warning(f"Geen snapshots gevonden in `{VIEW}`.")
@@ -695,17 +732,19 @@ with st.expander("Diagnose SPX option bronnen", expanded=False):
         "Scant BigQuery dataset `marketdata` op SPX/option bronnen met `snapshot_date` "
         "en vergelijkt welke tabel/view het meest recent is."
     )
-    diag = load_option_source_diagnostics()
+    diag = source_diag
     if diag.empty:
         st.info("Geen SPX/option bronnen met snapshot_date gevonden in BigQuery.")
     else:
         show = diag.copy()
         show["active_dashboard_source"] = show["source"].eq(VIEW)
+        show["default_dashboard_source"] = show["source"].eq(DEFAULT_VIEW)
         show["latest_snapshot"] = pd.to_datetime(show["latest_snapshot"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         st.dataframe(
             show[
                 [
                     "active_dashboard_source",
+                    "default_dashboard_source",
                     "source",
                     "type",
                     "latest_snapshot",
