@@ -88,17 +88,14 @@ REQUIRED_OPTION_COLS = [
     "type",
     "strike",
     "underlying_price",
-    "vix",
-    "days_to_exp",
-    "last_price",
-    "mid_price",
     "bid",
     "ask",
     "implied_volatility",
     "open_interest",
     "volume",
-    "ppd",
 ]
+DERIVED_OPTION_COLS = ["vix", "days_to_exp", "last_price", "mid_price", "ppd"]
+ACTIVE_SOURCE_COLUMNS: set[str] = set()
 
 
 @st.cache_resource(show_spinner=False)
@@ -153,6 +150,54 @@ def run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
     )
 
     return job.to_dataframe(create_bqstorage_client=False)
+
+
+def has_col(name: str) -> bool:
+    return name in ACTIVE_SOURCE_COLUMNS
+
+
+def f64_col(name: str, fallback: str = "NULL") -> str:
+    return f"CAST({name} AS FLOAT64)" if has_col(name) else fallback
+
+
+def i64_col(name: str, fallback: str = "NULL") -> str:
+    return f"CAST({name} AS INT64)" if has_col(name) else fallback
+
+
+def vix_expr() -> str:
+    return f64_col("vix")
+
+
+def last_price_expr() -> str:
+    return f64_col("last_price", fallback=mid_price_expr())
+
+
+def mid_price_expr() -> str:
+    if has_col("mid_price"):
+        return "CAST(mid_price AS FLOAT64)"
+    return "SAFE_DIVIDE(CAST(bid AS FLOAT64) + CAST(ask AS FLOAT64), 2.0)"
+
+
+def days_to_exp_expr() -> str:
+    if has_col("days_to_exp"):
+        return "CAST(days_to_exp AS INT64)"
+    return "DATE_DIFF(CAST(expiration AS DATE), DATE(CAST(snapshot_date AS TIMESTAMP)), DAY)"
+
+
+def ppd_expr() -> str:
+    if has_col("ppd"):
+        return "CAST(ppd AS FLOAT64)"
+    return f"SAFE_DIVIDE({mid_price_expr()}, NULLIF({days_to_exp_expr()}, 0))"
+
+
+def normalize_column_list(cols) -> list[str]:
+    if cols is None:
+        return []
+    if isinstance(cols, np.ndarray):
+        cols = cols.tolist()
+    if isinstance(cols, (list, tuple, set)):
+        return [str(c) for c in cols]
+    return [str(cols)]
 
 
 # Styling
@@ -280,6 +325,7 @@ def load_option_source_diagnostics() -> pd.DataFrame:
         SELECT
           c.table_name,
           ANY_VALUE(t.table_type) AS table_type,
+          ARRAY_AGG(c.column_name ORDER BY c.column_name) AS columns,
           COUNTIF(c.column_name IN UNNEST(@required_cols)) AS required_cols_present,
           COUNTIF(c.column_name = 'snapshot_date') AS has_snapshot_date
         FROM `{DATASET_FQ}.INFORMATION_SCHEMA.COLUMNS` c
@@ -303,6 +349,7 @@ def load_option_source_diagnostics() -> pd.DataFrame:
         info = {
             "source": fqtn,
             "type": row.get("table_type"),
+            "columns": normalize_column_list(row.get("columns")),
             "required_cols_present": int(row.get("required_cols_present") or 0),
             "latest_snapshot": None,
             "rows_total": None,
@@ -357,7 +404,7 @@ def load_snapshot_context(sel_snapshot):
         f"""
         SELECT
           AVG(CAST(underlying_price AS FLOAT64)) AS spx,
-          AVG(CAST(vix AS FLOAT64)) AS vix
+          AVG({vix_expr()}) AS vix
         FROM `{VIEW}`
         WHERE DATE(snapshot_date) = DATE(@snap_min)
           AND TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
@@ -428,12 +475,12 @@ def load_daily_market_context(start_date, end_date, dte_min, dte_max, mny_min, m
         CAST(open_interest AS FLOAT64) AS open_interest,
         CAST(volume AS FLOAT64) AS volume,
         CAST(implied_volatility AS FLOAT64) AS implied_volatility,
-        CAST(vix AS FLOAT64) AS vix,
-        CAST(days_to_exp AS INT64) AS days_to_exp,
+        {vix_expr()} AS vix,
+        {days_to_exp_expr()} AS days_to_exp,
         SAFE_DIVIDE(CAST(strike AS FLOAT64), NULLIF(CAST(underlying_price AS FLOAT64), 0)) - 1.0 AS moneyness
       FROM `{VIEW}`
       WHERE DATE(snapshot_date) BETWEEN @start AND @end
-        AND days_to_exp BETWEEN @dte_min AND @dte_max
+        AND {days_to_exp_expr()} BETWEEN @dte_min AND @dte_max
         AND SAFE_DIVIDE(CAST(strike AS FLOAT64), NULLIF(CAST(underlying_price AS FLOAT64), 0)) - 1.0
             BETWEEN @mny_min AND @mny_max
         AND (COALESCE(open_interest, 0) >= @min_oi OR COALESCE(volume, 0) >= @min_vol)
@@ -479,7 +526,7 @@ def load_skew_source(start_date, end_date, dte_lo, dte_hi, min_oi, min_vol):
           snapshot_date,
           expiration,
           LOWER(type) AS type,
-          CAST(days_to_exp AS INT64) AS days_to_exp,
+          {days_to_exp_expr()} AS days_to_exp,
           CAST(strike AS FLOAT64) AS strike,
           CAST(underlying_price AS FLOAT64) AS underlying_price,
           CAST(implied_volatility AS FLOAT64) AS implied_volatility,
@@ -487,7 +534,7 @@ def load_skew_source(start_date, end_date, dte_lo, dte_hi, min_oi, min_vol):
           CAST(volume AS FLOAT64) AS volume
         FROM `{VIEW}`
         WHERE DATE(snapshot_date) BETWEEN @start AND @end
-          AND days_to_exp BETWEEN @dte_lo AND @dte_hi
+          AND {days_to_exp_expr()} BETWEEN @dte_lo AND @dte_hi
           AND (COALESCE(open_interest, 0) >= @min_oi OR COALESCE(volume, 0) >= @min_vol)
         """,
         {
@@ -513,24 +560,24 @@ def load_ppd_expiry_ladder_for_strike(sel_snapshot, sel_type, strike, dte_min, d
           snapshot_date,
           expiration,
           LOWER(type) AS type,
-          CAST(days_to_exp AS INT64) AS days_to_exp,
+          {days_to_exp_expr()} AS days_to_exp,
           CAST(strike AS FLOAT64) AS strike,
           CAST(underlying_price AS FLOAT64) AS underlying_price,
           SAFE_DIVIDE(CAST(strike AS FLOAT64), NULLIF(CAST(underlying_price AS FLOAT64), 0)) - 1.0 AS moneyness,
-          CAST(last_price AS FLOAT64) AS last_price,
-          CAST(mid_price AS FLOAT64) AS mid_price,
+          {last_price_expr()} AS last_price,
+          {mid_price_expr()} AS mid_price,
           CAST(bid AS FLOAT64) AS bid,
           CAST(ask AS FLOAT64) AS ask,
           CAST(implied_volatility AS FLOAT64) AS implied_volatility,
           CAST(open_interest AS FLOAT64) AS open_interest,
           CAST(volume AS FLOAT64) AS volume,
-          CAST(ppd AS FLOAT64) AS ppd
+          {ppd_expr()} AS ppd
         FROM `{VIEW}`
         WHERE DATE(snapshot_date) = DATE(@snap_min)
           AND TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
           AND LOWER(type) = @t
           AND ABS(CAST(strike AS FLOAT64) - @strike) < 0.0001
-          AND days_to_exp BETWEEN @dte_min AND @dte_max
+          AND {days_to_exp_expr()} BETWEEN @dte_min AND @dte_max
           AND (COALESCE(open_interest, 0) >= @min_oi OR COALESCE(volume, 0) >= @min_vol)
         ORDER BY expiration
         """,
@@ -575,17 +622,17 @@ def load_option_history(start_date, end_date, sel_type, strike, expiration, min_
           snapshot_date,
           expiration,
           LOWER(type) AS type,
-          CAST(days_to_exp AS INT64) AS days_to_exp,
+          {days_to_exp_expr()} AS days_to_exp,
           CAST(strike AS FLOAT64) AS strike,
           CAST(underlying_price AS FLOAT64) AS underlying_price,
-          CAST(last_price AS FLOAT64) AS last_price,
-          CAST(mid_price AS FLOAT64) AS mid_price,
+          {last_price_expr()} AS last_price,
+          {mid_price_expr()} AS mid_price,
           CAST(bid AS FLOAT64) AS bid,
           CAST(ask AS FLOAT64) AS ask,
           CAST(implied_volatility AS FLOAT64) AS implied_volatility,
           CAST(open_interest AS FLOAT64) AS open_interest,
           CAST(volume AS FLOAT64) AS volume,
-          CAST(ppd AS FLOAT64) AS ppd
+          {ppd_expr()} AS ppd
         FROM `{VIEW}`
         WHERE DATE(snapshot_date) BETWEEN @start AND @end
           AND LOWER(type) = @t
@@ -620,23 +667,23 @@ def load_snapshot_chain(sel_snapshot, sel_type, dte_min, dte_max, min_oi, min_vo
           snapshot_date,
           expiration,
           LOWER(type) AS type,
-          CAST(days_to_exp AS INT64) AS days_to_exp,
+          {days_to_exp_expr()} AS days_to_exp,
           CAST(strike AS FLOAT64) AS strike,
           CAST(underlying_price AS FLOAT64) AS underlying_price,
           SAFE_DIVIDE(CAST(strike AS FLOAT64), NULLIF(CAST(underlying_price AS FLOAT64), 0)) - 1.0 AS moneyness,
           CAST(strike AS FLOAT64) - CAST(underlying_price AS FLOAT64) AS dist_points,
-          CAST(mid_price AS FLOAT64) AS mid_price,
+          {mid_price_expr()} AS mid_price,
           CAST(bid AS FLOAT64) AS bid,
           CAST(ask AS FLOAT64) AS ask,
           CAST(implied_volatility AS FLOAT64) AS implied_volatility,
           CAST(open_interest AS FLOAT64) AS open_interest,
           CAST(volume AS FLOAT64) AS volume,
-          CAST(ppd AS FLOAT64) AS ppd
+          {ppd_expr()} AS ppd
         FROM `{VIEW}`
         WHERE DATE(snapshot_date) = DATE(@snap_min)
           AND TIMESTAMP_TRUNC(CAST(snapshot_date AS TIMESTAMP), MINUTE) = @snap_min
           AND LOWER(type) = @t
-          AND days_to_exp BETWEEN @dte_min AND @dte_max
+          AND {days_to_exp_expr()} BETWEEN @dte_min AND @dte_max
           AND (COALESCE(open_interest, 0) >= @min_oi OR COALESCE(volume, 0) >= @min_vol)
         """,
         {
@@ -710,6 +757,15 @@ def choose_option_source(diag: pd.DataFrame) -> tuple[str, str]:
     return DEFAULT_VIEW, "Geen complete bron gevonden; partitioned tabel geprobeerd."
 
 
+def get_source_columns(diag: pd.DataFrame, source: str) -> set[str]:
+    if diag.empty:
+        return set(REQUIRED_OPTION_COLS + DERIVED_OPTION_COLS)
+    rows = diag[diag["source"].eq(source)]
+    if rows.empty:
+        return set(REQUIRED_OPTION_COLS + DERIVED_OPTION_COLS)
+    return set(normalize_column_list(rows.iloc[0].get("columns")))
+
+
 # Global controls
 if st.button("Ververs SPX option data uit BigQuery"):
     clear_option_caches()
@@ -717,6 +773,7 @@ if st.button("Ververs SPX option data uit BigQuery"):
 
 source_diag = load_option_source_diagnostics()
 VIEW, source_reason = choose_option_source(source_diag)
+ACTIVE_SOURCE_COLUMNS = get_source_columns(source_diag, VIEW)
 min_date, max_date = load_date_bounds()
 latest_snapshot, rows_total, rows_latest_day = load_snapshot_freshness()
 default_start = max(min_date, max_date - timedelta(days=14))
