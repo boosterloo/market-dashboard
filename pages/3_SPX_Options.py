@@ -229,6 +229,31 @@ def load_date_bounds():
 
 
 @st.cache_data(ttl=600, show_spinner=False)
+def load_snapshot_freshness():
+    df = run_query(
+        f"""
+        SELECT
+          MAX(CAST(snapshot_date AS TIMESTAMP)) AS latest_snapshot,
+          COUNT(*) AS rows_total,
+          COUNTIF(DATE(snapshot_date) = (
+            SELECT MAX(DATE(snapshot_date))
+            FROM `{VIEW}`
+            WHERE DATE(snapshot_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 400 DAY)
+          )) AS rows_latest_day
+        FROM `{VIEW}`
+        WHERE DATE(snapshot_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 400 DAY)
+        """
+    )
+    if df.empty:
+        return None, 0, 0
+    return (
+        pd.to_datetime(df["latest_snapshot"].iloc[0]) if pd.notna(df["latest_snapshot"].iloc[0]) else None,
+        int(df["rows_total"].iloc[0] or 0),
+        int(df["rows_latest_day"].iloc[0] or 0),
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def load_snapshots(start_date: date, end_date: date):
     df = run_query(
         f"""
@@ -551,9 +576,41 @@ def load_snapshot_chain(sel_snapshot, sel_type, dte_min, dte_max, min_oi, min_vo
     return df
 
 
+def clear_option_caches():
+    st.cache_data.clear()
+
+
+def as_utc_naive(ts) -> pd.Timestamp:
+    t = pd.to_datetime(ts)
+    if t.tzinfo is not None:
+        return t.tz_convert("UTC").tz_localize(None)
+    return t
+
+
 # Global controls
+if st.button("Ververs SPX option data uit BigQuery"):
+    clear_option_caches()
+    st.rerun()
+
 min_date, max_date = load_date_bounds()
+latest_snapshot, rows_total, rows_latest_day = load_snapshot_freshness()
 default_start = max(min_date, max_date - timedelta(days=14))
+
+if latest_snapshot is not None:
+    latest_snapshot_utc = as_utc_naive(latest_snapshot)
+    age_hours = (pd.Timestamp.utcnow().tz_localize(None) - latest_snapshot_utc).total_seconds() / 3600
+    st.caption(
+        "SPX option view: "
+        f"laatste snapshot {latest_snapshot_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC "
+        f"({age_hours:.1f} uur oud) | rows op laatste dag: {rows_latest_day:,} | view: `{VIEW}`"
+    )
+    if age_hours > 36:
+        st.warning(
+            "De BigQuery-view zelf lijkt achter te lopen. "
+            "Als de scraper wel groen is, schrijft hij waarschijnlijk niet door naar deze enriched view."
+        )
+else:
+    st.warning(f"Geen snapshots gevonden in `{VIEW}`.")
 
 with st.expander("Algemene filters", expanded=True):
     c0, c1, c2 = st.columns([1.1, 1.8, 1.1])
