@@ -381,7 +381,10 @@ def normalize_100(series: pd.Series) -> pd.Series:
 
 
 def padded_range(series_list: list[pd.Series], pad_ratio: float = 0.08):
-    values = pd.concat([pd.to_numeric(s, errors="coerce") for s in series_list], axis=0).dropna()
+    valid_series = [pd.to_numeric(s, errors="coerce") for s in series_list if s is not None]
+    if not valid_series:
+        return None
+    values = pd.concat(valid_series, axis=0).dropna()
     if values.empty:
         return None
     y_min = float(values.min())
@@ -457,7 +460,7 @@ DRIVER_MAP = {
 
 with st.sidebar:
     st.header("Instellingen")
-    view_mode = st.radio("Overlayschaling", ["Genormaliseerd (=100)", "Eigen schaal (2e y-as)"], index=0)
+    view_mode = st.radio("Overlayschaling", ["Genormaliseerd (=100)", "Eigen schaal (2e y-as)"], index=1)
     show_delta = st.checkbox("Delta%-bars tonen (Silver)", value=True)
 
     st.divider()
@@ -666,7 +669,7 @@ d["macro_detail"] = macro_detail
 
 driver_choices = [name for name, col in DRIVER_MAP.items() if col in d.columns and d[col].notna().any()]
 default_overlay = [
-    x for x in ["Gold (USD/oz)", "Gold/Silver ratio", "Copper (industrial proxy)", "DXY (Dollar Index)", "US 10Y (yield %)", "US 10Y Real (TIPS %)", "Real M2 YoY (%)", "VIX"]
+    x for x in ["Gold (USD/oz)", "Gold/Silver ratio", "Copper (industrial proxy)", "DXY (Dollar Index)"]
     if x in driver_choices
 ]
 default_scatter = [
@@ -780,12 +783,18 @@ if available_macro_watch:
                 line=dict(width=2, color=macro_palette.get(col, "#6b7280")),
             )
         )
+    macro_range = padded_range(
+        [normalize_100(d["silver_close"])]
+        + [normalize_100(d[col]) for _, col, _, _ in available_macro_watch]
+    )
     fig_macro.update_layout(
         height=420,
-        margin=dict(l=10, r=10, t=30, b=10),
+        title="Zilver versus dollar, rente en liquiditeit",
+        margin=dict(l=10, r=10, t=45, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        yaxis_title="Index (=100)",
+        hovermode="x unified",
     )
+    fig_macro.update_yaxes(title_text="Relatieve index (=100)", range=macro_range)
     st.plotly_chart(fig_macro, use_container_width=True)
 
     with st.expander("Waarom deze macrofactoren?", expanded=False):
@@ -851,9 +860,13 @@ else:
 st.divider()
 
 # ---------- Price + overlays ----------
-st.subheader("Silver - Price and macro overlays")
+st.subheader("Silver versus macrodrivers")
+st.caption(
+    "Lees de zwarte lijn links als de zilverprijs. De geselecteerde drivers staan rechts op hun gezamenlijke driverschaal; "
+    "zet maximaal enkele drivers tegelijk aan voor een goed leesbare vergelijking."
+)
 sel = st.multiselect(
-    "Kies drivers voor overlay",
+    "Kies drivers voor vergelijking",
     options=driver_choices,
     default=default_overlay,
     help="Genormaliseerd toont relatieve performance. Eigen schaal zet drivers op de tweede y-as.",
@@ -908,7 +921,13 @@ fig.update_yaxes(
 )
 if view_mode.startswith("Eigen"):
     fig.update_yaxes(title_text="Drivers", range=padded_range(secondary_range_series), secondary_y=True)
-fig.update_layout(height=560, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+fig.update_layout(
+    height=560,
+    margin=dict(l=10, r=10, t=45, b=10),
+    title="Zilver en geselecteerde drivers",
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+)
 st.plotly_chart(fig, use_container_width=True)
 
 if show_delta:
@@ -919,11 +938,19 @@ if show_delta:
     fig_d.add_trace(go.Bar(x=bars["date"], y=bars["pct"], name="Silver daily delta %", marker_color=colors, opacity=0.9))
     fig_d.add_hline(y=0, line_dash="dot", opacity=0.6)
     fig_d.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
-    fig_d.update_yaxes(title_text="Delta % dag")
+    fig_d.update_yaxes(
+        title_text="Dagelijkse verandering (%)",
+        range=padded_range([bars["pct"], pd.Series([0.0])]),
+    )
+    fig_d.update_layout(title="Dagelijkse beweging van zilver")
     st.plotly_chart(fig_d, use_container_width=True)
 
 # ---------- TA chart ----------
-st.subheader("Silver TA - Heikin Ashi, trend and momentum")
+st.subheader("Technische analyse van zilver")
+st.caption(
+    "Heikin Ashi toont trendstructuur; RSI en MACD tonen momentum. De prijsas van het bovenste paneel "
+    "wordt afzonderlijk en dynamisch geschaald."
+)
 real_ohlc_cols = ["silver_open", "silver_high", "silver_low", "silver_close"]
 has_real_ohlc = all(c in d.columns and d[c].notna().any() for c in real_ohlc_cols)
 
@@ -969,6 +996,17 @@ fig_ta.add_trace(
     row=1,
     col=1,
 )
+fig_ta.add_trace(
+    go.Scatter(
+        x=ta_plot["date"],
+        y=ta_plot["close"],
+        mode="lines",
+        name="Echte close",
+        line=dict(width=1.5, color="#111111", dash="dot"),
+    ),
+    row=1,
+    col=1,
+)
 
 for span, color in [(ema_fast, "#E69F00"), (ema_mid, "#009E73"), (ema_slow, "#0072B2")]:
     ema_col = f"silver_ema{span}"
@@ -998,7 +1036,15 @@ fig_ta.add_trace(
 )
 fig_ta.add_hline(y=0, line_dash="dot", row=3, col=1)
 
-price_range = padded_range([ta_plot["ha_low"], ta_plot["ha_high"], d[f"silver_ema{ema_mid}"], d[f"silver_ema{ema_slow}"]])
+price_range = padded_range(
+    [
+        ta_plot["ha_low"],
+        ta_plot["ha_high"],
+        ta_plot["close"],
+        d[f"silver_ema{ema_mid}"],
+        d[f"silver_ema{ema_slow}"],
+    ]
+)
 fig_ta.update_layout(
     height=900,
     margin=dict(l=10, r=10, t=70, b=30),
