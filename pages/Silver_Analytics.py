@@ -952,7 +952,11 @@ st.caption(
     "wordt afzonderlijk en dynamisch geschaald."
 )
 real_ohlc_cols = ["silver_open", "silver_high", "silver_low", "silver_close"]
-has_real_ohlc = all(c in d.columns and d[c].notna().any() for c in real_ohlc_cols)
+ohlc_coverage = {
+    c: float(d[c].notna().mean()) if c in d.columns else 0.0
+    for c in real_ohlc_cols
+}
+has_real_ohlc = all(ohlc_coverage[c] >= 0.95 for c in real_ohlc_cols)
 
 if has_real_ohlc:
     ta_ohlc = d[["date", "silver_open", "silver_high", "silver_low", "silver_close"]].rename(
@@ -970,7 +974,11 @@ else:
     ta_ohlc["close"] = ta_ohlc["silver_close"]
     ta_ohlc["high"] = ta_ohlc[["open", "close"]].max(axis=1)
     ta_ohlc["low"] = ta_ohlc[["open", "close"]].min(axis=1)
-    ohlc_note = "Geen echte silver OHLC-kolommen gevonden; candles zijn synthetisch uit close-to-close beweging."
+    coverage_text = ", ".join(f"{c.replace('silver_', '')}: {ohlc_coverage[c]:.0%}" for c in real_ohlc_cols)
+    ohlc_note = (
+        "Geen volledig gedekte silver OHLC-reeks gevonden; candles zijn daarom doorlopend synthetisch "
+        f"uit close-to-close beweging. Dekking: {coverage_text}."
+    )
 
 ha = heikin_ashi(ta_ohlc[["open", "high", "low", "close"]])
 ta_plot = pd.concat([ta_ohlc[["date", "close"]], ha], axis=1).dropna(subset=["ha_open", "ha_high", "ha_low", "ha_close"])
