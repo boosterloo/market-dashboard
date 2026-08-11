@@ -370,6 +370,8 @@ def heikin_ashi(src: pd.DataFrame) -> pd.DataFrame:
         cur_idx = ha.index[i]
         if pd.notna(ha_open.loc[prev_idx]) and pd.notna(ha.loc[prev_idx, "ha_close"]):
             ha_open.loc[cur_idx] = (ha_open.loc[prev_idx] + ha.loc[prev_idx, "ha_close"]) / 2.0
+        elif pd.notna(ha.loc[cur_idx, "open"]) and pd.notna(ha.loc[cur_idx, "close"]):
+            ha_open.loc[cur_idx] = (ha.loc[cur_idx, "open"] + ha.loc[cur_idx, "close"]) / 2.0
 
     ha["ha_open"] = ha_open
     ha["ha_high"] = pd.concat([ha["high"], ha["ha_open"], ha["ha_close"]], axis=1).max(axis=1)
@@ -1006,10 +1008,10 @@ if has_real_ohlc:
             "silver_low": "low",
             "silver_close": "close",
         }
-    ).copy()
+    ).dropna(subset=["open", "high", "low", "close"]).copy()
     ohlc_note = "Heikin Ashi op basis van echte OHLC-kolommen."
 else:
-    ta_ohlc = d[["date", "silver_close"]].copy()
+    ta_ohlc = d[["date", "silver_close"]].dropna(subset=["silver_close"]).copy()
     ta_ohlc["open"] = ta_ohlc["silver_close"].shift(1).fillna(ta_ohlc["silver_close"])
     ta_ohlc["close"] = ta_ohlc["silver_close"]
     ta_ohlc["high"] = ta_ohlc[["open", "close"]].max(axis=1)
@@ -1106,7 +1108,9 @@ fig_ta.update_yaxes(title_text="RSI", range=[0, 100], row=2, col=1)
 fig_ta.update_yaxes(title_text="MACD", row=3, col=1)
 fig_ta.update_xaxes(rangeslider_visible=False)
 st.plotly_chart(fig_ta, use_container_width=True)
-st.caption(ohlc_note)
+st.caption(
+    f"{ohlc_note} HA-candles: {len(ta_plot)} | geldige silver closes: {int(d['silver_close'].notna().sum())}."
+)
 
 # ---------- Ratio and momentum ----------
 if "gold_silver_ratio" in d.columns:
