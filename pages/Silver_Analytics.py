@@ -669,11 +669,27 @@ d["macro_detail"] = macro_detail
 
 driver_choices = [name for name, col in DRIVER_MAP.items() if col in d.columns and d[col].notna().any()]
 default_overlay = [
-    x for x in ["Gold (USD/oz)", "Gold/Silver ratio", "Copper (industrial proxy)", "DXY (Dollar Index)"]
+    x for x in [
+        "Gold (USD/oz)",
+        "Gold/Silver ratio",
+        "Copper (industrial proxy)",
+        "EURUSD",
+        "DXY (Dollar Index)",
+        "US 10Y Real (TIPS %)",
+        "VIX",
+    ]
     if x in driver_choices
 ]
 default_scatter = [
-    x for x in ["Gold (USD/oz)", "Copper (industrial proxy)", "DXY (Dollar Index)", "US 10Y (yield %)", "US 10Y Real (TIPS %)", "Real M2 YoY (%)"]
+    x for x in [
+        "Gold (USD/oz)",
+        "Gold/Silver ratio",
+        "Copper (industrial proxy)",
+        "EURUSD",
+        "DXY (Dollar Index)",
+        "US 10Y Real (TIPS %)",
+        "Real M2 YoY (%)",
+    ]
     if x in driver_choices
 ]
 
@@ -956,7 +972,12 @@ ohlc_coverage = {
     c: float(d[c].notna().mean()) if c in d.columns else 0.0
     for c in real_ohlc_cols
 }
-has_real_ohlc = all(ohlc_coverage[c] >= 0.95 for c in real_ohlc_cols)
+complete_ohlc = (
+    d[real_ohlc_cols].notna().all(axis=1)
+    if all(c in d.columns for c in real_ohlc_cols)
+    else pd.Series(False, index=d.index)
+)
+has_real_ohlc = bool(complete_ohlc.mean() >= 0.95)
 
 if has_real_ohlc:
     ta_ohlc = d[["date", "silver_open", "silver_high", "silver_low", "silver_close"]].rename(
@@ -980,8 +1001,10 @@ else:
         f"uit close-to-close beweging. Dekking: {coverage_text}."
     )
 
-ha = heikin_ashi(ta_ohlc[["open", "high", "low", "close"]])
-ta_plot = pd.concat([ta_ohlc[["date", "close"]], ha], axis=1).dropna(subset=["ha_open", "ha_high", "ha_low", "ha_close"])
+ta_ohlc = ta_ohlc.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+ha = heikin_ashi(ta_ohlc[["open", "high", "low", "close"]].reset_index(drop=True))
+ta_plot = pd.concat([ta_ohlc[["date", "close"]].reset_index(drop=True), ha], axis=1)
+ta_plot = ta_plot.dropna(subset=["ha_open", "ha_high", "ha_low", "ha_close"])
 
 fig_ta = make_subplots(
     rows=3,
