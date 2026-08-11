@@ -152,8 +152,10 @@ def load_fx_fallback() -> pd.DataFrame:
         f"SELECT date, dxy AS dxy_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
         f"SELECT date, DXY AS dxy_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
         f"SELECT date, eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
+        f"SELECT date, eur_usd_close AS eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
         f"SELECT date, eurusd AS eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
         f"SELECT date, EURUSD AS eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
+        f"SELECT date, eur_usd AS eurusd_close FROM `{FX_WIDE_VIEW}` ORDER BY date",
     ]:
         try:
             d = run_query(sql)
@@ -170,7 +172,10 @@ def load_fx_fallback() -> pd.DataFrame:
         if d_all.empty:
             return pd.DataFrame()
         dxy_col = best_col(d_all, ["dxy_close", "dxy", "DXY", "dollar_index", "usd_index"])
-        eurusd_col = best_col(d_all, ["eurusd_close", "eurusd", "EURUSD", "eur_usd"])
+        eurusd_col = best_col(
+            d_all,
+            ["eurusd_close", "eur_usd_close", "eurusd", "EURUSD", "eur_usd", "eurusd_price"],
+        )
         keep = ["date"]
         rename = {}
         if dxy_col:
@@ -190,8 +195,14 @@ def load_fx_fallback() -> pd.DataFrame:
 def load_yield_fallback() -> pd.DataFrame:
     merged = None
     for sql in [
+        f"SELECT date, y_2y AS us2y, y_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_2y_synth AS us2y, y_10y_synth AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
         f"SELECT date, y_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_2y AS us2y, y_10y AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_2y_synth AS us2y, y_10y_synth AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
         f"SELECT date, y_10y_synth AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_2y AS us2y FROM `{US_YIELD_VIEW}` ORDER BY date",
+        f"SELECT date, y_2y_synth AS us2y FROM `{US_YIELD_VIEW}` ORDER BY date",
         f"SELECT date, us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
         f"SELECT date, us_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
         f"SELECT date, y_10y AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
@@ -213,10 +224,14 @@ def load_yield_fallback() -> pd.DataFrame:
         d_all = run_query(f"SELECT * FROM `{US_YIELD_VIEW}` ORDER BY date")
         if d_all.empty:
             return pd.DataFrame()
+        us2y_col = best_col(d_all, ["us2y", "y_2y", "y_2y_synth", "us_2y", "rate_2y", "yield_2y"])
         us10y_col = best_col(d_all, ["us10y", "y_10y", "y_10y_synth", "us_10y", "rate_10y", "tenor_10y", "yield_10y"])
         real10y_col = best_col(d_all, ["tips10y_real", "real10y", "real_10y", "tips_10y", "tips10y", "y_10y_real"])
         keep = ["date"]
         rename = {}
+        if us2y_col:
+            keep.append(us2y_col)
+            rename[us2y_col] = "us2y"
         if us10y_col:
             keep.append(us10y_col)
             rename[us10y_col] = "us10y"
@@ -448,6 +463,7 @@ DRIVER_MAP = {
     "Copper (industrial proxy)": "copper_close",
     "DXY (Dollar Index)": "dxy_close",
     "EURUSD": "eurusd_close",
+    "US 2Y (yield %)": "us2y",
     "US 10Y (yield %)": "us10y",
     "US 10Y Real (TIPS %)": "tips10y_real",
     "VIX": "vix_close",
@@ -675,6 +691,7 @@ default_overlay = [
         "Copper (industrial proxy)",
         "EURUSD",
         "DXY (Dollar Index)",
+        "US 2Y (yield %)",
         "US 10Y Real (TIPS %)",
         "VIX",
     ]
@@ -687,6 +704,7 @@ default_scatter = [
         "Copper (industrial proxy)",
         "EURUSD",
         "DXY (Dollar Index)",
+        "US 2Y (yield %)",
         "US 10Y Real (TIPS %)",
         "Real M2 YoY (%)",
     ]
@@ -697,7 +715,7 @@ default_scatter = [
 with st.expander("Debug: driver-kolommen en non-null counts", expanded=False):
     dbg_cols = [
         "silver_close", "gold_close", "gold_silver_ratio", "copper_close",
-        "dxy_close", "eurusd_close", "us10y", "tips10y_real", "vix_close", "btc_close",
+        "dxy_close", "eurusd_close", "us2y", "us10y", "tips10y_real", "vix_close", "btc_close",
         "m2", "m2_real", "m2_yoy", "m2_real_yoy", "m2_vel", "m2_vel_yoy",
     ]
     st.write(
@@ -754,6 +772,7 @@ with st.expander("Hoe wordt deze diagnose gelezen?", expanded=False):
 
 macro_watch = [
     ("DXY", "dxy_close", "level", "Dollar sterker is meestal druk op metalen."),
+    ("US 2Y", "us2y", "pp", "Korte rente; gevoelig voor Fed-verwachtingen."),
     ("US 10Y", "us10y", "pp", "Nominale rente; hogere rente verhoogt opportunity cost."),
     ("US 10Y real", "tips10y_real", "pp", "Reele rente is vaak belangrijker voor precious metals."),
     ("M2 YoY", "m2_yoy", "pp", "Liquiditeitsgroei kan risk assets en metals ondersteunen."),
