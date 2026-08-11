@@ -51,9 +51,11 @@ DRIVERS_WIDE_VIEW = TABLES.get(
     TABLES.get("gold_drivers_wide_view", "nth-pier-468314-p7.marketdata.gold_drivers_wide_v"),
 )
 AEX_VIEW = TABLES.get("aex_view", "nth-pier-468314-p7.marketdata.aex_with_vix_v")
-CRYPTO_WIDE_VIEW = TABLES.get("crypto_daily_wide", "nth-pier-468314-p7.marketdata.crypto_daily_wide_v")
-FX_WIDE_VIEW = TABLES.get("fx_wide_view", "nth-pier-468314-p7.marketdata.fx_daily_wide_v")
-US_YIELD_VIEW = TABLES.get("us_yield_view", "nth-pier-468314-p7.marketdata.us_yields_daily_wide_v")
+SPX_VIEW = TABLES.get("spx_view", "nth-pier-468314-p7.marketdata.spx_with_vix_v")
+CRYPTO_WIDE_VIEW = TABLES.get("crypto_daily_wide", "nth-pier-468314-p7.marketdata.crypto_daily_wide")
+FX_WIDE_VIEW = TABLES.get("fx_wide_view", "nth-pier-468314-p7.marketdata.fx_rates_dashboard_v")
+US_YIELD_VIEW = TABLES.get("us_yield_view", "nth-pier-468314-p7.marketdata.us_yield_curve_enriched_v")
+US_REAL_FALLBACK = TABLES.get("us_yield_real_view", "nth-pier-468314-p7.marketdata.yield_curve_latest_v")
 MACRO_VIEW = TABLES.get("macro_view", "nth-pier-468314-p7.marketdata.macro_series_wide_monthly_fill_v")
 
 with st.expander("Debug: gebruikte bronnen", expanded=False):
@@ -62,9 +64,11 @@ with st.expander("Debug: gebruikte bronnen", expanded=False):
             "commodities_wide_view": COM_WIDE_VIEW,
             "drivers_wide_view": DRIVERS_WIDE_VIEW,
             "aex_view (VIX fallback)": AEX_VIEW,
+            "spx_view (S&P 500/VIX fallback)": SPX_VIEW,
             "crypto_daily_wide (BTC fallback)": CRYPTO_WIDE_VIEW,
             "fx_wide_view (DXY/EURUSD fallback)": FX_WIDE_VIEW,
-            "us_yield_view (US10Y/TIPS fallback)": US_YIELD_VIEW,
+            "us_yield_view (nominale rente fallback)": US_YIELD_VIEW,
+            "us_yield_real_view (real yield/breakeven fallback)": US_REAL_FALLBACK,
             "macro_view (M2 fallback)": MACRO_VIEW,
         }
     )
@@ -123,6 +127,29 @@ def load_vix_fallback() -> pd.DataFrame:
     try:
         d = run_query(f"SELECT date, vix_close FROM `{AEX_VIEW}` ORDER BY date")
         return _numeric_df(d)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_spx_fallback() -> pd.DataFrame:
+    try:
+        d_all = run_query(f"SELECT * FROM `{SPX_VIEW}` ORDER BY date")
+        if d_all.empty:
+            return pd.DataFrame()
+        spx_col = best_col(d_all, ["spx_close", "close", "sp500_close", "price"])
+        vix_col = best_col(d_all, ["vix_close", "vix"])
+        keep = ["date"]
+        rename = {}
+        if spx_col:
+            keep.append(spx_col)
+            rename[spx_col] = "spx_close"
+        if vix_col and vix_col not in keep:
+            keep.append(vix_col)
+            rename[vix_col] = "vix_close"
+        if len(keep) <= 1:
+            return pd.DataFrame()
+        return _numeric_df(d_all[keep].rename(columns=rename))
     except Exception:
         return pd.DataFrame()
 
@@ -193,56 +220,38 @@ def load_fx_fallback() -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_yield_fallback() -> pd.DataFrame:
-    merged = None
-    for sql in [
-        f"SELECT date, y_2y AS us2y, y_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_2y_synth AS us2y, y_10y_synth AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_2y AS us2y, y_10y AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_2y_synth AS us2y, y_10y_synth AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_10y_synth AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_2y AS us2y FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_2y_synth AS us2y FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, us_10y AS us10y, tips10y_real FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_10y AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, y_10y_synth AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
-        f"SELECT date, us_10y AS us10y FROM `{US_YIELD_VIEW}` ORDER BY date",
-    ]:
+    canonical_candidates = {
+        "us2y": ["us2y", "y_2y", "y_2y_synth", "us_2y", "rate_2y", "yield_2y"],
+        "us10y": ["us10y", "y_10y", "y_10y_synth", "us_10y", "rate_10y", "tenor_10y", "yield_10y"],
+        "tips10y_real": ["tips10y_real", "real_10y", "real10y", "tips_10y", "tips10y", "y_10y_real"],
+        "breakeven_10y": ["breakeven_10y", "breakeven10y", "be_10y"],
+    }
+    merged = pd.DataFrame()
+    for source in [US_YIELD_VIEW, US_REAL_FALLBACK]:
         try:
-            d = run_query(sql)
-            if d.empty:
+            d_all = run_query(f"SELECT * FROM `{source}` ORDER BY date")
+            if d_all.empty or "date" not in d_all.columns:
                 continue
-            d = _numeric_df(d)
-            merged = d if merged is None else pd.merge(merged, d, on="date", how="outer")
+            mapped = pd.DataFrame({"date": pd.to_datetime(d_all["date"])})
+            for canonical, candidates in canonical_candidates.items():
+                source_col = best_col(d_all, candidates)
+                if source_col:
+                    mapped[canonical] = pd.to_numeric(d_all[source_col], errors="coerce")
+            if len(mapped.columns) <= 1:
+                continue
+            merged = mapped if merged.empty else merge_new_cols(merged, mapped)
         except Exception:
             continue
-    if merged is not None:
-        merged = merged.loc[:, ~merged.columns.duplicated()]
-        return merged
-    try:
-        d_all = run_query(f"SELECT * FROM `{US_YIELD_VIEW}` ORDER BY date")
-        if d_all.empty:
-            return pd.DataFrame()
-        us2y_col = best_col(d_all, ["us2y", "y_2y", "y_2y_synth", "us_2y", "rate_2y", "yield_2y"])
-        us10y_col = best_col(d_all, ["us10y", "y_10y", "y_10y_synth", "us_10y", "rate_10y", "tenor_10y", "yield_10y"])
-        real10y_col = best_col(d_all, ["tips10y_real", "real10y", "real_10y", "tips_10y", "tips10y", "y_10y_real"])
-        keep = ["date"]
-        rename = {}
-        if us2y_col:
-            keep.append(us2y_col)
-            rename[us2y_col] = "us2y"
-        if us10y_col:
-            keep.append(us10y_col)
-            rename[us10y_col] = "us10y"
-        if real10y_col and real10y_col not in keep:
-            keep.append(real10y_col)
-            rename[real10y_col] = "tips10y_real"
-        if len(keep) <= 1:
-            return pd.DataFrame()
-        return _numeric_df(d_all[keep].rename(columns=rename))
-    except Exception:
+
+    if merged.empty:
         return pd.DataFrame()
+    if {"us10y", "tips10y_real"}.issubset(merged.columns):
+        implied_breakeven = merged["us10y"] - merged["tips10y_real"]
+        if "breakeven_10y" in merged.columns:
+            merged["breakeven_10y"] = merged["breakeven_10y"].combine_first(implied_breakeven)
+        else:
+            merged["breakeven_10y"] = implied_breakeven
+    return _numeric_df(merged)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -287,10 +296,16 @@ def load_m2_fallback() -> pd.DataFrame:
 def merge_new_cols(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
     if right is None or right.empty:
         return left
-    keep = ["date"] + [c for c in right.columns if c != "date" and c not in left.columns]
-    if len(keep) <= 1:
-        return left
-    return pd.merge(left, right[keep], on="date", how="outer")
+    merged = pd.merge(left, right, on="date", how="outer", suffixes=("", "__fallback"))
+    for col in [c for c in right.columns if c != "date"]:
+        fallback_col = f"{col}__fallback"
+        if fallback_col not in merged.columns:
+            continue
+        merged[col] = pd.to_numeric(merged[col], errors="coerce").combine_first(
+            pd.to_numeric(merged[fallback_col], errors="coerce")
+        )
+        merged = merged.drop(columns=fallback_col)
+    return merged
 
 
 # ---------- Load & merge ----------
@@ -299,7 +314,7 @@ if df_com.empty:
     st.warning("Geen data in commodities wide view.")
     st.stop()
 
-base_prefixes = ("silver_", "gold_", "copper_")
+base_prefixes = ("silver_", "gold_", "copper_", "wti_", "brent_")
 base_cols = ["date"] + [c for c in df_com.columns if c.startswith(base_prefixes)]
 df = df_com[base_cols].copy()
 
@@ -313,10 +328,19 @@ if not drv_main.empty:
     drivers_view_status = "loaded"
     df = merge_new_cols(df, drv_main)
 
-for fallback in [load_vix_fallback(), load_crypto_fallback(), load_fx_fallback(), load_yield_fallback(), load_m2_fallback()]:
+for fallback in [
+    load_spx_fallback(),
+    load_vix_fallback(),
+    load_crypto_fallback(),
+    load_fx_fallback(),
+    load_yield_fallback(),
+    load_m2_fallback(),
+]:
     df = merge_new_cols(df, fallback)
 
 df = df.sort_values("date").drop_duplicates(subset=["date"]).reset_index(drop=True)
+if "eurusd_close" in df.columns:
+    df["usd_proxy"] = 1.0 / pd.to_numeric(df["eurusd_close"], errors="coerce").replace(0, np.nan)
 
 
 # ---------- Helpers ----------
@@ -465,10 +489,15 @@ DRIVER_MAP = {
     "Copper (industrial proxy)": "copper_close",
     "DXY (Dollar Index)": "dxy_close",
     "EURUSD": "eurusd_close",
+    "USD proxy (1/EURUSD)": "usd_proxy",
     "US 2Y (yield %)": "us2y",
     "US 10Y (yield %)": "us10y",
     "US 10Y Real (TIPS %)": "tips10y_real",
+    "US 10Y breakeven (%)": "breakeven_10y",
+    "S&P 500": "spx_close",
     "VIX": "vix_close",
+    "WTI crude (USD/bbl)": "wti_close",
+    "Brent crude (USD/bbl)": "brent_close",
     "BTC (BTCUSD)": "btc_close",
     "M2 YoY (%)": "m2_yoy",
     "Real M2 YoY (%)": "m2_real_yoy",
@@ -692,9 +721,9 @@ default_overlay = [
         "Gold/Silver ratio",
         "Copper (industrial proxy)",
         "EURUSD",
-        "DXY (Dollar Index)",
-        "US 2Y (yield %)",
+        "USD proxy (1/EURUSD)",
         "US 10Y Real (TIPS %)",
+        "S&P 500",
         "VIX",
     ]
     if x in driver_choices
@@ -705,9 +734,10 @@ default_scatter = [
         "Gold/Silver ratio",
         "Copper (industrial proxy)",
         "EURUSD",
-        "DXY (Dollar Index)",
+        "USD proxy (1/EURUSD)",
         "US 2Y (yield %)",
         "US 10Y Real (TIPS %)",
+        "S&P 500",
         "Real M2 YoY (%)",
     ]
     if x in driver_choices
@@ -717,7 +747,8 @@ default_scatter = [
 with st.expander("Debug: driver-kolommen en non-null counts", expanded=False):
     dbg_cols = [
         "silver_close", "gold_close", "gold_silver_ratio", "copper_close",
-        "dxy_close", "eurusd_close", "us2y", "us10y", "tips10y_real", "vix_close", "btc_close",
+        "wti_close", "brent_close", "dxy_close", "eurusd_close", "usd_proxy",
+        "us2y", "us10y", "tips10y_real", "breakeven_10y", "spx_close", "vix_close", "btc_close",
         "m2", "m2_real", "m2_yoy", "m2_real_yoy", "m2_vel", "m2_vel_yoy",
     ]
     st.write(
@@ -900,7 +931,8 @@ st.divider()
 st.subheader("Silver versus macrodrivers")
 st.caption(
     "Lees de zwarte lijn links als de zilverprijs. De geselecteerde drivers staan rechts op hun gezamenlijke driverschaal; "
-    "zet maximaal enkele drivers tegelijk aan voor een goed leesbare vergelijking."
+    "zet maximaal enkele drivers tegelijk aan voor een goed leesbare vergelijking. Alleen reeksen met beschikbare data worden getoond. "
+    "De USD-proxy is exact 1/EURUSD en is dus geen officiële DXY-reeks."
 )
 sel = st.multiselect(
     "Kies drivers voor vergelijking",
@@ -1199,7 +1231,16 @@ if sel_corr:
     for name, col in corr_cols.items():
         raw = pd.to_numeric(d[col], errors="coerce")
         if corr_transform.startswith("Returns"):
-            if name in ["US 10Y (yield %)", "US 10Y Real (TIPS %)", "VIX", "Gold/Silver ratio", "M2 YoY (%)", "Real M2 YoY (%)"]:
+            if name in [
+                "US 2Y (yield %)",
+                "US 10Y (yield %)",
+                "US 10Y Real (TIPS %)",
+                "US 10Y breakeven (%)",
+                "VIX",
+                "Gold/Silver ratio",
+                "M2 YoY (%)",
+                "Real M2 YoY (%)",
+            ]:
                 corr_frame[name] = raw.diff()
             else:
                 corr_frame[name] = raw.pct_change() * 100.0
@@ -1388,10 +1429,16 @@ show_cols = [
     "gold_close",
     "gold_silver_ratio",
     "copper_close",
+    "wti_close",
+    "brent_close",
     "dxy_close",
     "eurusd_close",
+    "usd_proxy",
+    "us2y",
     "us10y",
     "tips10y_real",
+    "breakeven_10y",
+    "spx_close",
     "m2",
     "m2_real",
     "m2_yoy",
