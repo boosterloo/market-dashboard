@@ -76,6 +76,8 @@ def fmt_pct(v, digits=2):
 
 # BigQuery
 MAX_BYTES_BILLED = 2 * 1024**3
+CACHE_TTL_SECONDS = 6 * 60 * 60
+DIAGNOSTICS_CACHE_TTL_SECONDS = 24 * 60 * 60
 BQ_LOCATION = "europe-west1"
 PROJECT_ID = "nth-pier-468314-p7"
 DEFAULT_VIEW = "nth-pier-468314-p7.marketdata.spx_options_partitioned"
@@ -279,7 +281,7 @@ def add_pcr_midline(fig, row: int, col: int):
 
 
 # Data loaders
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_date_bounds():
     df = run_query(
         f"""
@@ -293,7 +295,7 @@ def load_date_bounds():
     return df["min_date"].iloc[0], df["max_date"].iloc[0]
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_snapshot_freshness():
     df = run_query(
         f"""
@@ -318,7 +320,7 @@ def load_snapshot_freshness():
     )
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=DIAGNOSTICS_CACHE_TTL_SECONDS, show_spinner=False)
 def load_option_source_diagnostics() -> pd.DataFrame:
     cols = run_query(
         f"""
@@ -382,7 +384,25 @@ def load_option_source_diagnostics() -> pd.DataFrame:
     return out
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=DIAGNOSTICS_CACHE_TTL_SECONDS, show_spinner=False)
+def load_active_source_columns() -> set[str]:
+    """Read only the active table schema; INFORMATION_SCHEMA metadata is cheap."""
+    table_name = DEFAULT_VIEW.rsplit(".", 1)[-1]
+    df = run_query(
+        f"""
+        SELECT column_name
+        FROM `{DATASET_FQ}.INFORMATION_SCHEMA.COLUMNS`
+        WHERE table_name = @table_name
+        ORDER BY ordinal_position
+        """,
+        {"table_name": table_name},
+    )
+    if df.empty:
+        return set(REQUIRED_OPTION_COLS)
+    return set(df["column_name"].astype(str).tolist())
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_snapshots(start_date: date, end_date: date):
     df = run_query(
         f"""
@@ -398,7 +418,7 @@ def load_snapshots(start_date: date, end_date: date):
     return sorted(pd.to_datetime(df["snap_min"]).dt.to_pydatetime().tolist())
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_snapshot_context(sel_snapshot):
     df = run_query(
         f"""
@@ -416,7 +436,7 @@ def load_snapshot_context(sel_snapshot):
     return safe_float(df["spx"].iloc[0]), safe_float(df["vix"].iloc[0])
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_strikes_for_snapshot(sel_snapshot, sel_type, min_oi, min_vol):
     df = run_query(
         f"""
@@ -438,7 +458,7 @@ def load_strikes_for_snapshot(sel_snapshot, sel_type, min_oi, min_vol):
     return sorted([float(x) for x in df["strike"].dropna().tolist()])
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_expirations_for_option(sel_snapshot, sel_type, strike, min_oi, min_vol):
     df = run_query(
         f"""
@@ -464,7 +484,7 @@ def load_expirations_for_option(sel_snapshot, sel_type, strike, min_oi, min_vol)
     return sorted(pd.to_datetime(df["expiration"]).dt.date.unique())
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_daily_market_context(start_date, end_date, dte_min, dte_max, mny_min, mny_max, min_oi, min_vol):
     sql = f"""
     WITH base AS (
@@ -518,7 +538,7 @@ def load_daily_market_context(start_date, end_date, dte_min, dte_max, mny_min, m
     return df
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_skew_source(start_date, end_date, dte_lo, dte_hi, min_oi, min_vol):
     df = run_query(
         f"""
@@ -552,7 +572,7 @@ def load_skew_source(start_date, end_date, dte_lo, dte_hi, min_oi, min_vol):
     return df
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_ppd_expiry_ladder_for_strike(sel_snapshot, sel_type, strike, dte_min, dte_max, min_oi, min_vol):
     df = run_query(
         f"""
@@ -614,7 +634,7 @@ def load_ppd_expiry_ladder_for_strike(sel_snapshot, sel_type, strike, dte_min, d
     return df
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_option_history(start_date, end_date, sel_type, strike, expiration, min_oi, min_vol):
     df = run_query(
         f"""
@@ -659,7 +679,7 @@ def load_option_history(start_date, end_date, sel_type, strike, expiration, min_
     return df
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_snapshot_chain(sel_snapshot, sel_type, dte_min, dte_max, min_oi, min_vol):
     df = run_query(
         f"""
@@ -771,9 +791,12 @@ if st.button("Ververs SPX option data uit BigQuery"):
     clear_option_caches()
     st.rerun()
 
-source_diag = load_option_source_diagnostics()
-VIEW, source_reason = choose_option_source(source_diag)
-ACTIVE_SOURCE_COLUMNS = get_source_columns(source_diag, VIEW)
+# Use the known partitioned table directly. The previous automatic source
+# discovery scanned every SPX/option table and view on each cold cache, which
+# was the largest avoidable BigQuery cost on a normal page visit.
+VIEW = DEFAULT_VIEW
+ACTIVE_SOURCE_COLUMNS = load_active_source_columns()
+source_reason = "Vaste partitioned SPX options tabel; brede brondiagnose draait alleen op verzoek."
 min_date, max_date = load_date_bounds()
 latest_snapshot, rows_total, rows_latest_day = load_snapshot_freshness()
 default_start = max(min_date, max_date - timedelta(days=14))
@@ -797,70 +820,77 @@ else:
 
 with st.expander("Diagnose SPX option bronnen", expanded=False):
     st.caption(
-        "Scant BigQuery dataset `marketdata` op SPX/option bronnen met `snapshot_date` "
-        "en vergelijkt welke tabel/view het meest recent is."
+        "Deze uitgebreide controle scant meerdere SPX/option-tabellen en views en kan daarom "
+        "BigQuery-kosten veroorzaken. Start hem alleen wanneer de vaste partitioned bron problemen geeft."
     )
-    diag = source_diag
-    if diag.empty:
-        st.info("Geen SPX/option bronnen met snapshot_date gevonden in BigQuery.")
-    else:
-        show = diag.copy()
-        show["active_dashboard_source"] = show["source"].eq(VIEW)
-        show["partitioned_default_source"] = show["source"].eq(DEFAULT_VIEW)
-        show["legacy_enriched_source"] = show["source"].eq(LEGACY_ENRICHED_VIEW)
-        show["latest_snapshot"] = pd.to_datetime(show["latest_snapshot"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-        st.dataframe(
-            show[
-                [
-                    "active_dashboard_source",
-                    "partitioned_default_source",
-                    "legacy_enriched_source",
-                    "source",
-                    "type",
-                    "latest_snapshot",
-                    "rows_last_7d",
-                    "rows_total",
-                    "required_cols_present",
-                    "error",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+    if st.button("Voer uitgebreide brondiagnose uit", type="secondary"):
+        diag = load_option_source_diagnostics()
+        if diag.empty:
+            st.info("Geen SPX/option bronnen met snapshot_date gevonden in BigQuery.")
+        else:
+            show = diag.copy()
+            show["active_dashboard_source"] = show["source"].eq(VIEW)
+            show["partitioned_default_source"] = show["source"].eq(DEFAULT_VIEW)
+            show["legacy_enriched_source"] = show["source"].eq(LEGACY_ENRICHED_VIEW)
+            show["latest_snapshot"] = pd.to_datetime(show["latest_snapshot"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+            st.dataframe(
+                show[
+                    [
+                        "active_dashboard_source",
+                        "partitioned_default_source",
+                        "legacy_enriched_source",
+                        "source",
+                        "type",
+                        "latest_snapshot",
+                        "rows_last_7d",
+                        "rows_total",
+                        "required_cols_present",
+                        "error",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
 with st.expander("Algemene filters", expanded=True):
-    c0, c1, c2 = st.columns([1.1, 1.8, 1.1])
-    with c0:
-        axis_scale = st.slider("As-lettergrootte", 1.2, 2.2, 1.5, 0.1)
-        st.session_state["_axis_mult"] = axis_scale
-    with c1:
-        range_choice = st.radio("Periode voor marktcontext", ["14d", "30d", "90d", "1y", "Custom"], index=0, horizontal=True)
-    with c2:
-        q_const_simple = st.number_input("Dividendrendement q", 0.0, 0.10, 0.016, 0.001, format="%.3f")
+    st.caption("Pas meerdere filters aan en klik één keer op Analyse bijwerken. Zo veroorzaakt niet iedere wijziging een nieuwe query.")
+    with st.form("spx_general_filters"):
+        c0, c1, c2 = st.columns([1.1, 1.8, 1.1])
+        with c0:
+            axis_scale = st.slider("As-lettergrootte", 1.2, 2.2, 1.5, 0.1)
+            st.session_state["_axis_mult"] = axis_scale
+        with c1:
+            range_choice = st.radio("Periode voor marktcontext", ["14d", "30d", "90d", "1y", "Custom"], index=0, horizontal=True)
+        with c2:
+            q_const_simple = st.number_input("Dividendrendement q", 0.0, 0.10, 0.016, 0.001, format="%.3f")
 
-    if range_choice != "Custom":
-        days_map = {"14d": 14, "30d": 30, "90d": 90, "1y": 365}
-        start_date = max(min_date, max_date - timedelta(days=days_map[range_choice]))
-        end_date = max_date
-        st.caption(f"Periode: {start_date} t/m {end_date}")
-    else:
-        start_date, end_date = st.date_input(
-            "Periode",
+        custom_start, custom_end = st.date_input(
+            "Aangepaste periode (alleen gebruikt bij Custom)",
             value=(default_start, max_date),
             min_value=min_date,
             max_value=max_date,
             format="YYYY-MM-DD",
         )
 
-    f1, f2, f3, f4 = st.columns([1.2, 1.2, 1, 1])
-    with f1:
-        context_dte_range = st.slider("DTE voor marktcontext", 0, 365, (0, 60), step=1)
-    with f2:
-        context_mny_range = st.slider("Moneyness voor marktcontext", -0.30, 0.30, (-0.15, 0.15), step=0.01)
-    with f3:
-        min_oi = st.slider("Min OI", 0, 100, 1, step=1)
-    with f4:
-        min_vol = st.slider("Min Volume", 0, 100, 1, step=1)
+        f1, f2, f3, f4 = st.columns([1.2, 1.2, 1, 1])
+        with f1:
+            context_dte_range = st.slider("DTE voor marktcontext", 0, 365, (0, 60), step=1)
+        with f2:
+            context_mny_range = st.slider("Moneyness voor marktcontext", -0.30, 0.30, (-0.15, 0.15), step=0.01)
+        with f3:
+            min_oi = st.slider("Min OI", 0, 100, 1, step=1)
+        with f4:
+            min_vol = st.slider("Min Volume", 0, 100, 1, step=1)
+
+        st.form_submit_button("Analyse bijwerken", type="primary")
+
+    if range_choice != "Custom":
+        days_map = {"14d": 14, "30d": 30, "90d": 90, "1y": 365}
+        start_date = max(min_date, max_date - timedelta(days=days_map[range_choice]))
+        end_date = max_date
+    else:
+        start_date, end_date = custom_start, custom_end
+    st.caption(f"Actieve periode: {start_date} t/m {end_date}")
 
 
 snapshots_all = load_snapshots(start_date, end_date)
