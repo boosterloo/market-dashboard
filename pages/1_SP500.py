@@ -220,28 +220,27 @@ def heikin_ashi(src: pd.DataFrame):
     ha["ha_close"] = (ha["open"] + ha["high"] + ha["low"] + ha["close"]) / 4.0
 
     ha_open = pd.Series(index=ha.index, dtype=float)
-    first_valid_idx = ha[["open", "close"]].dropna().index.min()
+    valid_ohlc = ha[["open", "high", "low", "close"]].notna().all(axis=1)
+    previous_ha_open = np.nan
+    previous_ha_close = np.nan
 
-    if pd.isna(first_valid_idx):
-        ha["ha_open"] = np.nan
-        ha["ha_high"] = np.nan
-        ha["ha_low"] = np.nan
-        return ha[["ha_open", "ha_high", "ha_low", "ha_close"]]
-
-    ha_open.loc[first_valid_idx] = (ha.loc[first_valid_idx, "open"] + ha.loc[first_valid_idx, "close"]) / 2.0
-
-    start_pos = ha.index.get_loc(first_valid_idx)
-    for i in range(start_pos + 1, len(ha)):
-        prev_idx = ha.index[i - 1]
-        cur_idx = ha.index[i]
-        if pd.notna(ha_open.loc[prev_idx]) and pd.notna(ha.loc[prev_idx, "ha_close"]):
-            ha_open.loc[cur_idx] = (ha_open.loc[prev_idx] + ha.loc[prev_idx, "ha_close"]) / 2.0
+    # A single incomplete source row must not break every later candle. Skip
+    # that row and continue from the last complete Heikin-Ashi candle.
+    for idx in ha.index:
+        if not valid_ohlc.loc[idx]:
+            continue
+        if pd.isna(previous_ha_open):
+            current_ha_open = (ha.loc[idx, "open"] + ha.loc[idx, "close"]) / 2.0
         else:
-            ha_open.loc[cur_idx] = np.nan
+            current_ha_open = (previous_ha_open + previous_ha_close) / 2.0
+        ha_open.loc[idx] = current_ha_open
+        previous_ha_open = current_ha_open
+        previous_ha_close = ha.loc[idx, "ha_close"]
 
     ha["ha_open"] = ha_open
     ha["ha_high"] = pd.concat([ha["high"], ha["ha_open"], ha["ha_close"]], axis=1).max(axis=1)
     ha["ha_low"] = pd.concat([ha["low"], ha["ha_open"], ha["ha_close"]], axis=1).min(axis=1)
+    ha.loc[~valid_ohlc, ["ha_open", "ha_high", "ha_low", "ha_close"]] = np.nan
 
     return ha[["ha_open", "ha_high", "ha_low", "ha_close"]]
 
