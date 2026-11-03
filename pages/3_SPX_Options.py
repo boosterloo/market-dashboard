@@ -175,9 +175,16 @@ def last_price_expr() -> str:
 
 
 def mid_price_expr() -> str:
+    if has_col("bid") and has_col("ask"):
+        return (
+            "CASE WHEN SAFE_CAST(bid AS FLOAT64) > 0 "
+            "AND SAFE_CAST(ask AS FLOAT64) >= SAFE_CAST(bid AS FLOAT64) "
+            "THEN SAFE_DIVIDE(SAFE_CAST(bid AS FLOAT64) + SAFE_CAST(ask AS FLOAT64), 2.0) "
+            "ELSE NULL END"
+        )
     if has_col("mid_price"):
-        return "CAST(mid_price AS FLOAT64)"
-    return "SAFE_DIVIDE(CAST(bid AS FLOAT64) + CAST(ask AS FLOAT64), 2.0)"
+        return "SAFE_CAST(mid_price AS FLOAT64)"
+    return "NULL"
 
 
 def days_to_exp_expr() -> str:
@@ -187,8 +194,6 @@ def days_to_exp_expr() -> str:
 
 
 def ppd_expr() -> str:
-    if has_col("ppd"):
-        return "CAST(ppd AS FLOAT64)"
     return f"SAFE_DIVIDE({mid_price_expr()}, NULLIF({days_to_exp_expr()}, 0))"
 
 
@@ -1092,7 +1097,7 @@ if page == "📊 Marktbeeld":
 elif page == "🎯 Beste expiratie":
     section_title(
         "Beste expiratie voor short optie",
-        "Kies een peildatum, put/call en strike. De grafiek vergelijkt alle expiraties voor die strike. Links staat PPD, rechts de optieprijs.",
+        "Kies peildatum, put/call en strike. PPD = geldige midprijs (bid+ask)/2 gedeeld door hele kalender-DTE. Ongeldige quotes vallen weg; controleer de bid voor een conservatievere verkoopprijs.",
     )
 
     c1, c2, c3 = st.columns([1.2, 0.8, 1.2])
@@ -1109,7 +1114,7 @@ elif page == "🎯 Beste expiratie":
     with c5:
         ladder_price_col = st.radio("Prijs op rechteras", ["mid_price", "bid", "last_price"], index=0, horizontal=True, key="ladder_price")
     with c6:
-        ladder_smooth = st.toggle("Smooth PPD", value=True, key="ladder_smooth")
+        ladder_smooth = st.toggle("Toon 3-puntsmediaan", value=True, key="ladder_smooth")
 
     if ladder_strike is not None:
         ladder = load_ppd_expiry_ladder_for_strike(
@@ -1125,6 +1130,14 @@ elif page == "🎯 Beste expiratie":
         if ladder.empty:
             st.info("Geen expiry ladder gevonden voor deze peildatum, type en strike.")
         else:
+            invalid_quote_count = (
+                ladder["bid"].isna()
+                | ladder["ask"].isna()
+                | (ladder["bid"] <= 0)
+                | (ladder["ask"] < ladder["bid"])
+            ).sum()
+            if invalid_quote_count:
+                st.caption(f"{invalid_quote_count} contract(en) met ontbrekende, niet-positieve of crossed bid/ask zijn uitgesloten.")
             ladder = ladder.dropna(subset=["expiration", "days_to_exp", "ppd"]).sort_values("expiration").copy()
             ladder["ppd_s"] = smooth_series(ladder["ppd"], 3)
             ladder["T"] = ladder["days_to_exp"] / 365.0
@@ -1152,7 +1165,7 @@ elif page == "🎯 Beste expiratie":
                     x=ladder["expiration"],
                     y=ladder["ppd"],
                     mode="markers",
-                    name="PPD",
+                    name="PPD (mid/DTE)",
                     customdata=np.stack(
                         [
                             ladder["days_to_exp"],
@@ -1171,7 +1184,7 @@ elif page == "🎯 Beste expiratie":
                     hovertemplate=(
                         "Expiratie=%{x}<br>"
                         "DTE=%{customdata[0]:.0f}<br>"
-                        "PPD=%{y:.2f}<br>"
+                        "PPD (mid/DTE)=%{y:.2f}<br>"
                         "Prijs=%{customdata[1]:.2f}<br>"
                         "Bid/Ask=%{customdata[2]:.2f} / %{customdata[3]:.2f}<br>"
                         "Spread/mid=%{customdata[4]:.1%}<br>"
@@ -1187,7 +1200,7 @@ elif page == "🎯 Beste expiratie":
 
             if ladder_smooth:
                 fig.add_trace(
-                    go.Scatter(x=ladder["expiration"], y=ladder["ppd_s"], mode="lines", name="PPD smooth"),
+                    go.Scatter(x=ladder["expiration"], y=ladder["ppd_s"], mode="lines", name="3-puntsmediaan PPD"),
                     secondary_y=False,
                 )
 
@@ -1205,7 +1218,7 @@ elif page == "🎯 Beste expiratie":
                 fig.add_vline(x=best["expiration"], line=dict(dash="dot", width=2))
 
             fig.update_xaxes(title_text="Expiratiedatum", type="date", tickformat="%d-%m-%Y")
-            fig.update_yaxes(title_text="PPD", secondary_y=False)
+            fig.update_yaxes(title_text="PPD (mid/DTE)", secondary_y=False)
             fig.update_yaxes(title_text="Optieprijs", secondary_y=True)
             fig.update_layout(
                 title=(
@@ -1217,7 +1230,7 @@ elif page == "🎯 Beste expiratie":
 
             if best is not None:
                 st.success(
-                    f"Hoogste PPD ligt bij expiratie {best['expiration']} "
+                    f"Hoogste PPD ({'3-puntsmediaan' if y_for_best == 'ppd_s' else 'ruw'}) ligt bij expiratie {best['expiration']} "
                     f"({int(best['days_to_exp'])} DTE): PPD {best[y_for_best]:.2f}, "
                     f"{ladder_price_col} {best[ladder_price_col]:.2f}, "
                     f"delta {best['delta']:.3f}, spread/mid {best['spread_pct_mid']:.1%}."
@@ -1243,7 +1256,7 @@ elif page == "🎯 Beste expiratie":
                     columns={
                         "expiration": "Expiratie",
                         "days_to_exp": "DTE",
-                        "ppd": "PPD",
+                        "ppd": "PPD (mid/DTE)",
                         ladder_price_col: "Prijs",
                         "bid": "Bid",
                         "ask": "Ask",
@@ -1310,9 +1323,9 @@ elif page == "🕰️ Optiehistoriek":
                 with s2:
                     fig_iv = make_subplots(specs=[[{"secondary_y": True}]])
                     fig_iv.add_trace(go.Scatter(x=hist["snapshot_date"], y=hist["implied_volatility"], mode="lines+markers", name="IV"), secondary_y=False)
-                    fig_iv.add_trace(go.Scatter(x=hist["snapshot_date"], y=hist["ppd"], mode="lines+markers", name="PPD"), secondary_y=True)
+                    fig_iv.add_trace(go.Scatter(x=hist["snapshot_date"], y=hist["ppd"], mode="lines+markers", name="PPD (mid/DTE)"), secondary_y=True)
                     fig_iv.update_yaxes(title_text="IV", secondary_y=False)
-                    fig_iv.update_yaxes(title_text="PPD", secondary_y=True)
+                    fig_iv.update_yaxes(title_text="PPD (mid/DTE)", secondary_y=True)
                     fig_iv.update_layout(title="IV en PPD door de tijd")
                     show_fig(fig_iv, height=430)
 
@@ -1358,11 +1371,11 @@ elif page == "📏 PPD naar afstand":
         g["ppd_s"] = smooth_series(g["ppd"], 3)
 
         fig_dist = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd"], mode="markers", name="PPD"), secondary_y=False)
-        fig_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd_s"], mode="lines", name="PPD smooth"), secondary_y=False)
+        fig_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd"], mode="markers", name="PPD (mid/DTE)"), secondary_y=False)
+        fig_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["ppd_s"], mode="lines", name="3-puntsmediaan PPD"), secondary_y=False)
         fig_dist.add_trace(go.Scatter(x=g["bin_mid"], y=g["price"], mode="lines", name="Mid prijs"), secondary_y=True)
         fig_dist.update_xaxes(title_text=x_title)
-        fig_dist.update_yaxes(title_text="PPD", secondary_y=False)
+        fig_dist.update_yaxes(title_text="PPD (mid/DTE)", secondary_y=False)
         fig_dist.update_yaxes(title_text="Mid prijs", secondary_y=True)
         fig_dist.update_layout(title=f"{dist_type.upper()}: PPD en prijs naar afstand tot spot")
         show_fig(fig_dist, height=500)
